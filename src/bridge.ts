@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { ConnectionProfile, SshDataEvent, SshDisconnectedEvent } from './types'
+import type { ConnectionProfile, RemoteFileList, SshDataEvent, SshDisconnectedEvent } from './types'
 
 type UnlistenFn = () => void
 
@@ -92,6 +92,66 @@ export async function sshDisconnect(session_id: string) {
     session_id,
     reason: 'Session closed',
   })
+}
+
+export async function sshListFiles(
+  config: ConnectionProfile,
+  remote_path: string,
+): Promise<RemoteFileList> {
+  if (isTauriRuntime()) {
+    return invoke<RemoteFileList>('ssh_list_files', { config, remotePath: remote_path })
+  }
+
+  return {
+    path: remote_path || '~',
+    entries: [
+      {
+        name: '..',
+        path: '..',
+        kind: 'directory',
+        modified: '',
+      },
+      {
+        name: 'release.log',
+        path: `${remote_path || '~'}/release.log`,
+        kind: 'file',
+        size: 18432,
+        modified: 'May 09 22:10',
+      },
+      {
+        name: 'uploads',
+        path: `${remote_path || '~'}/uploads`,
+        kind: 'directory',
+        modified: 'May 09 21:42',
+      },
+    ],
+  }
+}
+
+export async function sshUploadFile(
+  config: ConnectionProfile,
+  remote_path: string,
+  filename: string,
+  content_base64: string,
+) {
+  if (isTauriRuntime()) {
+    return invoke<string>('ssh_upload_file', {
+      config,
+      remotePath: remote_path,
+      filename,
+      contentBase64: content_base64,
+    })
+  }
+
+  return `${remote_path || '~'}/${filename}`
+}
+
+export async function sshDownloadFile(config: ConnectionProfile, remote_path: string) {
+  if (isTauriRuntime()) {
+    return invoke<string>('ssh_download_file', { config, remotePath: remote_path })
+  }
+
+  return `Downloads/${remote_path.split('/').pop() || 'download'}`
 }
 
 export async function onSshData(callback: (payload: SshDataEvent) => void): Promise<UnlistenFn> {

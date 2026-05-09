@@ -491,6 +491,10 @@ textarea {
     0 18px 38px rgba(20, 31, 38, 0.18);
 }
 
+.terminal-pane.dragging {
+  border-color: #ffd166;
+}
+
 .pane-header {
   display: flex;
   height: 42px;
@@ -578,6 +582,128 @@ textarea {
   height: 100%;
 }
 
+.file-manager {
+  display: flex;
+  max-height: 42%;
+  min-height: 168px;
+  flex: 0 0 auto;
+  flex-direction: column;
+  border-bottom: 1px solid #263238;
+  background: #12191e;
+}
+
+.file-manager-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 32px);
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid #263238;
+}
+
+.file-manager-toolbar .ant-input {
+  color: #d6dde4;
+  border-color: #2b3a42;
+  background: #0f1519;
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.file-manager-toolbar .ant-btn {
+  color: #b8c5cc;
+  border-color: #2b3a42;
+  background: #172026;
+}
+
+.file-list {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 4px 6px 7px;
+}
+
+.file-list.loading {
+  opacity: 0.68;
+}
+
+.file-row {
+  display: grid;
+  width: 100%;
+  min-height: 30px;
+  grid-template-columns: 22px minmax(0, 1fr) 72px 104px 34px;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  padding: 3px 5px;
+  color: #cbd5dc;
+  background: transparent;
+  text-align: left;
+  cursor: default;
+}
+
+.file-row:hover {
+  background: #1b2730;
+}
+
+.file-icon {
+  display: inline-grid;
+  place-items: center;
+  color: #ffd166;
+}
+
+.file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.file-meta {
+  overflow: hidden;
+  color: #83919b;
+  font-size: 11px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.file-actions .ant-btn {
+  color: #9fb0bb;
+}
+
+.file-empty {
+  display: grid;
+  height: 100%;
+  min-height: 80px;
+  place-items: center;
+  color: #83919b;
+  font-size: 12px;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 42px 0 0;
+  z-index: 4;
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  color: #fff7dc;
+  background: rgba(17, 24, 28, 0.78);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.drop-overlay > span:first-child {
+  color: #ffd166;
+  font-size: 24px;
+}
+
 .pane-empty {
   position: absolute;
   inset: 42px 0 0;
@@ -587,7 +713,75 @@ textarea {
 }
 
 .connection-form {
-  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.connection-modal .ant-modal-body {
+  padding-top: 14px;
+  padding-bottom: 8px;
+}
+
+.connection-modal .ant-modal-footer {
+  margin-top: 10px;
+}
+
+.connection-form .ant-form-item {
+  margin-bottom: 0;
+}
+
+.connection-form .ant-form-item-label {
+  padding-bottom: 4px;
+  line-height: 1.1;
+}
+
+.connection-form .ant-form-item-label > label {
+  height: auto;
+  color: #465662;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.connection-form-grid {
+  display: grid;
+  gap: 10px;
+}
+
+.connection-form-grid.primary {
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) 108px;
+}
+
+.connection-form-grid.secondary,
+.connection-form-grid.key-fields {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.connection-form-grid.key-fields {
+  grid-template-columns: minmax(0, 1fr) 180px;
+}
+
+.auth-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid #dde6ea;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8fafb;
+}
+
+.auth-panel-title {
+  color: #263743;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.private-key-field textarea.ant-input {
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .connection-modal-footer {
@@ -600,16 +794,6 @@ textarea {
 .connection-modal-footer span {
   display: inline-flex;
   gap: 8px;
-}
-
-.form-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px;
-  gap: 12px;
-}
-
-.form-row + .form-row {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .ant-input-affix-wrapper,

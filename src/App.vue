@@ -749,7 +749,8 @@ onBeforeUnmount(() => {
     <a-modal
       v-model:open="connectionModalOpen"
       :title="connectionForm.id ? '编辑连接' : '新建连接'"
-      width="560px"
+      width="640px"
+      class="connection-modal"
       :destroy-on-close="false"
       @ok="saveConnection"
     >
@@ -763,10 +764,10 @@ onBeforeUnmount(() => {
         </div>
       </template>
       <a-form layout="vertical" class="connection-form">
-        <a-form-item label="名称" required>
-          <a-input v-model:value="connectionForm.name" placeholder="Production" />
-        </a-form-item>
-        <div class="form-row">
+        <div class="connection-form-grid primary">
+          <a-form-item label="名称" required>
+            <a-input v-model:value="connectionForm.name" placeholder="Production" />
+          </a-form-item>
           <a-form-item label="主机" required>
             <a-input v-model:value="connectionForm.host" placeholder="192.168.1.10" />
           </a-form-item>
@@ -774,33 +775,39 @@ onBeforeUnmount(() => {
             <a-input-number v-model:value="connectionForm.port" :min="1" :max="65535" />
           </a-form-item>
         </div>
-        <div class="form-row">
+        <div class="connection-form-grid secondary">
           <a-form-item label="用户名" required>
             <a-input v-model:value="connectionForm.username" placeholder="root" />
           </a-form-item>
           <a-form-item label="分组">
             <a-select v-model:value="connectionForm.group_id" :options="groupOptions" />
           </a-form-item>
+          <a-form-item label="密码">
+            <a-input-password v-model:value="connectionForm.password" autocomplete="current-password" />
+          </a-form-item>
         </div>
-        <a-form-item label="密码">
-          <a-input-password v-model:value="connectionForm.password" autocomplete="current-password" />
-        </a-form-item>
-        <a-form-item label="私钥路径">
-          <a-input v-model:value="connectionForm.private_key_path" placeholder="C:\\Users\\me\\.ssh\\id_rsa" />
-        </a-form-item>
-        <a-form-item label="粘贴私钥">
-          <a-textarea
-            v-model:value="connectionForm.private_key"
-            :auto-size="{ minRows: 4, maxRows: 8 }"
-            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-          />
-        </a-form-item>
-        <a-form-item label="证书密码">
-          <a-input-password
-            v-model:value="connectionForm.private_key_passphrase"
-            autocomplete="current-password"
-          />
-        </a-form-item>
+
+        <div class="auth-panel">
+          <div class="auth-panel-title">密钥认证</div>
+          <div class="connection-form-grid key-fields">
+            <a-form-item label="私钥路径">
+              <a-input v-model:value="connectionForm.private_key_path" placeholder="C:\\Users\\me\\.ssh\\id_rsa" />
+            </a-form-item>
+            <a-form-item label="证书密码">
+              <a-input-password
+                v-model:value="connectionForm.private_key_passphrase"
+                autocomplete="current-password"
+              />
+            </a-form-item>
+          </div>
+          <a-form-item label="粘贴私钥" class="private-key-field">
+            <a-textarea
+              v-model:value="connectionForm.private_key"
+              :auto-size="{ minRows: 3, maxRows: 5 }"
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+            />
+          </a-form-item>
+        </div>
       </a-form>
     </a-modal>
 

@@ -38,3 +38,18 @@ export interface SshDisconnectedEvent {
   session_id: string
   reason?: string
 }
+
+export type RemoteFileKind = 'file' | 'directory' | 'symlink'
+
+export interface RemoteFileEntry {
+  name: string
+  path: string
+  kind: RemoteFileKind
+  size?: number
+  modified: string
+}
+
+export interface RemoteFileList {
+  path: string
+  entries: RemoteFileEntry[]
+}
