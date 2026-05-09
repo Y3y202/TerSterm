@@ -39,6 +39,14 @@ export interface SshDisconnectedEvent {
   reason?: string
 }
 
+export interface SystemUsage {
+  cpu_percent: number
+  memory_used_gb: number
+  memory_total_gb: number
+  storage_used_gb: number
+  storage_total_gb: number
+}
+
 export type RemoteFileKind = 'file' | 'directory' | 'symlink'
 
 export interface RemoteFileEntry {

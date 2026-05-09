@@ -1,6 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { ConnectionProfile, RemoteFileList, SshDataEvent, SshDisconnectedEvent } from './types'
+import type {
+  ConnectionProfile,
+  RemoteFileList,
+  SshDataEvent,
+  SshDisconnectedEvent,
+  SystemUsage,
+} from './types'
 
 type UnlistenFn = () => void
 
@@ -92,6 +98,20 @@ export async function sshDisconnect(session_id: string) {
     session_id,
     reason: 'Session closed',
   })
+}
+
+export async function sshGetSystemUsage(config: ConnectionProfile): Promise<SystemUsage> {
+  if (isTauriRuntime()) {
+    return invoke<SystemUsage>('ssh_get_system_usage', { config })
+  }
+
+  return {
+    cpu_percent: 18.6,
+    memory_used_gb: 3.42,
+    memory_total_gb: 16,
+    storage_used_gb: 84,
+    storage_total_gb: 256,
+  }
 }
 
 export async function sshListFiles(

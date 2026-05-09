@@ -15,17 +15,18 @@ import {
   ReloadOutlined,
   UploadOutlined,
 } from '@ant-design/icons-vue'
-import { message } from 'ant-design-vue'
+import { Modal, message } from 'ant-design-vue'
 import {
   onSshData,
   onSshDisconnected,
   sshDownloadFile,
+  sshGetSystemUsage,
   sshListFiles,
   sshResize,
   sshUploadFile,
   sshWrite,
 } from '../bridge'
-import type { RemoteFileEntry, SshPane } from '../types'
+import type { RemoteFileEntry, SshPane, SystemUsage } from '../types'
 
 const props = defineProps<{
   pane: SshPane
@@ -47,6 +48,7 @@ const remoteFiles = ref<RemoteFileEntry[]>([])
 const fileLoading = ref(false)
 const transferring = ref(false)
 const dragActive = ref(false)
+const systemUsage = ref<SystemUsage | null>(null)
 
 let terminal: Terminal | undefined
 let fitAddon: FitAddon | undefined
@@ -55,6 +57,8 @@ let unlistenData: (() => void) | undefined
 let unlistenDisconnected: (() => void) | undefined
 let inputBuffer = ''
 let refreshTimer: number | undefined
+let usageTimer: number | undefined
+let usageRequestId = 0
 let refreshRequestId = 0
 let queuedRefreshPath: string | undefined
 
@@ -66,6 +70,14 @@ const statusText = computed(() => {
   if (props.pane.status === 'closed') return '已关闭'
   return '未连接'
 })
+
+const formatPercent = (value: number) => `${Math.max(0, value).toFixed(1)}%`
+
+const formatGbPair = (used: number, total: number) => {
+  if (!Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return '--/--G'
+
+  return `${Math.max(0, used).toFixed(1)}/${Math.max(0, total).toFixed(1)}G`
+}
 
 const fitTerminal = () => {
   if (!terminal || !fitAddon || !terminalHost.value) return
@@ -212,6 +224,12 @@ const formatBytes = (size?: number) => {
   return `${(size / 1024 / 1024).toFixed(1)} MB`
 }
 
+const describeUploadFiles = (files: File[]) => {
+  if (files.length === 1) return files[0].name
+
+  return `${files.length} 个文件`
+}
+
 const refreshFiles = async (path = remotePath.value) => {
   if (!props.pane.connection || !isConnected.value) return
   const requestId = ++refreshRequestId
@@ -250,6 +268,39 @@ const scheduleRefreshFiles = (path = remotePath.value) => {
     queuedRefreshPath = undefined
     void refreshFiles(nextPath || remotePath.value)
   }, 350)
+}
+
+const refreshSystemUsage = async () => {
+  if (!props.pane.connection || !isConnected.value) return
+  const requestId = ++usageRequestId
+
+  try {
+    const result = await sshGetSystemUsage(props.pane.connection)
+    if (requestId === usageRequestId) {
+      systemUsage.value = result
+    }
+  } catch {
+    if (requestId === usageRequestId) {
+      systemUsage.value = null
+    }
+  }
+}
+
+const stopSystemUsagePolling = () => {
+  if (usageTimer) {
+    window.clearInterval(usageTimer)
+    usageTimer = undefined
+  }
+  usageRequestId += 1
+}
+
+const startSystemUsagePolling = () => {
+  stopSystemUsagePolling()
+  systemUsage.value = null
+  if (!props.pane.connection || !isConnected.value) return
+
+  void refreshSystemUsage()
+  usageTimer = window.setInterval(refreshSystemUsage, 5000)
 }
 
 const openFileManager = async () => {
@@ -319,10 +370,27 @@ const handleDragLeave = (event: DragEvent) => {
 
 const handleDrop = async (event: DragEvent) => {
   dragActive.value = false
+  if (!props.pane.connection || !isConnected.value) {
+    message.warning('请先连接主机')
+    return
+  }
+
   const files = Array.from(event.dataTransfer?.files || [])
   if (files.length === 0) return
-  fileManagerOpen.value = true
-  await uploadFiles(files)
+
+  const targetHost = props.pane.connection.name || props.pane.connection.host
+  const targetPath = remotePath.value
+
+  Modal.confirm({
+    title: `上传到 ${targetHost}`,
+    content: `是否将 ${describeUploadFiles(files)} 上传到 ${targetPath}？`,
+    okText: '上传',
+    cancelText: '取消',
+    async onOk() {
+      fileManagerOpen.value = true
+      await uploadFiles(files)
+    },
+  })
 }
 
 watch(
@@ -339,6 +407,7 @@ watch(
       remotePath.value = '~'
       remoteFiles.value = []
       fileManagerOpen.value = false
+      systemUsage.value = null
     }
 
     if (status === 'error' && props.pane.error) {
@@ -357,6 +426,11 @@ watch(
     fitTerminal()
     terminal?.focus()
   },
+)
+
+watch(
+  () => [props.pane.status, props.pane.session_id, props.pane.connection?.id],
+  () => startSystemUsagePolling(),
 )
 
 onMounted(async () => {
@@ -411,12 +485,14 @@ onMounted(async () => {
   })
 
   window.setTimeout(fitTerminal, 80)
+  startSystemUsagePolling()
 })
 
 onBeforeUnmount(() => {
   if (refreshTimer) {
     window.clearTimeout(refreshTimer)
   }
+  stopSystemUsagePolling()
   resizeObserver?.disconnect()
   unlistenData?.()
   unlistenDisconnected?.()
@@ -434,9 +510,10 @@ defineExpose({
     class="terminal-pane"
     :class="{ active, empty: pane.status === 'idle', dragging: dragActive }"
     @mousedown="focusPane"
-    @dragover.prevent="handleDragOver"
-    @dragleave="handleDragLeave"
-    @drop.prevent="handleDrop"
+    @dragenter.capture.prevent="handleDragOver"
+    @dragover.capture.prevent="handleDragOver"
+    @dragleave.capture="handleDragLeave"
+    @drop.capture.prevent="handleDrop"
   >
     <header class="pane-header">
       <div class="pane-title">
@@ -445,6 +522,11 @@ defineExpose({
           <strong>{{ pane.title }}</strong>
           <span>{{ statusText }}</span>
         </div>
+      </div>
+      <div v-if="isConnected && systemUsage" class="pane-metrics">
+        <span>CPU {{ formatPercent(systemUsage.cpu_percent) }}</span>
+        <span>内存 {{ formatGbPair(systemUsage.memory_used_gb, systemUsage.memory_total_gb) }}</span>
+        <span>存储 {{ formatGbPair(systemUsage.storage_used_gb, systemUsage.storage_total_gb) }}</span>
       </div>
       <div class="pane-actions">
         <a-tooltip title="文件管理">

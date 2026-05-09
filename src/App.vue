@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, h, nextTick, onBeforeUnmount, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import {
   AppstoreOutlined,
   DeleteOutlined,
@@ -26,6 +27,7 @@ const MIN_SIDEBAR_WIDTH = 240
 const MAX_SIDEBAR_WIDTH = 520
 
 type ConnectionDraft = Omit<ConnectionProfile, 'id'> & { id?: string }
+type DeepLinkUnlisten = () => void
 
 const createId = (prefix: string) => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -145,6 +147,7 @@ const sidebarWidth = ref(
 const resizingSidebar = ref(false)
 const selectedConnectionId = ref<string>()
 const terminalRefs = ref<Record<string, InstanceType<typeof TerminalPane>>>({})
+let unlistenDeepLink: DeepLinkUnlisten | undefined
 
 const connectionForm = reactive<ConnectionDraft>({
   name: '',
@@ -370,6 +373,137 @@ const saveConnection = () => {
   message.success('已保存连接')
 }
 
+const readUrlValue = (url: URL, names: string[]) => {
+  for (const name of names) {
+    const value = url.searchParams.get(name)?.trim()
+    if (value) return value
+  }
+
+  return ''
+}
+
+const readUrlFlag = (url: URL, names: string[], defaultValue: boolean) => {
+  const value = readUrlValue(url, names).toLowerCase()
+  if (!value) return defaultValue
+  return !['0', 'false', 'no', 'off'].includes(value)
+}
+
+const isTerstermDeepLink = (url: URL) => url.protocol.toLowerCase() === 'tersterm:'
+
+const groupIdFromDeepLink = (value: string) => {
+  const groupName = value.trim()
+  if (!groupName) return DEFAULT_GROUP_ID
+
+  const existing = groups.value.find(
+    (group) => group.id === groupName || group.name.toLowerCase() === groupName.toLowerCase(),
+  )
+  if (existing) {
+    existing.expanded = true
+    return existing.id
+  }
+
+  const group: ConnectionGroup = {
+    id: createId('group'),
+    name: groupName,
+    expanded: true,
+  }
+  groups.value.push(group)
+  return group.id
+}
+
+const profileFromDeepLink = (
+  rawUrl: string,
+): { profile: ConnectionProfile; save: boolean; connect: boolean } | undefined => {
+  let url: URL
+  try {
+    url = new URL(rawUrl)
+  } catch {
+    return undefined
+  }
+
+  if (!isTerstermDeepLink(url)) return undefined
+
+  const command = url.hostname.toLowerCase()
+  const shorthandHost = command && command !== 'connect' ? url.hostname : ''
+  const host = readUrlValue(url, ['host', 'hostname', 'ip']) || shorthandHost
+  const username =
+    readUrlValue(url, ['username', 'user', 'login']) || decodeURIComponent(url.username)
+
+  if (!host || !username) {
+    message.warning('Quick session link needs host and username')
+    return undefined
+  }
+
+  const port = Number(readUrlValue(url, ['port']) || url.port || 22)
+  const name = readUrlValue(url, ['name', 'title']) || `${username}@${host}`
+  const groupValue = readUrlValue(url, ['group', 'group_id', 'folder'])
+  const group_id = groupValue ? groupIdFromDeepLink(groupValue) : DEFAULT_GROUP_ID
+  const password = readUrlValue(url, ['password', 'pass']) || decodeURIComponent(url.password)
+  const private_key_path = readUrlValue(url, ['private_key_path', 'key_path', 'identity'])
+  const private_key = readUrlValue(url, ['private_key', 'key'])
+  const private_key_passphrase = readUrlValue(url, [
+    'private_key_passphrase',
+    'passphrase',
+  ])
+
+  return {
+    profile: {
+      id: createId('connection'),
+      name,
+      host,
+      port: Number.isFinite(port) && port > 0 ? port : 22,
+      username,
+      password: password || undefined,
+      private_key_path: private_key_path || undefined,
+      private_key: private_key || undefined,
+      private_key_passphrase: private_key_passphrase || undefined,
+      group_id,
+    },
+    save: readUrlFlag(url, ['save'], true),
+    connect: readUrlFlag(url, ['connect', 'open'], true),
+  }
+}
+
+const saveOrUpdateQuickConnection = (profile: ConnectionProfile) => {
+  const existingIndex = connections.value.findIndex(
+    (connection) =>
+      connection.host === profile.host &&
+      Number(connection.port || 22) === profile.port &&
+      connection.username === profile.username,
+  )
+
+  if (existingIndex >= 0) {
+    profile.id = connections.value[existingIndex].id
+    connections.value.splice(existingIndex, 1, profile)
+  } else {
+    connections.value.unshift(profile)
+  }
+
+  const group = groups.value.find((item) => item.id === profile.group_id)
+  if (group) group.expanded = true
+  selectedConnectionId.value = profile.id
+}
+
+const openQuickSessionUrls = async (urls: string[]) => {
+  for (const rawUrl of urls) {
+    const quickSession = profileFromDeepLink(rawUrl)
+    if (!quickSession) continue
+
+    const profile = quickSession.profile
+    if (quickSession.save) {
+      saveOrUpdateQuickConnection(profile)
+      message.success(`Saved quick session: ${profile.name}`)
+    }
+
+    if (quickSession.connect) {
+      await openConnectionInPane(profile)
+    } else {
+      resetConnectionForm(profile)
+      connectionModalOpen.value = true
+    }
+  }
+}
+
 const testConnection = async () => {
   const profile = profileFromConnectionForm()
   if (!profile) return
@@ -564,7 +698,23 @@ const handleDisconnected = ({
   })
 }
 
+onMounted(async () => {
+  try {
+    unlistenDeepLink = await onOpenUrl((urls) => {
+      void openQuickSessionUrls(urls)
+    })
+
+    const currentUrls = await getCurrent()
+    if (currentUrls?.length) {
+      void openQuickSessionUrls(currentUrls)
+    }
+  } catch {
+    // Deep links are only available in the Tauri runtime.
+  }
+})
+
 onBeforeUnmount(() => {
+  unlistenDeepLink?.()
   void Promise.all(panes.value.map((pane) => (pane.session_id ? sshDisconnect(pane.session_id) : null)))
 })
 </script>

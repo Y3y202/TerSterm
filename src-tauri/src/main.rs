@@ -18,6 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -57,6 +58,15 @@ struct RemoteFileEntry {
 struct RemoteFileList {
     path: String,
     entries: Vec<RemoteFileEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemUsage {
+    cpu_percent: f32,
+    memory_used_gb: f32,
+    memory_total_gb: f32,
+    storage_used_gb: f32,
+    storage_total_gb: f32,
 }
 
 enum SshCommand {
@@ -184,6 +194,15 @@ async fn ssh_download_file(
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
     tauri::async_runtime::spawn_blocking(move || run_remote_file_download(app, config, remote_path))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ssh_get_system_usage(config: ConnectionConfig) -> Result<SystemUsage, String> {
+    validate_connection_config(&config)?;
+    tauri::async_runtime::spawn_blocking(move || run_remote_system_usage(config))
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
@@ -375,6 +394,14 @@ fn unique_local_path(directory: &Path, filename: &str) -> PathBuf {
 fn connect_sftp(
     config: &ConnectionConfig,
 ) -> Result<(Session, Sftp), Box<dyn std::error::Error + Send + Sync>> {
+    let session = connect_ssh_session(config)?;
+    let sftp = session.sftp()?;
+    Ok((session, sftp))
+}
+
+fn connect_ssh_session(
+    config: &ConnectionConfig,
+) -> Result<Session, Box<dyn std::error::Error + Send + Sync>> {
     let address = (config.host.as_str(), config.port)
         .to_socket_addrs()?
         .next()
@@ -402,11 +429,10 @@ fn connect_sftp(
     }
 
     if !session.authenticated() {
-        return Err("SFTP authentication failed".into());
+        return Err("SSH authentication failed".into());
     }
 
-    let sftp = session.sftp()?;
-    Ok((session, sftp))
+    Ok(session)
 }
 
 fn kind_from_stat(stat: &FileStat) -> String {
@@ -527,6 +553,77 @@ fn run_remote_file_download(
     std::io::copy(&mut remote_file, &mut local_file)?;
 
     Ok(local_path.to_string_lossy().to_string())
+}
+
+fn parse_system_usage_output(
+    output: &str,
+) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
+    let mut cpu_percent = None;
+    let mut memory = None;
+    let mut storage = None;
+
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("CPU") => {
+                cpu_percent = parts.next().and_then(|value| value.parse::<f32>().ok());
+            }
+            Some("MEM") => {
+                let used = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let total = parts.next().and_then(|value| value.parse::<f32>().ok());
+                if let (Some(used), Some(total)) = (used, total) {
+                    memory = Some((used, total));
+                }
+            }
+            Some("DISK") => {
+                let used = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let total = parts.next().and_then(|value| value.parse::<f32>().ok());
+                if let (Some(used), Some(total)) = (used, total) {
+                    storage = Some((used, total));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let (memory_used_gb, memory_total_gb) =
+        memory.ok_or("Unable to read remote memory usage")?;
+    let (storage_used_gb, storage_total_gb) =
+        storage.ok_or("Unable to read remote storage usage")?;
+
+    Ok(SystemUsage {
+        cpu_percent: cpu_percent.ok_or("Unable to read remote CPU usage")?,
+        memory_used_gb,
+        memory_total_gb,
+        storage_used_gb,
+        storage_total_gb,
+    })
+}
+
+fn run_remote_system_usage(
+    config: ConnectionConfig,
+) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
+    let session = connect_ssh_session(&config)?;
+    let mut channel = session.channel_session()?;
+    let command = r##"sh -lc 'read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -BG / | awk "NR==2 { gsub(/G/, \"\", \$2); gsub(/G/, \"\", \$3); printf \"DISK %.2f %.2f\n\", \$3, \$2 }"'"##;
+    channel.exec(command)?;
+
+    let mut output = String::new();
+    channel.read_to_string(&mut output)?;
+
+    let mut stderr = String::new();
+    channel.stderr().read_to_string(&mut stderr).ok();
+    channel.wait_close()?;
+
+    if channel.exit_status()? != 0 {
+        let message = stderr.trim();
+        if message.is_empty() {
+            return Err("Unable to read remote system usage".into());
+        }
+        return Err(message.to_string().into());
+    }
+
+    parse_system_usage_output(&output)
 }
 
 fn run_ssh_session(
@@ -764,6 +861,14 @@ fn run_ssh_test_connection(
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                window.show().ok();
+                window.unminimize().ok();
+                window.set_focus().ok();
+            }
+        }))
         .manage(SshSessions::default())
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
@@ -773,9 +878,11 @@ fn main() {
             ssh_disconnect,
             ssh_list_files,
             ssh_upload_file,
-            ssh_download_file
+            ssh_download_file,
+            ssh_get_system_usage
         ])
         .setup(|app| {
+            app.deep_link().register_all().ok();
             let window = app
                 .get_webview_window("main")
                 .expect("main window not found");
