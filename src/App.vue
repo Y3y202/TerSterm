@@ -162,7 +162,7 @@ let unlistenDeepLink: DeepLinkUnlisten | undefined
 let unlistenSshData: DeepLinkUnlisten | undefined
 let systemUsageTimer: number | undefined
 const systemUsageRequestIds = new Map<string, number>()
-const systemUsagePendingPaneIds = new Set<string>()
+const systemUsagePendingPaneIds = new Map<string, number>()
 
 const connectionForm = reactive<ConnectionDraft>({
   name: '',
@@ -382,13 +382,28 @@ const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string 
   })
 }
 
+const connectionUsesPrivateKey = (connection?: ConnectionProfile) =>
+  Boolean(connection?.private_key?.trim() || connection?.private_key_path?.trim())
+
+const paneLooksAuthenticated = (pane: SshPane) => {
+  const output = pane.terminal_output || ''
+  return (
+    output.includes('Welcome to ') ||
+    output.includes('Last login:') ||
+    /[@][^\r\n]+[:~][^\r\n]*[#>$]\s*$/.test(output)
+  )
+}
+
+const shouldRefreshPaneSystemUsage = (pane: SshPane) =>
+  !connectionUsesPrivateKey(pane.connection) || Boolean(pane.system_usage) || paneLooksAuthenticated(pane)
+
 const refreshPaneSystemUsage = async (pane: SshPane) => {
   if (!pane.connection || !pane.session_id || pane.status !== 'connected') return
   if (systemUsagePendingPaneIds.has(pane.id)) return
 
   const requestId = (systemUsageRequestIds.get(pane.id) || 0) + 1
   systemUsageRequestIds.set(pane.id, requestId)
-  systemUsagePendingPaneIds.add(pane.id)
+  systemUsagePendingPaneIds.set(pane.id, requestId)
 
   try {
     const usage = await sshGetSystemUsage(pane.connection)
@@ -401,13 +416,15 @@ const refreshPaneSystemUsage = async (pane: SshPane) => {
       pane.system_usage_error = error instanceof Error ? error.message : String(error)
     }
   } finally {
-    systemUsagePendingPaneIds.delete(pane.id)
+    if (systemUsagePendingPaneIds.get(pane.id) === requestId) {
+      systemUsagePendingPaneIds.delete(pane.id)
+    }
   }
 }
 
 const refreshAllSystemUsage = () => {
   panes.value.forEach((pane) => {
-    if (pane.status === 'connected' && pane.session_id) {
+    if (pane.status === 'connected' && pane.session_id && shouldRefreshPaneSystemUsage(pane)) {
       void refreshPaneSystemUsage(pane)
     }
   })
@@ -527,10 +544,10 @@ const profileFromConnectionForm = (): ConnectionProfile | undefined => {
     host: connectionForm.host.trim(),
     port: Number(connectionForm.port || 22),
     username: connectionForm.username.trim(),
-    password: connectionForm.password?.trim() || undefined,
+    password: connectionForm.password || undefined,
     private_key_path: connectionForm.private_key_path?.trim() || undefined,
     private_key: connectionForm.private_key?.trim() || undefined,
-    private_key_passphrase: connectionForm.private_key_passphrase?.trim() || undefined,
+    private_key_passphrase: connectionForm.private_key_passphrase || undefined,
     group_id,
   }
 }
@@ -890,7 +907,9 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
         status: 'connected',
         error: undefined,
       })
-      void refreshPaneSystemUsage(pane)
+      if (shouldRefreshPaneSystemUsage(pane)) {
+        void refreshPaneSystemUsage(pane)
+      }
     }
     await nextTick()
     terminalRefs.value[pane.id]?.fitTerminal()
@@ -947,6 +966,11 @@ const appendTerminalOutput = (session_id: string, data: string) => {
 
   const nextOutput = `${pane.terminal_output || ''}${data}`
   pane.terminal_output = nextOutput.length > 200_000 ? nextOutput.slice(-200_000) : nextOutput
+
+  if (connectionUsesPrivateKey(pane.connection) && paneLooksAuthenticated(pane) && !pane.system_usage) {
+    pane.system_usage_error = undefined
+    void refreshPaneSystemUsage(pane)
+  }
 }
 
 onMounted(async () => {
@@ -954,7 +978,6 @@ onMounted(async () => {
   unlistenSshData = await onSshData(({ session_id, data }) => {
     appendTerminalOutput(session_id, data)
   })
-
   try {
     unlistenDeepLink = await onOpenUrl((urls) => {
       void openQuickSessionUrls(urls)
