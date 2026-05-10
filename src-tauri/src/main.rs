@@ -3,7 +3,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
-use ssh2::{FileStat, Session, Sftp};
+use ssh2::{ExtendedData, FileStat, Session, Sftp};
 use std::{
     collections::HashMap,
     env, fs,
@@ -15,7 +15,7 @@ use std::{
         Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -614,7 +614,7 @@ fn run_remote_system_usage(
     config: ConnectionConfig,
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
     let command = format!("sh -lc '{}'", system_usage_shell_fragment());
-    let output = run_openssh_command(config, &command, Duration::from_secs(25))?;
+    let output = run_ssh2_exec_command(&config, &command)?;
     parse_system_usage_output(&output)
 }
 
@@ -622,103 +622,30 @@ fn system_usage_shell_fragment() -> &'static str {
     r#"read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -B1 / | awk "NR==2 { printf \"DISK %.2f %.2f\n\", \$3/1073741824, \$2/1073741824 }""#
 }
 
-fn run_openssh_command(
-    config: ConnectionConfig,
+fn run_ssh2_exec_command(
+    config: &ConnectionConfig,
     remote_command: &str,
-    timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let private_key = prepare_private_key(&config)?;
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 120,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let session = connect_ssh_session(config)?;
+    let mut channel = session.channel_session()?;
+    channel.handle_extended_data(ExtendedData::Merge)?;
+    channel.exec(remote_command)?;
 
-    let command = build_ssh_command(&config, private_key.as_ref(), Some(remote_command));
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
-    let (output_tx, output_rx) = mpsc::channel::<String>();
-
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    output_tx
-                        .send(String::from_utf8_lossy(&buffer[..size]).to_string())
-                        .ok();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let password = config
-        .password
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let private_key_passphrase = config
-        .private_key_passphrase
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let mut password_sent = false;
-    let mut passphrase_sent = false;
     let mut output = String::new();
-    let started_at = Instant::now();
+    channel.read_to_string(&mut output)?;
+    channel.wait_close()?;
 
-    loop {
-        while let Ok(chunk) = output_rx.try_recv() {
-            output.push_str(&chunk);
-            let prompt = output.to_lowercase();
-
-            if !passphrase_sent && prompt.contains("passphrase") {
-                passphrase_sent = true;
-                if let Some(passphrase) = &private_key_passphrase {
-                    writer.write_all(format!("{passphrase}\n").as_bytes())?;
-                    writer.flush()?;
-                }
-            }
-
-            if !password_sent && prompt.contains("password:") {
-                password_sent = true;
-                if let Some(password) = &password {
-                    writer.write_all(format!("{password}\n").as_bytes())?;
-                    writer.flush()?;
-                }
-            }
-        }
-
-        if let Some(status) = child.try_wait()? {
-            while let Ok(chunk) = output_rx.try_recv() {
-                output.push_str(&chunk);
-            }
-
-            if status.success() {
-                return Ok(output);
-            }
-
-            let message = output.trim();
-            if message.is_empty() {
-                return Err(format!("Remote command failed with exit code {}", status.exit_code()).into());
-            }
-
-            return Err(message.to_string().into());
-        }
-
-        if started_at.elapsed() > timeout {
-            child.kill().ok();
-            child.wait().ok();
-            return Err("Remote command timed out".into());
-        }
-
-        thread::sleep(Duration::from_millis(50));
+    let exit_status = channel.exit_status()?;
+    if exit_status == 0 {
+        return Ok(output);
     }
+
+    let message = output.trim();
+    if message.is_empty() {
+        return Err(format!("Remote command failed with exit code {exit_status}").into());
+    }
+
+    Err(message.to_string().into())
 }
 
 fn run_ssh_session(
