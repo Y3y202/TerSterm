@@ -674,8 +674,8 @@ fn run_openssh_command(
 
     loop {
         while let Ok(chunk) = output_rx.try_recv() {
-            let prompt = chunk.to_lowercase();
             output.push_str(&chunk);
+            let prompt = output.to_lowercase();
 
             if !passphrase_sent && prompt.contains("passphrase") {
                 passphrase_sent = true;
@@ -774,13 +774,25 @@ fn run_ssh_session(
             let mut buffer = [0_u8; 8192];
             let mut password_sent = false;
             let mut passphrase_sent = false;
+            let mut auth_prompt_buffer = String::new();
 
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(size) => {
                         let data = String::from_utf8_lossy(&buffer[..size]).to_string();
-                        let prompt = data.to_lowercase();
+                        auth_prompt_buffer.push_str(&data);
+                        if auth_prompt_buffer.len() > 4096 {
+                            auth_prompt_buffer = auth_prompt_buffer
+                                .chars()
+                                .rev()
+                                .take(4096)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                        }
+                        let prompt = auth_prompt_buffer.to_lowercase();
                         if !passphrase_sent
                             && prompt.contains("passphrase")
                             && private_key_passphrase.is_some()
