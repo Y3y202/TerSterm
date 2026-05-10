@@ -128,9 +128,12 @@ fn ssh_connect(
 }
 
 #[tauri::command]
-fn ssh_test_connection(config: ConnectionConfig) -> Result<String, String> {
+async fn ssh_test_connection(config: ConnectionConfig) -> Result<String, String> {
     validate_connection_config(&config)?;
-    run_ssh_test_connection(config).map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || run_ssh_test_connection(config))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -289,7 +292,7 @@ fn build_ssh_command(
     remote_command: Option<&str>,
 ) -> CommandBuilder {
     let mut command = CommandBuilder::new("ssh");
-    command.arg("-tt");
+    command.arg(if remote_command.is_some() { "-T" } else { "-tt" });
     command.arg("-p");
     command.arg(config.port.to_string());
     command.arg("-o");
@@ -414,18 +417,25 @@ fn connect_ssh_session(
     session.set_tcp_stream(tcp);
     session.handshake()?;
 
-    let private_key = prepare_private_key(&config)?;
     let passphrase = config
         .private_key_passphrase
         .as_deref()
         .filter(|value| !value.trim().is_empty());
 
+    let private_key = prepare_private_key(config)?;
+
     if let Some(private_key) = private_key.as_ref() {
-        session.userauth_pubkey_file(&config.username, None, &private_key.path, passphrase)?;
+        session
+            .userauth_pubkey_file(&config.username, None, &private_key.path, passphrase)
+            .map_err(|error| format!("SSH private key authentication failed: {error}"))?;
     } else if let Some(password) = config.password.as_deref().filter(|value| !value.is_empty()) {
-        session.userauth_password(&config.username, password)?;
+        session
+            .userauth_password(&config.username, password)
+            .map_err(|error| format!("SSH password authentication failed: {error}"))?;
     } else {
-        session.userauth_agent(&config.username)?;
+        session
+            .userauth_agent(&config.username)
+            .map_err(|error| format!("SSH agent authentication failed: {error}"))?;
     }
 
     if !session.authenticated() {
@@ -603,27 +613,112 @@ fn parse_system_usage_output(
 fn run_remote_system_usage(
     config: ConnectionConfig,
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
-    let session = connect_ssh_session(&config)?;
-    let mut channel = session.channel_session()?;
-    let command = r##"sh -lc 'read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -BG / | awk "NR==2 { gsub(/G/, \"\", \$2); gsub(/G/, \"\", \$3); printf \"DISK %.2f %.2f\n\", \$3, \$2 }"'"##;
-    channel.exec(command)?;
-
-    let mut output = String::new();
-    channel.read_to_string(&mut output)?;
-
-    let mut stderr = String::new();
-    channel.stderr().read_to_string(&mut stderr).ok();
-    channel.wait_close()?;
-
-    if channel.exit_status()? != 0 {
-        let message = stderr.trim();
-        if message.is_empty() {
-            return Err("Unable to read remote system usage".into());
-        }
-        return Err(message.to_string().into());
-    }
-
+    let command = format!("sh -lc '{}'", system_usage_shell_fragment());
+    let output = run_openssh_command(config, &command, Duration::from_secs(25))?;
     parse_system_usage_output(&output)
+}
+
+fn system_usage_shell_fragment() -> &'static str {
+    r#"read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -B1 / | awk "NR==2 { printf \"DISK %.2f %.2f\n\", \$3/1073741824, \$2/1073741824 }""#
+}
+
+fn run_openssh_command(
+    config: ConnectionConfig,
+    remote_command: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let private_key = prepare_private_key(&config)?;
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: 24,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let command = build_ssh_command(&config, private_key.as_ref(), Some(remote_command));
+    let mut child = pair.slave.spawn_command(command)?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let mut writer = pair.master.take_writer()?;
+    let (output_tx, output_rx) = mpsc::channel::<String>();
+
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    output_tx
+                        .send(String::from_utf8_lossy(&buffer[..size]).to_string())
+                        .ok();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let password = config
+        .password
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let private_key_passphrase = config
+        .private_key_passphrase
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let mut password_sent = false;
+    let mut passphrase_sent = false;
+    let mut output = String::new();
+    let started_at = Instant::now();
+
+    loop {
+        while let Ok(chunk) = output_rx.try_recv() {
+            let prompt = chunk.to_lowercase();
+            output.push_str(&chunk);
+
+            if !passphrase_sent && prompt.contains("passphrase") {
+                passphrase_sent = true;
+                if let Some(passphrase) = &private_key_passphrase {
+                    writer.write_all(format!("{passphrase}\n").as_bytes())?;
+                    writer.flush()?;
+                }
+            }
+
+            if !password_sent && prompt.contains("password:") {
+                password_sent = true;
+                if let Some(password) = &password {
+                    writer.write_all(format!("{password}\n").as_bytes())?;
+                    writer.flush()?;
+                }
+            }
+        }
+
+        if let Some(status) = child.try_wait()? {
+            while let Ok(chunk) = output_rx.try_recv() {
+                output.push_str(&chunk);
+            }
+
+            if status.success() {
+                return Ok(output);
+            }
+
+            let message = output.trim();
+            if message.is_empty() {
+                return Err(format!("Remote command failed with exit code {}", status.exit_code()).into());
+            }
+
+            return Err(message.to_string().into());
+        }
+
+        if started_at.elapsed() > timeout {
+            child.kill().ok();
+            child.wait().ok();
+            return Err("Remote command timed out".into());
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn run_ssh_session(
@@ -752,8 +847,12 @@ fn run_ssh_session(
         }
 
         if reader_done_rx.try_recv().is_ok() {
-            child.wait().ok();
-            return Ok(());
+            let status = child.wait()?;
+            if status.success() {
+                return Ok(());
+            }
+
+            return Err(format!("SSH process exited with code {}", status.exit_code()).into());
         }
     }
 }
@@ -761,101 +860,15 @@ fn run_ssh_session(
 fn run_ssh_test_connection(
     config: ConnectionConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let private_key = prepare_private_key(&config)?;
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 100,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let session = connect_ssh_session(&config)?;
+    let mut channel = session.channel_session()?;
+    channel.exec("true")?;
+    channel.wait_close()?;
 
-    let command = build_ssh_command(&config, private_key.as_ref(), Some("exit"));
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
-    let (output_tx, output_rx) = mpsc::channel::<String>();
-
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(size) => {
-                    output_tx
-                        .send(String::from_utf8_lossy(&buffer[..size]).to_string())
-                        .ok();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let password = config
-        .password
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let private_key_passphrase = config
-        .private_key_passphrase
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let mut password_sent = false;
-    let mut passphrase_sent = false;
-    let mut output = String::new();
-    let started_at = Instant::now();
-
-    loop {
-        while let Ok(chunk) = output_rx.try_recv() {
-            let prompt = chunk.to_lowercase();
-            output.push_str(&chunk);
-
-            if !passphrase_sent && prompt.contains("passphrase") {
-                passphrase_sent = true;
-                if let Some(passphrase) = &private_key_passphrase {
-                    writer.write_all(format!("{passphrase}\n").as_bytes())?;
-                    writer.flush()?;
-                }
-            }
-
-            if !password_sent && prompt.contains("password:") {
-                password_sent = true;
-                if let Some(password) = &password {
-                    writer.write_all(format!("{password}\n").as_bytes())?;
-                    writer.flush()?;
-                }
-            }
-        }
-
-        if let Some(status) = child.try_wait()? {
-            while let Ok(chunk) = output_rx.try_recv() {
-                output.push_str(&chunk);
-            }
-
-            if status.success() {
-                return Ok("Connection test succeeded".to_string());
-            }
-
-            let message = output.trim();
-            if message.is_empty() {
-                return Err(format!(
-                    "Connection test failed with exit code {}",
-                    status.exit_code()
-                )
-                .into());
-            }
-
-            return Err(message.to_string().into());
-        }
-
-        if started_at.elapsed() > Duration::from_secs(30) {
-            child.kill().ok();
-            child.wait().ok();
-            return Err("Connection test timed out after 30 seconds".into());
-        }
-
-        thread::sleep(Duration::from_millis(50));
+    if channel.exit_status()? == 0 {
+        Ok("Connection test succeeded".to_string())
+    } else {
+        Err("Connection test command failed".into())
     }
 }
 

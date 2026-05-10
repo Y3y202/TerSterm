@@ -14,7 +14,14 @@ import {
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import TerminalPane from './components/TerminalPane.vue'
-import { sshConnect, sshDisconnect, sshTestConnection } from './bridge'
+import {
+  onSshData,
+  sshConnect,
+  sshDisconnect,
+  sshGetSystemUsage,
+  sshTestConnection,
+  sshWrite,
+} from './bridge'
 import type { ConnectionGroup, ConnectionProfile, SshPane } from './types'
 
 const CONNECTION_STORAGE_KEY = 'tersterm.connections'
@@ -133,6 +140,7 @@ const rawConnections = readRawConnections()
 const groups = ref<ConnectionGroup[]>(readStoredGroups(rawConnections))
 const connections = ref<ConnectionProfile[]>(normalizeConnections(rawConnections, groups.value))
 const panes = ref<SshPane[]>([createPane(0)])
+const visiblePaneIds = ref<string[]>([panes.value[0].id])
 const activePaneId = ref(panes.value[0].id)
 const searchText = ref('')
 const connectionModalOpen = ref(false)
@@ -146,8 +154,15 @@ const sidebarWidth = ref(
 )
 const resizingSidebar = ref(false)
 const selectedConnectionId = ref<string>()
+const syncInputEnabled = ref(false)
+const syncInputConfigOpen = ref(false)
+const syncedPaneIds = ref<string[]>([])
 const terminalRefs = ref<Record<string, InstanceType<typeof TerminalPane>>>({})
 let unlistenDeepLink: DeepLinkUnlisten | undefined
+let unlistenSshData: DeepLinkUnlisten | undefined
+let systemUsageTimer: number | undefined
+const systemUsageRequestIds = new Map<string, number>()
+const systemUsagePendingPaneIds = new Set<string>()
 
 const connectionForm = reactive<ConnectionDraft>({
   name: '',
@@ -173,7 +188,24 @@ const splitLayouts = [
   { count: 4, title: '四分屏', icon: 'quad' },
 ]
 
+const visiblePanes = computed(() =>
+  visiblePaneIds.value
+    .map((paneId) => panes.value.find((pane) => pane.id === paneId))
+    .filter((pane): pane is SshPane => Boolean(pane)),
+)
 const activePane = computed(() => panes.value.find((pane) => pane.id === activePaneId.value))
+const visibleConnectedPanes = computed(() =>
+  visiblePanes.value.filter((pane) => pane.status === 'connected' && pane.session_id),
+)
+const syncTargetPanes = computed(() =>
+  visibleConnectedPanes.value.filter((pane) => syncedPaneIds.value.includes(pane.id)),
+)
+const canBroadcastInput = computed(() => syncInputEnabled.value && syncTargetPanes.value.length >= 2)
+
+const paneSubtitle = (pane: SshPane) => {
+  if (!pane.connection) return pane.status === 'idle' ? '未连接' : pane.status
+  return `${pane.connection.username}@${pane.connection.host}:${pane.connection.port}`
+}
 
 const groupOptions = computed(() =>
   groups.value.map((group) => ({
@@ -235,6 +267,11 @@ watch(
   { deep: true },
 )
 
+watch(
+  () => visibleConnectedPanes.value.map((pane) => `${pane.id}:${pane.session_id}`).join('|'),
+  () => pruneSyncTargets(),
+)
+
 const setTerminalRef = (paneId: string, component: InstanceType<typeof TerminalPane> | null) => {
   if (!component) {
     delete terminalRefs.value[paneId]
@@ -251,6 +288,147 @@ const fitAllTerminals = () => {
   requestAnimationFrame(() => {
     Object.values(terminalRefs.value).forEach((terminal) => terminal?.fitTerminal())
   })
+}
+
+const showPane = async (paneId: string) => {
+  const current = visiblePaneIds.value.filter((id) => panes.value.some((pane) => pane.id === id))
+  if (!current.includes(paneId)) {
+    if (current.length < MAX_PANES) {
+      current.push(paneId)
+    } else {
+      const replaceIndex = Math.max(0, current.indexOf(activePaneId.value))
+      current[replaceIndex] = paneId
+    }
+    visiblePaneIds.value = current
+  }
+
+  activePaneId.value = paneId
+  await nextTick()
+  terminalRefs.value[paneId]?.fitTerminal()
+}
+
+const switchToPane = async (paneId: string) => {
+  const current = visiblePaneIds.value.filter((id) => panes.value.some((pane) => pane.id === id))
+  if (!current.includes(paneId)) {
+    const replaceIndex = Math.max(0, current.indexOf(activePaneId.value))
+    current[replaceIndex] = paneId
+    visiblePaneIds.value = current
+  }
+
+  activePaneId.value = paneId
+  await nextTick()
+  terminalRefs.value[paneId]?.fitTerminal()
+}
+
+const pruneSyncTargets = () => {
+  const selectableIds = new Set(visibleConnectedPanes.value.map((pane) => pane.id))
+  syncedPaneIds.value = syncedPaneIds.value.filter((paneId) => selectableIds.has(paneId))
+  if (syncedPaneIds.value.length < 2) {
+    syncInputEnabled.value = false
+  }
+  if (!syncInputEnabled.value && syncedPaneIds.value.length === 0) {
+    syncInputConfigOpen.value = false
+  }
+}
+
+const toggleSyncInput = () => {
+  pruneSyncTargets()
+
+  if (syncInputEnabled.value) {
+    syncInputEnabled.value = false
+    syncInputConfigOpen.value = false
+    return
+  }
+
+  if (syncedPaneIds.value.length < 2) {
+    syncedPaneIds.value = visibleConnectedPanes.value.slice(0, MAX_PANES).map((pane) => pane.id)
+  }
+
+  if (!syncInputEnabled.value && syncedPaneIds.value.length < 2) {
+    message.warning('请至少选择 2 个已连接的分屏会话')
+    return
+  }
+
+  syncInputEnabled.value = true
+  syncInputConfigOpen.value = true
+}
+
+const toggleSyncPane = (paneId: string) => {
+  if (syncedPaneIds.value.includes(paneId)) {
+    syncedPaneIds.value = syncedPaneIds.value.filter((id) => id !== paneId)
+  } else if (syncedPaneIds.value.length < MAX_PANES) {
+    syncedPaneIds.value = [...syncedPaneIds.value, paneId]
+  }
+
+  pruneSyncTargets()
+  if (syncInputConfigOpen.value && syncedPaneIds.value.length >= 2) {
+    syncInputEnabled.value = true
+  }
+}
+
+const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string }) => {
+  const sourcePane = panes.value.find((pane) => pane.id === pane_id)
+  if (!sourcePane?.session_id || sourcePane.status !== 'connected') return
+
+  const targets =
+    canBroadcastInput.value && syncedPaneIds.value.includes(pane_id)
+      ? syncTargetPanes.value
+      : [sourcePane]
+
+  targets.forEach((pane) => {
+    if (pane.session_id && pane.status === 'connected') {
+      void sshWrite(pane.session_id, data)
+    }
+  })
+}
+
+const refreshPaneSystemUsage = async (pane: SshPane) => {
+  if (!pane.connection || !pane.session_id || pane.status !== 'connected') return
+  if (systemUsagePendingPaneIds.has(pane.id)) return
+
+  const requestId = (systemUsageRequestIds.get(pane.id) || 0) + 1
+  systemUsageRequestIds.set(pane.id, requestId)
+  systemUsagePendingPaneIds.add(pane.id)
+
+  try {
+    const usage = await sshGetSystemUsage(pane.connection)
+    if (systemUsageRequestIds.get(pane.id) === requestId && pane.status === 'connected') {
+      pane.system_usage = usage
+      pane.system_usage_error = undefined
+    }
+  } catch (error) {
+    if (systemUsageRequestIds.get(pane.id) === requestId && pane.status === 'connected') {
+      pane.system_usage_error = error instanceof Error ? error.message : String(error)
+    }
+  } finally {
+    systemUsagePendingPaneIds.delete(pane.id)
+  }
+}
+
+const refreshAllSystemUsage = () => {
+  panes.value.forEach((pane) => {
+    if (pane.status === 'connected' && pane.session_id) {
+      void refreshPaneSystemUsage(pane)
+    }
+  })
+}
+
+const startSystemUsagePolling = () => {
+  if (systemUsageTimer) {
+    window.clearInterval(systemUsageTimer)
+  }
+
+  refreshAllSystemUsage()
+  systemUsageTimer = window.setInterval(refreshAllSystemUsage, 15000)
+}
+
+const stopSystemUsagePolling = () => {
+  if (systemUsageTimer) {
+    window.clearInterval(systemUsageTimer)
+    systemUsageTimer = undefined
+  }
+  systemUsageRequestIds.clear()
+  systemUsagePendingPaneIds.clear()
 }
 
 const startSidebarResize = (event: PointerEvent) => {
@@ -277,30 +455,33 @@ const startSidebarResize = (event: PointerEvent) => {
 
 const setSplitCount = async (count: number) => {
   const nextCount = Math.min(MAX_PANES, Math.max(1, count))
-  if (nextCount === panes.value.length) return
+  if (nextCount === visiblePaneIds.value.length) return
 
-  if (nextCount < panes.value.length) {
-    const removed = panes.value.slice(nextCount)
-    await Promise.all(
-      removed.map((pane) => (pane.session_id ? sshDisconnect(pane.session_id) : null)),
-    )
-    panes.value = panes.value.slice(0, nextCount)
-    if (!panes.value.some((pane) => pane.id === activePaneId.value)) {
-      activePaneId.value = panes.value[0].id
+  if (nextCount < visiblePaneIds.value.length) {
+    visiblePaneIds.value = visiblePaneIds.value.slice(0, nextCount)
+    if (!visiblePaneIds.value.includes(activePaneId.value)) {
+      activePaneId.value = visiblePaneIds.value[0]
     }
     return
   }
 
-  const start = panes.value.length
-  panes.value = [
-    ...panes.value,
-    ...Array.from({ length: nextCount - panes.value.length }, (_, index) =>
-      createPane(start + index),
-    ),
-  ]
+  const nextVisible = [...visiblePaneIds.value]
+  const hiddenPanes = panes.value.filter((pane) => !nextVisible.includes(pane.id))
+  while (nextVisible.length < nextCount) {
+    const hidden = hiddenPanes.shift()
+    if (hidden) {
+      nextVisible.push(hidden.id)
+      continue
+    }
+
+    const pane = createPane(panes.value.length)
+    panes.value.push(pane)
+    nextVisible.push(pane.id)
+  }
+  visiblePaneIds.value = nextVisible
 
   await nextTick()
-  panes.value.forEach((pane) => terminalRefs.value[pane.id]?.fitTerminal())
+  visiblePanes.value.forEach((pane) => terminalRefs.value[pane.id]?.fitTerminal())
 }
 
 const toggleGroup = (groupId: string) => {
@@ -602,6 +783,8 @@ const deleteConnection = async (connection: ConnectionProfile) => {
       session_id: undefined,
       connection: undefined,
       error: undefined,
+      system_usage: undefined,
+      system_usage_error: undefined,
     })
   }
 }
@@ -616,23 +799,70 @@ const disconnectPane = async (pane: SshPane) => {
     status: 'closed',
     session_id: undefined,
     error: undefined,
+    system_usage: undefined,
+    system_usage_error: undefined,
   })
+}
+
+const disconnectPaneById = async (paneId: string) => {
+  const pane = panes.value.find((item) => item.id === paneId)
+  if (pane) {
+    await disconnectPane(pane)
+  }
 }
 
 const closePane = async (paneId: string) => {
   const pane = panes.value.find((item) => item.id === paneId)
   if (!pane) return
+  const visibleCount = visiblePaneIds.value.length
 
   await disconnectPane(pane)
-  Object.assign(pane, {
-    title: `终端 ${panes.value.findIndex((item) => item.id === paneId) + 1}`,
-    status: 'idle',
-    connection: undefined,
-  })
+  panes.value = panes.value.filter((item) => item.id !== paneId)
+  delete terminalRefs.value[paneId]
+
+  if (panes.value.length === 0) {
+    panes.value.push(createPane(0))
+  }
+
+  const nextVisible = visiblePaneIds.value.filter((id) => id !== paneId)
+  for (const candidate of panes.value) {
+    if (nextVisible.length >= Math.min(visibleCount, panes.value.length, MAX_PANES)) break
+    if (!nextVisible.includes(candidate.id)) {
+      nextVisible.push(candidate.id)
+    }
+  }
+
+  visiblePaneIds.value = nextVisible.length ? nextVisible : [panes.value[0].id]
+  if (!visiblePaneIds.value.includes(activePaneId.value)) {
+    activePaneId.value = visiblePaneIds.value[0]
+  }
+}
+
+const findPaneForSidebarConnection = async () => {
+  const active = activePane.value
+  if (active && active.status !== 'connected' && active.status !== 'connecting') {
+    return active.id
+  }
+
+  const available = visiblePanes.value.find(
+    (pane) => pane.status !== 'connected' && pane.status !== 'connecting',
+  )
+  if (available) return available.id
+
+  const pane = createPane(panes.value.length)
+  panes.value.push(pane)
+
+  const nextVisible = [...visiblePaneIds.value]
+  const replaceIndex = Math.max(0, nextVisible.indexOf(activePaneId.value))
+  nextVisible[replaceIndex] = pane.id
+  visiblePaneIds.value = nextVisible
+  await nextTick()
+  return pane.id
 }
 
 const openConnectionInPane = async (connection: ConnectionProfile, paneId = activePaneId.value) => {
   const pane = panes.value.find((item) => item.id === paneId) || panes.value[0]
+  await showPane(pane.id)
   activePaneId.value = pane.id
   selectedConnectionId.value = connection.id
 
@@ -646,6 +876,9 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
     connection,
     session_id: undefined,
     error: undefined,
+    terminal_output: '',
+    system_usage: undefined,
+    system_usage_error: undefined,
   })
 
   try {
@@ -657,6 +890,7 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
         status: 'connected',
         error: undefined,
       })
+      void refreshPaneSystemUsage(pane)
     }
     await nextTick()
     terminalRefs.value[pane.id]?.fitTerminal()
@@ -666,6 +900,13 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
       status: 'error',
       error: error instanceof Error ? error.message : String(error),
     })
+  }
+}
+
+const openConnectionFromSidebar = async (connection: ConnectionProfile) => {
+  const paneId = await findPaneForSidebarConnection()
+  if (paneId) {
+    await openConnectionInPane(connection, paneId)
   }
 }
 
@@ -692,13 +933,28 @@ const handleDisconnected = ({
   if (!pane || pane.session_id !== session_id) return
 
   Object.assign(pane, {
-    status: 'closed',
+    status: reason ? 'error' : 'closed',
     session_id: undefined,
     error: reason,
+    system_usage: undefined,
+    system_usage_error: undefined,
   })
 }
 
+const appendTerminalOutput = (session_id: string, data: string) => {
+  const pane = panes.value.find((item) => item.session_id === session_id)
+  if (!pane) return
+
+  const nextOutput = `${pane.terminal_output || ''}${data}`
+  pane.terminal_output = nextOutput.length > 200_000 ? nextOutput.slice(-200_000) : nextOutput
+}
+
 onMounted(async () => {
+  startSystemUsagePolling()
+  unlistenSshData = await onSshData(({ session_id, data }) => {
+    appendTerminalOutput(session_id, data)
+  })
+
   try {
     unlistenDeepLink = await onOpenUrl((urls) => {
       void openQuickSessionUrls(urls)
@@ -714,6 +970,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  stopSystemUsagePolling()
+  unlistenSshData?.()
   unlistenDeepLink?.()
   void Promise.all(panes.value.map((pane) => (pane.session_id ? sshDisconnect(pane.session_id) : null)))
 })
@@ -804,7 +1062,7 @@ onBeforeUnmount(() => {
               :key="connection.id"
               class="connection-item"
               :class="{ selected: selectedConnectionId === connection.id }"
-              @click="openConnectionInPane(connection)"
+              @click="openConnectionFromSidebar(connection)"
             >
               <span class="connection-main">
                 <strong>{{ connection.name }}</strong>
@@ -861,7 +1119,7 @@ onBeforeUnmount(() => {
             <a-tooltip v-for="layout in splitLayouts" :key="layout.count" :title="layout.title">
               <button
                 class="split-layout-button"
-                :class="{ active: panes.length === layout.count }"
+                :class="{ active: visiblePaneIds.length === layout.count }"
                 type="button"
                 :aria-label="layout.title"
                 @click="setSplitCount(layout.count)"
@@ -875,22 +1133,73 @@ onBeforeUnmount(() => {
               </button>
             </a-tooltip>
           </div>
+          <a-button
+            :type="syncInputEnabled ? 'primary' : 'default'"
+            :disabled="visibleConnectedPanes.length < 2"
+            @click="toggleSyncInput"
+          >
+            同步输入
+          </a-button>
           <a-button :icon="h(SaveOutlined)" @click="openConnectionModal()">
             保存连接
           </a-button>
         </div>
       </header>
 
-      <div class="terminal-grid" :class="`grid-${panes.length}`">
-        <TerminalPane
+      <div v-if="panes.length > 1" class="session-strip" aria-label="会话列表">
+        <button
           v-for="pane in panes"
+          :key="pane.id"
+          class="session-chip"
+          :class="{ active: pane.id === activePaneId, visible: visiblePaneIds.includes(pane.id) }"
+          type="button"
+          @click="switchToPane(pane.id)"
+        >
+          <span class="status-dot" :class="pane.status" />
+          <span class="session-chip-text">
+            <strong>{{ pane.title }}</strong>
+            <small>{{ paneSubtitle(pane) }}</small>
+          </span>
+          <span class="session-chip-close" role="button" title="关闭会话" @click.stop="closePane(pane.id)">
+            x
+          </span>
+        </button>
+      </div>
+
+      <div
+        v-if="syncInputConfigOpen && visibleConnectedPanes.length > 1"
+        class="sync-strip"
+        aria-label="同步输入会话"
+      >
+        <span class="sync-strip-label">同步到</span>
+        <button
+          v-for="pane in visibleConnectedPanes"
+          :key="pane.id"
+          class="sync-chip"
+          :class="{ selected: syncedPaneIds.includes(pane.id) }"
+          type="button"
+          @click="toggleSyncPane(pane.id)"
+        >
+          <span class="sync-check">{{ syncedPaneIds.includes(pane.id) ? 'on' : '' }}</span>
+          <span class="sync-chip-text">
+            <strong>{{ pane.title }}</strong>
+            <small>{{ pane.connection?.host }}</small>
+          </span>
+        </button>
+      </div>
+
+      <div class="terminal-grid" :class="`grid-${visiblePanes.length}`">
+        <TerminalPane
+          v-for="pane in visiblePanes"
           :key="pane.id"
           :ref="(component) => setTerminalRef(pane.id, component as InstanceType<typeof TerminalPane> | null)"
           :pane="pane"
           :active="pane.id === activePaneId"
           @focus="activePaneId = $event"
+          @disconnect="disconnectPaneById"
           @close="closePane"
           @connect="connectFromPane"
+          @input="handleTerminalInput"
           @disconnected="handleDisconnected"
         />
       </div>

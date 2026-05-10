@@ -27,6 +27,9 @@ export interface SshPane {
   session_id?: string
   connection?: ConnectionProfile
   error?: string
+  terminal_output?: string
+  system_usage?: SystemUsage
+  system_usage_error?: string
 }
 
 export interface SshDataEvent {

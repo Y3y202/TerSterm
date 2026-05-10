@@ -20,13 +20,11 @@ import {
   onSshData,
   onSshDisconnected,
   sshDownloadFile,
-  sshGetSystemUsage,
   sshListFiles,
   sshResize,
   sshUploadFile,
-  sshWrite,
 } from '../bridge'
-import type { RemoteFileEntry, SshPane, SystemUsage } from '../types'
+import type { RemoteFileEntry, SshPane } from '../types'
 
 const props = defineProps<{
   pane: SshPane
@@ -35,8 +33,10 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   focus: [paneId: string]
+  disconnect: [paneId: string]
   close: [paneId: string]
   connect: [paneId: string]
+  input: [payload: { pane_id: string; data: string }]
   disconnected: [payload: { pane_id: string; session_id: string; reason?: string }]
 }>()
 
@@ -48,7 +48,6 @@ const remoteFiles = ref<RemoteFileEntry[]>([])
 const fileLoading = ref(false)
 const transferring = ref(false)
 const dragActive = ref(false)
-const systemUsage = ref<SystemUsage | null>(null)
 
 let terminal: Terminal | undefined
 let fitAddon: FitAddon | undefined
@@ -57,8 +56,6 @@ let unlistenData: (() => void) | undefined
 let unlistenDisconnected: (() => void) | undefined
 let inputBuffer = ''
 let refreshTimer: number | undefined
-let usageTimer: number | undefined
-let usageRequestId = 0
 let refreshRequestId = 0
 let queuedRefreshPath: string | undefined
 
@@ -101,9 +98,9 @@ const resetTerminal = (notice?: string) => {
   }
 }
 
-const closePane = () => {
-  emit('close', props.pane.id)
-}
+const disconnectPane = () => emit('disconnect', props.pane.id)
+
+const closePane = () => emit('close', props.pane.id)
 
 const normalizePath = (path: string) => {
   const combined = path.startsWith('/') || path.startsWith('~') ? path : `${remotePath.value}/${path}`
@@ -270,39 +267,6 @@ const scheduleRefreshFiles = (path = remotePath.value) => {
   }, 350)
 }
 
-const refreshSystemUsage = async () => {
-  if (!props.pane.connection || !isConnected.value) return
-  const requestId = ++usageRequestId
-
-  try {
-    const result = await sshGetSystemUsage(props.pane.connection)
-    if (requestId === usageRequestId) {
-      systemUsage.value = result
-    }
-  } catch {
-    if (requestId === usageRequestId) {
-      systemUsage.value = null
-    }
-  }
-}
-
-const stopSystemUsagePolling = () => {
-  if (usageTimer) {
-    window.clearInterval(usageTimer)
-    usageTimer = undefined
-  }
-  usageRequestId += 1
-}
-
-const startSystemUsagePolling = () => {
-  stopSystemUsagePolling()
-  systemUsage.value = null
-  if (!props.pane.connection || !isConnected.value) return
-
-  void refreshSystemUsage()
-  usageTimer = window.setInterval(refreshSystemUsage, 5000)
-}
-
 const openFileManager = async () => {
   fileManagerOpen.value = !fileManagerOpen.value
   if (fileManagerOpen.value && remoteFiles.value.length === 0) {
@@ -407,7 +371,6 @@ watch(
       remotePath.value = '~'
       remoteFiles.value = []
       fileManagerOpen.value = false
-      systemUsage.value = null
     }
 
     if (status === 'error' && props.pane.error) {
@@ -426,11 +389,6 @@ watch(
     fitTerminal()
     terminal?.focus()
   },
-)
-
-watch(
-  () => [props.pane.status, props.pane.session_id, props.pane.connection?.id],
-  () => startSystemUsagePolling(),
 )
 
 onMounted(async () => {
@@ -458,11 +416,14 @@ onMounted(async () => {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
   terminal.open(terminalHost.value!)
+  if (props.pane.terminal_output) {
+    terminal.write(props.pane.terminal_output)
+  }
 
   terminal.onData((data) => {
     if (!props.pane.session_id || props.pane.status !== 'connected') return
     trackShellInput(data)
-    void sshWrite(props.pane.session_id, data)
+    emit('input', { pane_id: props.pane.id, data })
   })
 
   resizeObserver = new ResizeObserver(() => fitTerminal())
@@ -485,14 +446,12 @@ onMounted(async () => {
   })
 
   window.setTimeout(fitTerminal, 80)
-  startSystemUsagePolling()
 })
 
 onBeforeUnmount(() => {
   if (refreshTimer) {
     window.clearTimeout(refreshTimer)
   }
-  stopSystemUsagePolling()
   resizeObserver?.disconnect()
   unlistenData?.()
   unlistenDisconnected?.()
@@ -523,10 +482,18 @@ defineExpose({
           <span>{{ statusText }}</span>
         </div>
       </div>
-      <div v-if="isConnected && systemUsage" class="pane-metrics">
-        <span>CPU {{ formatPercent(systemUsage.cpu_percent) }}</span>
-        <span>内存 {{ formatGbPair(systemUsage.memory_used_gb, systemUsage.memory_total_gb) }}</span>
-        <span>存储 {{ formatGbPair(systemUsage.storage_used_gb, systemUsage.storage_total_gb) }}</span>
+      <div v-if="isConnected" class="pane-metrics">
+        <span v-if="pane.system_usage">CPU {{ formatPercent(pane.system_usage.cpu_percent) }}</span>
+        <span v-if="pane.system_usage">
+          内存 {{ formatGbPair(pane.system_usage.memory_used_gb, pane.system_usage.memory_total_gb) }}
+        </span>
+        <span v-if="pane.system_usage">
+          存储 {{ formatGbPair(pane.system_usage.storage_used_gb, pane.system_usage.storage_total_gb) }}
+        </span>
+        <span v-if="!pane.system_usage && pane.system_usage_error" :title="pane.system_usage_error">
+          资源错误
+        </span>
+        <span v-if="!pane.system_usage && !pane.system_usage_error">资源 --</span>
       </div>
       <div class="pane-actions">
         <a-tooltip title="文件管理">
@@ -553,7 +520,7 @@ defineExpose({
             size="small"
             :icon="h(PoweroffOutlined)"
             :disabled="!isConnected"
-            @click.stop="closePane"
+            @click.stop="disconnectPane"
           />
         </a-tooltip>
         <a-tooltip title="关闭">
