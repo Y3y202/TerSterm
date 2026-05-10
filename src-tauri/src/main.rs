@@ -78,6 +78,24 @@ enum SshCommand {
 #[derive(Default)]
 struct SshSessions(Mutex<HashMap<String, Sender<SshCommand>>>);
 
+impl Drop for SshSessions {
+    fn drop(&mut self) {
+        disconnect_all_sessions(self);
+    }
+}
+
+fn disconnect_all_sessions(sessions: &SshSessions) {
+    let senders = sessions
+        .0
+        .lock()
+        .map(|mut store| store.drain().map(|(_, sender)| sender).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    for sender in senders {
+        sender.send(SshCommand::Disconnect).ok();
+    }
+}
+
 #[tauri::command]
 fn ssh_connect(
     app: AppHandle,
@@ -833,6 +851,13 @@ fn main() {
             ssh_download_file,
             ssh_get_system_usage
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                let sessions = window.app_handle().state::<SshSessions>();
+                disconnect_all_sessions(&sessions);
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
         .setup(|app| {
             app.deep_link().register_all().ok();
             let window = app
