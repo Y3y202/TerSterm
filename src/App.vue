@@ -2,15 +2,14 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import {
-  AppstoreOutlined,
   DeleteOutlined,
   EditOutlined,
   FolderAddOutlined,
   FolderOpenOutlined,
   PlusOutlined,
   RightOutlined,
-  SaveOutlined,
   SearchOutlined,
+  SyncOutlined,
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
 import TerminalPane from './components/TerminalPane.vue'
@@ -30,11 +29,12 @@ const SIDEBAR_WIDTH_STORAGE_KEY = 'tersterm.sidebarWidth'
 const DEFAULT_GROUP_ID = 'default'
 const DEFAULT_GROUP_NAME = '默认'
 const MAX_PANES = 4
-const MIN_SIDEBAR_WIDTH = 240
-const MAX_SIDEBAR_WIDTH = 520
+const MIN_SIDEBAR_WIDTH = 200
+const MAX_SIDEBAR_WIDTH = 420
 
 type ConnectionDraft = Omit<ConnectionProfile, 'id'> & { id?: string }
 type DeepLinkUnlisten = () => void
+type PendingPaneCredential = 'private_key_passphrase'
 
 const createId = (prefix: string) => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -149,7 +149,7 @@ const testingConnection = ref(false)
 const sidebarWidth = ref(
   Math.min(
     MAX_SIDEBAR_WIDTH,
-    Math.max(MIN_SIDEBAR_WIDTH, Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)) || 292),
+    Math.max(MIN_SIDEBAR_WIDTH, Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)) || 228),
   ),
 )
 const resizingSidebar = ref(false)
@@ -163,6 +163,8 @@ let unlistenSshData: DeepLinkUnlisten | undefined
 let systemUsageTimer: number | undefined
 const systemUsageRequestIds = new Map<string, number>()
 const systemUsagePendingPaneIds = new Map<string, number>()
+const pendingPaneCredentials = new Map<string, PendingPaneCredential>()
+const pendingPaneCredentialBuffers = new Map<string, string>()
 
 const connectionForm = reactive<ConnectionDraft>({
   name: '',
@@ -201,11 +203,6 @@ const syncTargetPanes = computed(() =>
   visibleConnectedPanes.value.filter((pane) => syncedPaneIds.value.includes(pane.id)),
 )
 const canBroadcastInput = computed(() => syncInputEnabled.value && syncTargetPanes.value.length >= 2)
-
-const paneSubtitle = (pane: SshPane) => {
-  if (!pane.connection) return pane.status === 'idle' ? '未连接' : pane.status
-  return `${pane.connection.username}@${pane.connection.host}:${pane.connection.port}`
-}
 
 const groupOptions = computed(() =>
   groups.value.map((group) => ({
@@ -368,7 +365,14 @@ const toggleSyncPane = (paneId: string) => {
 
 const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string }) => {
   const sourcePane = panes.value.find((pane) => pane.id === pane_id)
-  if (!sourcePane?.session_id || sourcePane.status !== 'connected') return
+  if (
+    !sourcePane?.session_id ||
+    (sourcePane.status !== 'connecting' && sourcePane.status !== 'connected')
+  ) {
+    return
+  }
+
+  capturePendingPaneCredentialInput(sourcePane, data)
 
   const targets =
     canBroadcastInput.value && syncedPaneIds.value.includes(pane_id)
@@ -376,7 +380,10 @@ const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string 
       : [sourcePane]
 
   targets.forEach((pane) => {
-    if (pane.session_id && pane.status === 'connected') {
+    if (
+      pane.session_id &&
+      (pane.status === 'connecting' || pane.status === 'connected')
+    ) {
       void sshWrite(pane.session_id, data)
     }
   })
@@ -385,40 +392,191 @@ const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string 
 const connectionUsesPrivateKey = (connection?: ConnectionProfile) =>
   Boolean(connection?.private_key?.trim() || connection?.private_key_path?.trim())
 
+const stripTerminalControlSequences = (output: string) =>
+  output.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g, '')
+
+const stripConfiguredPassphrasePrompt = (output: string) =>
+  output.replace(/Enter passphrase for key[^\r\n]*:\s*/gi, '')
+
+const hasPrivateKeyPassphrasePrompt = (output: string) => {
+  const value = stripTerminalControlSequences(output).toLowerCase()
+  return value.includes('enter passphrase for key') || value.includes('passphrase for key')
+}
+
+const clearPendingPaneCredential = (paneId: string) => {
+  pendingPaneCredentials.delete(paneId)
+  pendingPaneCredentialBuffers.delete(paneId)
+}
+
+const trackPendingPaneCredential = (pane: SshPane, data: string) => {
+  if (
+    connectionUsesPrivateKey(pane.connection) &&
+    !pane.connection?.private_key_passphrase &&
+    hasPrivateKeyPassphrasePrompt(pane.terminal_output || data)
+  ) {
+    pendingPaneCredentials.set(pane.id, 'private_key_passphrase')
+    pendingPaneCredentialBuffers.set(pane.id, '')
+    return
+  }
+
+  if (paneLooksAuthenticated(pane)) {
+    clearPendingPaneCredential(pane.id)
+  }
+}
+
+const capturePendingPaneCredentialInput = (pane: SshPane, data: string) => {
+  const shouldCapture =
+    pendingPaneCredentials.get(pane.id) === 'private_key_passphrase' ||
+    (connectionUsesPrivateKey(pane.connection) &&
+      !pane.connection?.private_key_passphrase &&
+      hasPrivateKeyPassphrasePrompt(pane.terminal_output || '') &&
+      !paneLooksAuthenticated(pane))
+
+  if (!shouldCapture) return
+
+  let buffer = pendingPaneCredentialBuffers.get(pane.id) || ''
+  for (const char of data) {
+    if (char === '\u0003') {
+      clearPendingPaneCredential(pane.id)
+      return
+    }
+
+    if (char === '\u007f' || char === '\b') {
+      buffer = buffer.slice(0, -1)
+      continue
+    }
+
+    if (char === '\r' || char === '\n') {
+      if (buffer && pane.connection) {
+        pane.connection = {
+          ...pane.connection,
+          private_key_passphrase: buffer,
+        }
+        pane.private_key_passphrase_origin = 'session'
+        window.setTimeout(() => {
+          if (
+            pane.session_id &&
+            pane.status === 'connected' &&
+            !pane.system_usage &&
+            shouldRefreshPaneSystemUsage(pane)
+          ) {
+            void refreshPaneSystemUsage(pane)
+          }
+        }, 500)
+      }
+      clearPendingPaneCredential(pane.id)
+      return
+    }
+
+    if (char >= ' ' && char !== '\u007f') {
+      buffer += char
+    }
+  }
+
+  pendingPaneCredentialBuffers.set(pane.id, buffer)
+}
+
+const terminalOutputLines = (output: string) =>
+  output
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+const lineLooksLikeShellPrompt = (line: string) =>
+  /[@][^\s:]+(?::|[~/]|\s+)[^\r\n]*[#>$%]$/.test(line) ||
+  /^\[[^\]]+\][#>$%]$/.test(line) ||
+  /^[^\s]{1,80}[#>$%]$/.test(line)
+
 const paneLooksAuthenticated = (pane: SshPane) => {
-  const output = pane.terminal_output || ''
+  const output = stripTerminalControlSequences(pane.terminal_output || '')
+  const trailingLines = terminalOutputLines(output).slice(-5)
+
   return (
     output.includes('Welcome to ') ||
     output.includes('Last login:') ||
-    /[@][^\r\n]+[:~][^\r\n]*[#>$]\s*$/.test(output)
+    trailingLines.some(lineLooksLikeShellPrompt)
   )
 }
 
 const shouldRefreshPaneSystemUsage = (pane: SshPane) =>
-  !connectionUsesPrivateKey(pane.connection) || Boolean(pane.system_usage) || paneLooksAuthenticated(pane)
+  Boolean(pane.connection && pane.session_id && pane.remote_features_ready)
 
 const refreshPaneSystemUsage = async (pane: SshPane) => {
   if (!pane.connection || !pane.session_id || pane.status !== 'connected') return
   if (systemUsagePendingPaneIds.has(pane.id)) return
 
+  const sessionId = pane.session_id
   const requestId = (systemUsageRequestIds.get(pane.id) || 0) + 1
   systemUsageRequestIds.set(pane.id, requestId)
   systemUsagePendingPaneIds.set(pane.id, requestId)
+  pane.system_usage_loading = true
+  pane.system_usage_error = undefined
 
   try {
-    const usage = await sshGetSystemUsage(pane.connection)
-    if (systemUsageRequestIds.get(pane.id) === requestId && pane.status === 'connected') {
+    const usage = await sshGetSystemUsage(pane.connection, sessionId)
+    if (
+      systemUsageRequestIds.get(pane.id) === requestId &&
+      pane.session_id === sessionId &&
+      pane.status === 'connected'
+    ) {
       pane.system_usage = usage
       pane.system_usage_error = undefined
     }
   } catch (error) {
-    if (systemUsageRequestIds.get(pane.id) === requestId && pane.status === 'connected') {
+    if (
+      systemUsageRequestIds.get(pane.id) === requestId &&
+      pane.session_id === sessionId &&
+      pane.status === 'connected'
+    ) {
       pane.system_usage_error = error instanceof Error ? error.message : String(error)
     }
   } finally {
     if (systemUsagePendingPaneIds.get(pane.id) === requestId) {
       systemUsagePendingPaneIds.delete(pane.id)
+      pane.system_usage_loading = false
     }
+  }
+}
+
+const markPaneRemoteFeaturesReady = (pane: SshPane) => {
+  if (!pane.connection || !pane.session_id) return
+
+  pane.remote_features_ready = true
+  if (pane.status === 'connecting') {
+    pane.status = 'connected'
+  }
+
+  if (!pane.system_usage) {
+    pane.system_usage_error = undefined
+    void refreshPaneSystemUsage(pane)
+  }
+}
+
+const stopPaneSession = async (pane: SshPane) => {
+  const session_id = pane.session_id
+  if (!session_id) return
+
+  Object.assign(pane, {
+    status: 'closed' as const,
+    private_key_passphrase_origin: undefined,
+    remote_features_ready: false,
+    error: undefined,
+    system_usage: undefined,
+    system_usage_loading: false,
+    system_usage_error: undefined,
+  })
+  systemUsageRequestIds.delete(pane.id)
+  systemUsagePendingPaneIds.delete(pane.id)
+  clearPendingPaneCredential(pane.id)
+  try {
+    await sshDisconnect(session_id)
+  } catch (error) {
+    if (pane.session_id === session_id) {
+      pane.error = error instanceof Error ? error.message : String(error)
+    }
+  }
+  if (pane.session_id === session_id) {
+    pane.session_id = undefined
   }
 }
 
@@ -791,32 +949,34 @@ const deleteConnection = async (connection: ConnectionProfile) => {
 
   for (const pane of panes.value) {
     if (pane.connection?.id !== connection.id) continue
-    if (pane.session_id) {
-      await sshDisconnect(pane.session_id)
-    }
+    await stopPaneSession(pane)
     Object.assign(pane, {
       title: '终端',
       status: 'idle',
       session_id: undefined,
       connection: undefined,
+      private_key_passphrase_origin: undefined,
+      remote_features_ready: false,
       error: undefined,
       system_usage: undefined,
+      system_usage_loading: false,
       system_usage_error: undefined,
     })
   }
 }
 
 const disconnectPane = async (pane: SshPane) => {
-  if (pane.session_id) {
-    await sshDisconnect(pane.session_id)
-  }
+  await stopPaneSession(pane)
 
   Object.assign(pane, {
     title: pane.connection?.name || pane.title,
     status: 'closed',
     session_id: undefined,
+    private_key_passphrase_origin: undefined,
+    remote_features_ready: false,
     error: undefined,
     system_usage: undefined,
+    system_usage_loading: false,
     system_usage_error: undefined,
   })
 }
@@ -883,33 +1043,35 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
   activePaneId.value = pane.id
   selectedConnectionId.value = connection.id
 
-  if (pane.session_id) {
-    await sshDisconnect(pane.session_id)
-  }
+  await stopPaneSession(pane)
+
+  const paneConnection = { ...connection }
 
   Object.assign(pane, {
     title: connection.name,
     status: 'connecting',
-    connection,
+    connection: paneConnection,
+    private_key_passphrase_origin: connection.private_key_passphrase?.trim() ? 'configured' : undefined,
+    remote_features_ready: false,
     session_id: undefined,
     error: undefined,
     terminal_output: '',
     system_usage: undefined,
+    system_usage_loading: false,
     system_usage_error: undefined,
   })
+  clearPendingPaneCredential(pane.id)
 
   try {
     const session_id = createId('session')
     pane.session_id = session_id
-    await sshConnect(connection, session_id)
+    await sshConnect(paneConnection, session_id)
     if (pane.session_id === session_id && pane.status === 'connecting') {
       Object.assign(pane, {
-        status: 'connected',
+        status: 'connecting',
+        remote_features_ready: false,
         error: undefined,
       })
-      if (shouldRefreshPaneSystemUsage(pane)) {
-        void refreshPaneSystemUsage(pane)
-      }
     }
     await nextTick()
     terminalRefs.value[pane.id]?.fitTerminal()
@@ -917,6 +1079,8 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
     Object.assign(pane, {
       session_id: undefined,
       status: 'error',
+      private_key_passphrase_origin: undefined,
+      remote_features_ready: false,
       error: error instanceof Error ? error.message : String(error),
     })
   }
@@ -954,23 +1118,48 @@ const handleDisconnected = ({
   Object.assign(pane, {
     status: reason ? 'error' : 'closed',
     session_id: undefined,
+    private_key_passphrase_origin: undefined,
+    remote_features_ready: false,
     error: reason,
     system_usage: undefined,
+    system_usage_loading: false,
     system_usage_error: undefined,
   })
+  clearPendingPaneCredential(pane.id)
 }
 
 const appendTerminalOutput = (session_id: string, data: string) => {
   const pane = panes.value.find((item) => item.session_id === session_id)
   if (!pane) return
 
-  const nextOutput = `${pane.terminal_output || ''}${data}`
+  const visibleData = pane.private_key_passphrase_origin === 'configured'
+    ? stripConfiguredPassphrasePrompt(data)
+    : data
+  const nextOutput = `${pane.terminal_output || ''}${visibleData}`
   pane.terminal_output = nextOutput.length > 200_000 ? nextOutput.slice(-200_000) : nextOutput
+  trackPendingPaneCredential(pane, visibleData)
 
-  if (connectionUsesPrivateKey(pane.connection) && paneLooksAuthenticated(pane) && !pane.system_usage) {
+  if (!pane.remote_features_ready && paneLooksAuthenticated(pane)) {
+    markPaneRemoteFeaturesReady(pane)
+  }
+
+  if (shouldRefreshPaneSystemUsage(pane) && !pane.system_usage) {
     pane.system_usage_error = undefined
     void refreshPaneSystemUsage(pane)
   }
+}
+
+const handlePaneAuthenticated = ({
+  pane_id,
+  session_id,
+}: {
+  pane_id: string
+  session_id: string
+}) => {
+  const pane = panes.value.find((item) => item.id === pane_id)
+  if (!pane || pane.session_id !== session_id) return
+
+  markPaneRemoteFeaturesReady(pane)
 }
 
 onMounted(async () => {
@@ -1128,13 +1317,24 @@ onBeforeUnmount(() => {
     <div class="sidebar-resizer" role="separator" aria-label="调整侧边栏宽度" @pointerdown="startSidebarResize" />
 
     <section class="workspace">
-      <header class="workspace-toolbar">
-        <div class="toolbar-title">
-          <AppstoreOutlined />
-          <div>
-            <strong>工作台</strong>
-            <span>{{ activePane?.title || '终端' }}</span>
-          </div>
+      <header class="workspace-strip">
+        <div class="session-strip" aria-label="会话列表">
+          <button
+            v-for="pane in panes"
+            :key="pane.id"
+            class="session-chip"
+            :class="{ active: pane.id === activePaneId, visible: visiblePaneIds.includes(pane.id) }"
+            type="button"
+            @click="switchToPane(pane.id)"
+          >
+            <span class="status-dot" :class="pane.status" />
+            <span class="session-chip-text">
+              <strong>{{ pane.title }}</strong>
+            </span>
+            <span class="session-chip-close" role="button" title="关闭会话" @click.stop="closePane(pane.id)">
+              x
+            </span>
+          </button>
         </div>
 
         <div class="toolbar-actions">
@@ -1159,35 +1359,13 @@ onBeforeUnmount(() => {
           <a-button
             :type="syncInputEnabled ? 'primary' : 'default'"
             :disabled="visibleConnectedPanes.length < 2"
+            :icon="h(SyncOutlined)"
+            aria-label="同步输入"
+            title="同步输入"
             @click="toggleSyncInput"
-          >
-            同步输入
-          </a-button>
-          <a-button :icon="h(SaveOutlined)" @click="openConnectionModal()">
-            保存连接
-          </a-button>
+          />
         </div>
       </header>
-
-      <div v-if="panes.length > 1" class="session-strip" aria-label="会话列表">
-        <button
-          v-for="pane in panes"
-          :key="pane.id"
-          class="session-chip"
-          :class="{ active: pane.id === activePaneId, visible: visiblePaneIds.includes(pane.id) }"
-          type="button"
-          @click="switchToPane(pane.id)"
-        >
-          <span class="status-dot" :class="pane.status" />
-          <span class="session-chip-text">
-            <strong>{{ pane.title }}</strong>
-            <small>{{ paneSubtitle(pane) }}</small>
-          </span>
-          <span class="session-chip-close" role="button" title="关闭会话" @click.stop="closePane(pane.id)">
-            x
-          </span>
-        </button>
-      </div>
 
       <div
         v-if="syncInputConfigOpen && visibleConnectedPanes.length > 1"
@@ -1223,6 +1401,7 @@ onBeforeUnmount(() => {
           @close="closePane"
           @connect="connectFromPane"
           @input="handleTerminalInput"
+          @authenticated="handlePaneAuthenticated"
           @disconnected="handleDisconnected"
         />
       </div>

@@ -26,9 +26,12 @@ export interface SshPane {
   status: PaneStatus
   session_id?: string
   connection?: ConnectionProfile
+  private_key_passphrase_origin?: 'configured' | 'session'
+  remote_features_ready?: boolean
   error?: string
   terminal_output?: string
   system_usage?: SystemUsage
+  system_usage_loading?: boolean
   system_usage_error?: string
 }
 

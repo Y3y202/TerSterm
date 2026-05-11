@@ -1,25 +1,47 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose, Engine as _};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{
+    native_pty_system, Child as PtyChild, CommandBuilder, MasterPty as PtyMasterPty, PtySize,
+};
 use serde::{Deserialize, Serialize};
 use ssh2::{ExtendedData, FileStat, Session, Sftp};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        mpsc::{self, Sender},
-        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_deep_link::DeepLinkExt;
 use uuid::Uuid;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        Threading::{
+            OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+            PROCESS_TERMINATE,
+        },
+    },
+};
+
+#[cfg(windows)]
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 #[derive(Debug, Deserialize, Clone)]
 struct ConnectionConfig {
@@ -75,8 +97,36 @@ enum SshCommand {
     Disconnect,
 }
 
+struct SessionEntry {
+    sender: Sender<SshCommand>,
+    done: Receiver<()>,
+}
+
 #[derive(Default)]
-struct SshSessions(Mutex<HashMap<String, Sender<SshCommand>>>);
+struct SshSessions(Mutex<HashMap<String, SessionEntry>>);
+
+struct OpenSshProcessEntry {
+    session_id: Option<String>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct OpenSshProcesses {
+    entries: Mutex<HashMap<String, OpenSshProcessEntry>>,
+    cancelled_sessions: Mutex<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct SshSessionSecrets(Mutex<HashMap<String, SessionAuthSecrets>>);
+
+#[derive(Default, Clone)]
+struct SessionAuthSecrets {
+    password: Option<String>,
+    private_key_passphrase: Option<String>,
+}
+
+#[derive(Default)]
+struct AppClosing(AtomicBool);
 
 impl Drop for SshSessions {
     fn drop(&mut self) {
@@ -84,15 +134,162 @@ impl Drop for SshSessions {
     }
 }
 
+impl Drop for OpenSshProcesses {
+    fn drop(&mut self) {
+        cancel_all_openssh_processes(self);
+    }
+}
+
+fn configure_subprocess(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn disconnect_all_sessions(sessions: &SshSessions) {
-    let senders = sessions
+    let entries = sessions
         .0
         .lock()
-        .map(|mut store| store.drain().map(|(_, sender)| sender).collect::<Vec<_>>())
+        .map(|mut store| store.drain().map(|(_, entry)| entry).collect::<Vec<_>>())
         .unwrap_or_default();
 
-    for sender in senders {
-        sender.send(SshCommand::Disconnect).ok();
+    for entry in &entries {
+        entry.sender.send(SshCommand::Disconnect).ok();
+    }
+
+    for entry in entries {
+        entry.done.recv_timeout(Duration::from_secs(2)).ok();
+    }
+}
+
+fn cancel_all_openssh_processes(processes: &OpenSshProcesses) {
+    let entries = processes
+        .entries
+        .lock()
+        .map(|mut store| store.drain().map(|(_, entry)| entry).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if let Ok(mut cancelled_sessions) = processes.cancelled_sessions.lock() {
+        cancelled_sessions.extend(entries.iter().filter_map(|entry| entry.session_id.clone()));
+    }
+
+    for entry in entries {
+        entry.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn cancel_session_openssh_processes(processes: &OpenSshProcesses, session_id: &str) {
+    if let Ok(mut cancelled_sessions) = processes.cancelled_sessions.lock() {
+        cancelled_sessions.insert(session_id.to_string());
+    }
+
+    let entries = processes
+        .entries
+        .lock()
+        .map(|mut store| {
+            let keys = store
+                .iter()
+                .filter_map(|(key, entry)| {
+                    (entry.session_id.as_deref() == Some(session_id)).then_some(key.clone())
+                })
+                .collect::<Vec<_>>();
+
+            keys.into_iter()
+                .filter_map(|key| store.remove(&key))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for entry in entries {
+        entry.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn clear_session_openssh_cancellation(processes: &OpenSshProcesses, session_id: &str) {
+    if let Ok(mut cancelled_sessions) = processes.cancelled_sessions.lock() {
+        cancelled_sessions.remove(session_id);
+    }
+}
+
+fn is_session_openssh_cancelled(processes: &OpenSshProcesses, session_id: &str) -> bool {
+    processes
+        .cancelled_sessions
+        .lock()
+        .map(|cancelled_sessions| cancelled_sessions.contains(session_id))
+        .unwrap_or(false)
+}
+
+fn remember_session_private_key_passphrase(
+    secrets: &SshSessionSecrets,
+    session_id: &str,
+    passphrase: String,
+) {
+    if passphrase.trim().is_empty() {
+        return;
+    }
+
+    if let Ok(mut store) = secrets.0.lock() {
+        store
+            .entry(session_id.to_string())
+            .or_default()
+            .private_key_passphrase = Some(passphrase);
+    }
+}
+
+fn remember_session_password(secrets: &SshSessionSecrets, session_id: &str, password: String) {
+    if password.trim().is_empty() {
+        return;
+    }
+
+    if let Ok(mut store) = secrets.0.lock() {
+        store.entry(session_id.to_string()).or_default().password = Some(password);
+    }
+}
+
+fn forget_session_auth_secrets(secrets: &SshSessionSecrets, session_id: &str) {
+    if let Ok(mut store) = secrets.0.lock() {
+        store.remove(session_id);
+    }
+}
+
+fn get_session_auth_secrets(
+    secrets: &SshSessionSecrets,
+    session_id: Option<&str>,
+) -> Option<SessionAuthSecrets> {
+    session_id.and_then(|id| {
+        secrets
+            .0
+            .lock()
+            .ok()
+            .and_then(|store| store.get(id).cloned())
+    })
+}
+
+fn apply_session_auth_secrets(config: &mut ConnectionConfig, secrets: Option<SessionAuthSecrets>) {
+    let Some(secrets) = secrets else {
+        return;
+    };
+
+    if config.password.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        if let Some(password) = secrets.password.filter(|value| !value.trim().is_empty()) {
+            config.password = Some(password);
+        }
+    }
+
+    if config
+        .private_key_passphrase
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return;
+    }
+
+    if let Some(passphrase) = secrets
+        .private_key_passphrase
+        .filter(|value| !value.trim().is_empty())
+    {
+        config.private_key_passphrase = Some(passphrase);
     }
 }
 
@@ -115,12 +312,22 @@ fn ssh_connect(
         return Err("Session id is required".into());
     }
 
+    clear_session_openssh_cancellation(&app.state::<OpenSshProcesses>(), &session_id);
+    forget_session_auth_secrets(&app.state::<SshSessionSecrets>(), &session_id);
+
     let (tx, rx) = mpsc::channel::<SshCommand>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     sessions
         .0
         .lock()
         .map_err(|_| "SSH session store is unavailable".to_string())?
-        .insert(session_id.clone(), tx);
+        .insert(
+            session_id.clone(),
+            SessionEntry {
+                sender: tx,
+                done: done_rx,
+            },
+        );
 
     let thread_session_id = session_id.clone();
     thread::spawn(move || {
@@ -132,6 +339,12 @@ fn ssh_connect(
             store.remove(&thread_session_id);
         }
 
+        forget_session_auth_secrets(
+            &app.state::<SshSessionSecrets>(),
+            &thread_session_id,
+        );
+        clear_session_openssh_cancellation(&app.state::<OpenSshProcesses>(), &thread_session_id);
+
         app.emit(
             "ssh-disconnected",
             SshDisconnectedEvent {
@@ -140,18 +353,23 @@ fn ssh_connect(
             },
         )
         .ok();
+
+        done_tx.send(()).ok();
     });
 
     Ok(session_id)
 }
 
 #[tauri::command]
-async fn ssh_test_connection(config: ConnectionConfig) -> Result<String, String> {
+async fn ssh_test_connection(app: AppHandle, config: ConnectionConfig) -> Result<String, String> {
     validate_connection_config(&config)?;
-    tauri::async_runtime::spawn_blocking(move || run_ssh_test_connection(config))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_ssh_test_connection(&processes, config)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -174,33 +392,60 @@ fn ssh_resize(
 }
 
 #[tauri::command]
-fn ssh_disconnect(sessions: State<'_, SshSessions>, session_id: String) -> Result<(), String> {
-    send_command(&sessions, &session_id, SshCommand::Disconnect)
+fn ssh_disconnect(
+    sessions: State<'_, SshSessions>,
+    processes: State<'_, OpenSshProcesses>,
+    secrets: State<'_, SshSessionSecrets>,
+    session_id: String,
+) -> Result<(), String> {
+    cancel_session_openssh_processes(&processes, &session_id);
+    forget_session_auth_secrets(&secrets, &session_id);
+    send_disconnect_command(&sessions, &session_id)
 }
 
 #[tauri::command]
 async fn ssh_list_files(
-    config: ConnectionConfig,
+    app: AppHandle,
+    mut config: ConnectionConfig,
     remote_path: String,
+    session_id: Option<String>,
 ) -> Result<RemoteFileList, String> {
     validate_connection_config(&config)?;
-    tauri::async_runtime::spawn_blocking(move || run_remote_file_list(config, remote_path))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_file_list(&processes, session_id.as_deref(), config, remote_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 async fn ssh_upload_file(
     app: AppHandle,
-    config: ConnectionConfig,
+    mut config: ConnectionConfig,
     remote_path: String,
     filename: String,
     content_base64: String,
+    session_id: Option<String>,
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
+    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
     tauri::async_runtime::spawn_blocking(move || {
-        run_remote_file_upload(app, config, remote_path, filename, content_base64)
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_file_upload(
+            &processes,
+            session_id.as_deref(),
+            config,
+            remote_path,
+            filename,
+            content_base64,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -210,23 +455,40 @@ async fn ssh_upload_file(
 #[tauri::command]
 async fn ssh_download_file(
     app: AppHandle,
-    config: ConnectionConfig,
+    mut config: ConnectionConfig,
     remote_path: String,
+    session_id: Option<String>,
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
-    tauri::async_runtime::spawn_blocking(move || run_remote_file_download(app, config, remote_path))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_file_download(&app, &processes, session_id.as_deref(), config, remote_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-async fn ssh_get_system_usage(config: ConnectionConfig) -> Result<SystemUsage, String> {
+async fn ssh_get_system_usage(
+    app: AppHandle,
+    mut config: ConnectionConfig,
+    session_id: Option<String>,
+) -> Result<SystemUsage, String> {
     validate_connection_config(&config)?;
-    tauri::async_runtime::spawn_blocking(move || run_remote_system_usage(config))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_system_usage(&processes, session_id.as_deref(), config)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 fn send_command(
@@ -239,12 +501,219 @@ fn send_command(
         .lock()
         .map_err(|_| "SSH session store is unavailable".to_string())?
         .get(session_id)
-        .cloned()
+        .map(|entry| entry.sender.clone())
         .ok_or_else(|| "SSH session not found".to_string())?;
 
     sender
         .send(command)
         .map_err(|_| "SSH session is already closed".to_string())
+}
+
+fn send_disconnect_command(
+    sessions: &State<'_, SshSessions>,
+    session_id: &str,
+) -> Result<(), String> {
+    let sender = sessions
+        .0
+        .lock()
+        .map_err(|_| "SSH session store is unavailable".to_string())?
+        .get(session_id)
+        .map(|entry| entry.sender.clone());
+
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+
+    sender
+        .send(SshCommand::Disconnect)
+        .map_err(|_| "SSH session is already closed".to_string())
+}
+
+struct OpenSshProcessGuard<'a> {
+    processes: &'a OpenSshProcesses,
+    token: String,
+    cancel: Arc<AtomicBool>,
+}
+
+impl OpenSshProcessGuard<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for OpenSshProcessGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut store) = self.processes.entries.lock() {
+            store.remove(&self.token);
+        }
+    }
+}
+
+fn register_openssh_process<'a>(
+    processes: &'a OpenSshProcesses,
+    session_id: Option<&str>,
+) -> OpenSshProcessGuard<'a> {
+    let token = Uuid::new_v4().to_string();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    if session_id.is_some_and(|value| is_session_openssh_cancelled(processes, value)) {
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    if let Ok(mut store) = processes.entries.lock() {
+        store.insert(
+            token.clone(),
+            OpenSshProcessEntry {
+                session_id: session_id.map(|value| value.to_string()),
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    OpenSshProcessGuard {
+        processes,
+        token,
+        cancel,
+    }
+}
+
+#[cfg(windows)]
+fn snapshot_process_entries() -> Option<Vec<(u32, u32)>> {
+    let snapshot: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+        loop {
+            entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    Some(entries)
+}
+
+#[cfg(windows)]
+fn collect_descendants_from_entries(root_process_id: u32, entries: &[(u32, u32)]) -> Vec<u32> {
+    fn collect_descendants(process_id: u32, entries: &[(u32, u32)], descendants: &mut Vec<u32>) {
+        for &(child_id, parent_id) in entries {
+            if parent_id == process_id && child_id != process_id {
+                collect_descendants(child_id, entries, descendants);
+                descendants.push(child_id);
+            }
+        }
+    }
+
+    let mut process_ids = Vec::new();
+    collect_descendants(root_process_id, entries, &mut process_ids);
+    process_ids
+}
+
+#[cfg(windows)]
+fn collect_descendant_process_ids(root_process_id: u32) -> Vec<u32> {
+    let Some(entries) = snapshot_process_entries() else {
+        return Vec::new();
+    };
+
+    collect_descendants_from_entries(root_process_id, &entries)
+}
+
+#[cfg(windows)]
+fn terminate_process_ids(process_ids: &[u32]) -> bool {
+    let mut terminated_any = false;
+
+    for &pid in process_ids {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE_ACCESS, 0, pid) };
+        if handle.is_null() {
+            continue;
+        }
+
+        unsafe {
+            if TerminateProcess(handle, 1) != 0 {
+                terminated_any = true;
+                WaitForSingleObject(handle, 2_000);
+            }
+            CloseHandle(handle);
+        }
+    }
+
+    terminated_any
+}
+
+#[cfg(windows)]
+fn terminate_descendant_processes(root_process_id: u32) -> bool {
+    let process_ids = collect_descendant_process_ids(root_process_id);
+    terminate_process_ids(&process_ids)
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(process_id: u32) -> bool {
+    let mut process_ids = collect_descendant_process_ids(process_id);
+    process_ids.push(process_id);
+
+    terminate_process_ids(&process_ids)
+}
+
+fn terminate_pty_child(child: &mut (dyn PtyChild + Send + Sync)) {
+    #[cfg(windows)]
+    if let Some(process_id) = child.process_id() {
+        if terminate_process_tree(process_id) {
+            return;
+        }
+    }
+
+    child.kill().ok();
+}
+
+fn wait_for_pty_child_exit(child: &mut (dyn PtyChild + Send + Sync), timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn shutdown_pty_process(
+    child: &mut (dyn PtyChild + Send + Sync),
+    master: &mut Option<Box<dyn PtyMasterPty + Send>>,
+    writer: &mut Option<Box<dyn Write + Send>>,
+    reader_done: Option<&Receiver<()>>,
+) {
+    drop(writer.take());
+    drop(master.take());
+
+    if let Some(reader_done) = reader_done {
+        reader_done.recv_timeout(Duration::from_millis(200)).ok();
+    }
+
+    terminate_pty_child(child);
+    wait_for_pty_child_exit(child, Duration::from_secs(2));
+
+    if let Some(reader_done) = reader_done {
+        reader_done.recv_timeout(Duration::from_millis(200)).ok();
+    }
 }
 
 fn validate_connection_config(config: &ConnectionConfig) -> Result<(), String> {
@@ -302,6 +771,119 @@ fn prepare_private_key(
     }
 
     Ok(None)
+}
+
+fn clone_private_key_to_temp(
+    private_key: PreparedPrivateKey,
+) -> Result<PreparedPrivateKey, Box<dyn std::error::Error + Send + Sync>> {
+    if private_key.remove_on_drop {
+        return Ok(private_key);
+    }
+
+    let copy_path = env::temp_dir().join(format!("tersterm-key-{}.pem", Uuid::new_v4()));
+    fs::copy(&private_key.path, &copy_path)?;
+    Ok(PreparedPrivateKey {
+        path: copy_path,
+        remove_on_drop: true,
+    })
+}
+
+fn private_key_needs_pem_conversion(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.contains("BEGIN OPENSSH PRIVATE KEY"))
+        .unwrap_or(false)
+}
+
+fn convert_private_key_to_pem(
+    path: &Path,
+    passphrase: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut command = std::process::Command::new("ssh-keygen");
+    configure_subprocess(&mut command);
+    let status = command
+        .arg("-p")
+        .arg("-m")
+        .arg("PEM")
+        .arg("-P")
+        .arg(passphrase)
+        .arg("-N")
+        .arg(passphrase)
+        .arg("-f")
+        .arg(path)
+        .arg("-q")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err("Failed to convert private key to PEM for SSH operations".into())
+}
+
+fn remove_private_key_passphrase(
+    path: &Path,
+    passphrase: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut command = std::process::Command::new("ssh-keygen");
+    configure_subprocess(&mut command);
+    let status = command
+        .arg("-p")
+        .arg("-P")
+        .arg(passphrase)
+        .arg("-N")
+        .arg("")
+        .arg("-f")
+        .arg(path)
+        .arg("-q")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err("Failed to remove private key passphrase for OpenSSH operations".into())
+}
+
+fn prepare_private_key_for_ssh2(
+    config: &ConnectionConfig,
+) -> Result<Option<PreparedPrivateKey>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(private_key) = prepare_private_key(config)? else {
+        return Ok(None);
+    };
+
+    if !private_key_needs_pem_conversion(&private_key.path) {
+        return Ok(Some(private_key));
+    }
+
+    let converted_key = clone_private_key_to_temp(private_key)?;
+
+    let passphrase = config.private_key_passphrase.as_deref().unwrap_or("");
+    let _ = convert_private_key_to_pem(&converted_key.path, passphrase);
+    Ok(Some(converted_key))
+}
+
+fn prepare_private_key_for_noninteractive_openssh(
+    config: &ConnectionConfig,
+) -> Result<Option<PreparedPrivateKey>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(private_key) = prepare_private_key(config)? else {
+        return Ok(None);
+    };
+
+    let Some(passphrase) = config
+        .private_key_passphrase
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(Some(private_key));
+    };
+
+    let key_copy = clone_private_key_to_temp(private_key)?;
+    remove_private_key_passphrase(&key_copy.path, passphrase)?;
+    Ok(Some(key_copy))
 }
 
 fn build_ssh_command(
@@ -384,6 +966,10 @@ fn sanitize_filename(filename: &str) -> String {
         .to_string()
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'\''"#))
+}
+
 fn unique_local_path(directory: &Path, filename: &str) -> PathBuf {
     let safe_name = sanitize_filename(filename);
     let safe_name = if safe_name.is_empty() {
@@ -436,6 +1022,7 @@ fn connect_ssh_session(
     tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut session = Session::new()?;
+    session.set_timeout(20_000);
     session.set_tcp_stream(tcp);
     session.handshake()?;
 
@@ -444,7 +1031,7 @@ fn connect_ssh_session(
         .as_deref()
         .filter(|value| !value.trim().is_empty());
 
-    let private_key = prepare_private_key(config)?;
+    let private_key = prepare_private_key_for_ssh2(config)?;
 
     if let Some(private_key) = private_key.as_ref() {
         session
@@ -483,7 +1070,224 @@ fn name_from_path(path: &Path) -> String {
         .to_string()
 }
 
+fn file_list_shell_fragment(remote_path: &str) -> String {
+    let requested_path = sftp_path(remote_path);
+    format!(
+        r#"path={}; real=$(cd -- "$path" 2>/dev/null && pwd -P) || exit 1; printf "\nPATH\t%s\n" "$real"; if [ "$real" != "/" ]; then printf "ENTRY\td\t..\t\t\n"; fi; find "$real" -maxdepth 1 -mindepth 1 -printf "ENTRY\t%y\t%f\t%s\t%TY-%Tm-%Td %TH:%TM\n""#,
+        shell_quote(&requested_path)
+    )
+}
+
+fn should_fallback_to_openssh(
+    config: &ConnectionConfig,
+    error: &(dyn std::error::Error + Send + Sync),
+) -> bool {
+    let has_password = config
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if !connection_uses_private_key(config) && !has_password {
+        return false;
+    }
+
+    let message = error.to_string().to_lowercase();
+    [
+        "auth",
+        "authentication",
+        "password",
+        "keyboard-interactive",
+        "agent",
+        "key",
+        "pem",
+        "public key",
+        "private key",
+        "unsupported",
+        "invalid",
+        "libssh2",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn strip_terminal_control_sequences(output: &str) -> String {
+    let mut clean = String::with_capacity(output.len());
+    let mut chars = output.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            clean.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+
+                    if next == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    clean
+}
+
+fn line_looks_like_shell_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+
+    if !matches!(last, '#' | '$' | '>' | '%') {
+        return false;
+    }
+
+    if trimmed.starts_with('[') && trimmed.len() <= 160 {
+        return true;
+    }
+
+    trimmed.len() <= 160 && (trimmed.contains('@') || trimmed.contains(':'))
+}
+
+fn output_looks_authenticated(output: &str) -> bool {
+    let normalized = strip_terminal_control_sequences(output);
+    if normalized.contains("Welcome to ") || normalized.contains("Last login:") {
+        return true;
+    }
+
+    normalized
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .take(8)
+        .any(line_looks_like_shell_prompt)
+}
+
+fn parse_openssh_file_list(
+    output: &str,
+) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
+    let mut display_path = None;
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        let Some(line) = line
+            .find("PATH\t")
+            .or_else(|| line.find("ENTRY\t"))
+            .map(|index| &line[index..])
+        else {
+            continue;
+        };
+
+        let mut parts = line.splitn(5, '\t');
+        match parts.next() {
+            Some("PATH") => {
+                display_path = parts.next().map(|value| value.replace('\\', "/"));
+            }
+            Some("ENTRY") => {
+                let kind = match parts.next() {
+                    Some("d") => "directory",
+                    Some("l") => "symlink",
+                    Some("f") | Some("-") => "file",
+                    Some(_) | None => "file",
+                }
+                .to_string();
+                let name = parts.next().unwrap_or_default().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+
+                let size = parts.next().and_then(|value| value.parse::<u64>().ok());
+                let modified = parts.next().unwrap_or_default().to_string();
+                entries.push(RemoteFileEntry {
+                    name,
+                    path: String::new(),
+                    kind,
+                    size,
+                    modified,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let display_path = display_path.ok_or("Unable to read remote directory")?;
+    for entry in &mut entries {
+        entry.path = remote_join(&display_path, &entry.name);
+    }
+
+    entries.sort_by(|left, right| {
+        match (
+            left.kind.as_str() == "directory",
+            right.kind.as_str() == "directory",
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+        }
+    });
+
+    Ok(RemoteFileList {
+        path: display_path,
+        entries,
+    })
+}
+
+fn run_remote_file_list_openssh(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_path: &str,
+) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
+    let fragment = file_list_shell_fragment(remote_path);
+    let command = format!("sh -lc {}", shell_quote(&fragment));
+    let output = run_openssh_exec_command(processes, session_id, config, &command)?;
+    parse_openssh_file_list(&output)
+}
+
 fn run_remote_file_list(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    remote_path: String,
+) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
+    if connection_uses_private_key(&config) {
+        return run_remote_file_list_openssh(processes, session_id, &config, &remote_path);
+    }
+
+    match run_remote_file_list_ssh2(config.clone(), remote_path.clone()) {
+        Ok(result) => Ok(result),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            run_remote_file_list_openssh(processes, session_id, &config, &remote_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_remote_file_list_ssh2(
     config: ConnectionConfig,
     remote_path: String,
 ) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
@@ -542,7 +1346,8 @@ fn run_remote_file_list(
 }
 
 fn run_remote_file_upload(
-    _app: AppHandle,
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
     config: ConnectionConfig,
     remote_path: String,
     filename: String,
@@ -553,9 +1358,42 @@ fn run_remote_file_upload(
         return Err("File name is required".into());
     }
 
-    let (_session, sftp) = connect_sftp(&config)?;
+    if connection_uses_private_key(&config) {
+        return run_remote_file_upload_openssh(
+            processes,
+            session_id,
+            &config,
+            remote_path,
+            safe_name,
+            content_base64,
+        );
+    }
+
+    match run_remote_file_upload_ssh2(&config, &remote_path, &safe_name, &content_base64) {
+        Ok(result) => Ok(result),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            run_remote_file_upload_openssh(
+                processes,
+                session_id,
+                &config,
+                remote_path,
+                safe_name,
+                content_base64,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_remote_file_upload_ssh2(
+    config: &ConnectionConfig,
+    remote_path: &str,
+    safe_name: &str,
+    content_base64: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (_session, sftp) = connect_sftp(config)?;
     let bytes = general_purpose::STANDARD.decode(content_base64)?;
-    let target = remote_join(&normalize_remote_path(&remote_path), &safe_name);
+    let target = remote_join(&normalize_remote_path(remote_path), safe_name);
     let mut remote_file = sftp.create(Path::new(&sftp_path(&target)))?;
     remote_file.write_all(&bytes)?;
     remote_file.flush()?;
@@ -563,8 +1401,37 @@ fn run_remote_file_upload(
     Ok(target)
 }
 
+fn run_remote_file_upload_openssh(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_path: String,
+    safe_name: String,
+    content_base64: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let target = remote_join(&normalize_remote_path(&remote_path), &safe_name);
+    let remote_target = sftp_path(&target);
+    let marker = format!("TERSTERM_UPLOAD_{}", Uuid::new_v4().simple());
+    let fragment = format!(
+        r#"target={}; parent=$(dirname -- "$target") || exit 1; mkdir -p -- "$parent" || exit 1; base64 -d > "$target" <<'{}'
+{}
+{}
+"#,
+        shell_quote(&remote_target),
+        marker,
+        content_base64,
+        marker
+    );
+    let command = format!("sh -lc {}", shell_quote(&fragment));
+    run_openssh_exec_command(processes, session_id, config, &command)?;
+
+    Ok(target)
+}
+
 fn run_remote_file_download(
-    app: AppHandle,
+    app: &AppHandle,
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
     config: ConnectionConfig,
     remote_path: String,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -579,12 +1446,75 @@ fn run_remote_file_download(
     fs::create_dir_all(&downloads)?;
     let local_path = unique_local_path(&downloads, &filename);
 
-    let (_session, sftp) = connect_sftp(&config)?;
-    let mut remote_file = sftp.open(Path::new(&sftp_path(&remote_path)))?;
-    let mut local_file = fs::File::create(&local_path)?;
-    std::io::copy(&mut remote_file, &mut local_file)?;
+    if connection_uses_private_key(&config) {
+        run_remote_file_download_openssh(
+            processes,
+            session_id,
+            &config,
+            &remote_path,
+            &local_path,
+        )?;
+        return Ok(local_path.to_string_lossy().to_string());
+    }
 
-    Ok(local_path.to_string_lossy().to_string())
+    match run_remote_file_download_ssh2(&config, &remote_path, &local_path) {
+        Ok(()) => Ok(local_path.to_string_lossy().to_string()),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            run_remote_file_download_openssh(
+                processes,
+                session_id,
+                &config,
+                &remote_path,
+                &local_path,
+            )?;
+            Ok(local_path.to_string_lossy().to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn run_remote_file_download_ssh2(
+    config: &ConnectionConfig,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_session, sftp) = connect_sftp(config)?;
+    let mut remote_file = sftp.open(Path::new(&sftp_path(remote_path)))?;
+    let mut local_file = fs::File::create(local_path)?;
+    std::io::copy(&mut remote_file, &mut local_file)?;
+    Ok(())
+}
+
+fn run_remote_file_download_openssh(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_path: &str,
+    local_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let start_marker = format!("TERSTERM_DOWNLOAD_BEGIN_{}", Uuid::new_v4().simple());
+    let end_marker = format!("TERSTERM_DOWNLOAD_END_{}", Uuid::new_v4().simple());
+    let fragment = format!(
+        "printf '%s\\n' {start}; base64 < {path}; printf '\\n%s\\n' {end}",
+        start = shell_quote(&start_marker),
+        end = shell_quote(&end_marker),
+        path = shell_quote(&sftp_path(remote_path)),
+    );
+    let command = format!("sh -lc {}", shell_quote(&fragment));
+    let output = run_openssh_exec_command(processes, session_id, config, &command)?;
+    let start = output
+        .find(&start_marker)
+        .ok_or("Unable to find download start marker")?;
+    let end = output
+        .find(&end_marker)
+        .ok_or("Unable to find download end marker")?;
+    let encoded = output[start + start_marker.len()..end]
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let bytes = general_purpose::STANDARD.decode(encoded)?;
+    fs::write(local_path, bytes)?;
+    Ok(())
 }
 
 fn parse_system_usage_output(
@@ -595,6 +1525,12 @@ fn parse_system_usage_output(
     let mut storage = None;
 
     for line in output.lines() {
+        let line = line
+            .find("CPU ")
+            .or_else(|| line.find("MEM "))
+            .or_else(|| line.find("DISK "))
+            .map(|index| &line[index..])
+            .unwrap_or(line);
         let mut parts = line.split_whitespace();
         match parts.next() {
             Some("CPU") => {
@@ -632,15 +1568,25 @@ fn parse_system_usage_output(
 }
 
 fn run_remote_system_usage(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
     config: ConnectionConfig,
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
-    let command = format!("sh -lc '{}'", system_usage_shell_fragment());
-    let output = if connection_uses_private_key(&config) {
-        run_openssh_exec_command(&config, &command)?
-    } else {
-        run_ssh2_exec_command(&config, &command)?
-    };
-    parse_system_usage_output(&output)
+    let command = format!("sh -lc {}", shell_quote(system_usage_shell_fragment()));
+
+    if connection_uses_private_key(&config) {
+        let output = run_openssh_exec_command(processes, session_id, &config, &command)?;
+        return parse_system_usage_output(&output);
+    }
+
+    match run_ssh2_exec_command(&config, &command) {
+        Ok(output) => parse_system_usage_output(&output),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            let output = run_openssh_exec_command(processes, session_id, &config, &command)?;
+            parse_system_usage_output(&output)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn system_usage_shell_fragment() -> &'static str {
@@ -685,9 +1631,33 @@ fn connection_uses_private_key(config: &ConnectionConfig) -> bool {
 }
 
 fn run_openssh_exec_command(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
     config: &ConnectionConfig,
     remote_command: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let debug_enabled = env::var("TERSTERM_DEBUG_OPENSSH")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let has_interactive_secret = config
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if !has_interactive_secret {
+        return run_openssh_exec_command_noninteractive(
+            processes,
+            session_id,
+            config,
+            remote_command,
+        );
+    }
+
+    let process_guard = register_openssh_process(processes, session_id);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 32,
@@ -698,25 +1668,32 @@ fn run_openssh_exec_command(
 
     let private_key = prepare_private_key(config)?;
     let command = build_ssh_command(config, private_key.as_ref(), Some(remote_command));
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
 
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
+    let master = pair.master;
+    let slave = pair.slave;
+    let mut child = slave.spawn_command(command)?;
+    drop(slave);
+    if process_guard.is_cancelled() {
+        terminate_pty_child(&mut *child);
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let mut reader = master.try_clone_reader()?;
+    let mut writer = Some(master.take_writer()?);
+    let mut master = Some(master);
     let (output_tx, output_rx) = mpsc::channel::<Option<String>>();
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let private_key_passphrase = config
+        .private_key_passphrase
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     let password = config
         .password
         .clone()
         .filter(|value| !value.trim().is_empty());
-    let private_key_passphrase = config
-        .private_key_passphrase
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            connection_uses_private_key(&config)
-                .then(|| password.clone())
-                .flatten()
-        });
 
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
@@ -736,17 +1713,48 @@ fn run_openssh_exec_command(
         }
 
         output_tx.send(None).ok();
+        reader_done_tx.send(()).ok();
     });
 
     let started_at = Instant::now();
     let mut output = String::new();
     let mut prompt_buffer = String::new();
+    let requires_passphrase = private_key_passphrase.is_some();
+    let requires_password = password.is_some();
     let mut password_sent = false;
     let mut passphrase_sent = false;
+    let mut exit_status = None;
 
     loop {
+        if process_guard.is_cancelled() {
+            shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
+            return Err("OpenSSH command cancelled".into());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            exit_status = Some(status);
+            break;
+        }
+
         match output_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Some(data)) => {
+                if debug_enabled {
+                    eprintln!(
+                        "run_openssh_exec_command output chunk: {}",
+                        data.replace('\r', "\\r").replace('\n', "\\n")
+                    );
+                }
+
+                if data.contains("\u{1b}[6n") {
+                    if debug_enabled {
+                        eprintln!("run_openssh_exec_command responding to cursor position request");
+                    }
+                    if let Some(writer) = writer.as_mut() {
+                        writer.write_all(b"\x1b[1;1R")?;
+                        writer.flush()?;
+                    }
+                }
+
                 output.push_str(&data);
                 prompt_buffer.push_str(&data);
                 if prompt_buffer.len() > 4096 {
@@ -764,24 +1772,55 @@ fn run_openssh_exec_command(
                 if !passphrase_sent && prompt.contains("passphrase") {
                     if let Some(passphrase) = &private_key_passphrase {
                         passphrase_sent = true;
-                        writer.write_all(format!("{passphrase}\n").as_bytes())?;
-                        writer.flush()?;
+                        if debug_enabled {
+                            eprintln!("run_openssh_exec_command sending private key passphrase");
+                        }
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(format!("{passphrase}\n").as_bytes())?;
+                            writer.flush()?;
+                        }
                     }
                 }
 
                 if !password_sent && prompt.contains("password:") {
                     if let Some(password) = &password {
                         password_sent = true;
-                        writer.write_all(format!("{password}\n").as_bytes())?;
-                        writer.flush()?;
+                        if debug_enabled {
+                            eprintln!("run_openssh_exec_command sending password");
+                        }
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(format!("{password}\n").as_bytes())?;
+                            writer.flush()?;
+                        }
                     }
+                }
+
+                // Remote exec probes never need stdin after credentials are supplied.
+                if writer.is_some()
+                    && (!requires_passphrase || passphrase_sent)
+                    && (!requires_password || password_sent)
+                {
+                    if debug_enabled {
+                        eprintln!("run_openssh_exec_command closing stdin after credentials");
+                    }
+                    drop(writer.take());
                 }
             }
             Ok(None) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if debug_enabled && started_at.elapsed().as_secs() % 5 == 0 {
+                    eprintln!(
+                        "run_openssh_exec_command timeout tick: {}s",
+                        started_at.elapsed().as_secs()
+                    );
+                }
                 if started_at.elapsed() > Duration::from_secs(20) {
-                    child.kill().ok();
-                    child.wait().ok();
+                    shutdown_pty_process(
+                        &mut *child,
+                        &mut master,
+                        &mut writer,
+                        Some(&reader_done_rx),
+                    );
                     return Err("OpenSSH command timed out".into());
                 }
             }
@@ -789,7 +1828,30 @@ fn run_openssh_exec_command(
         }
     }
 
-    let status = child.wait()?;
+    if exit_status.is_some() {
+        drop(writer.take());
+        drop(master.take());
+        reader_done_rx.recv_timeout(Duration::from_millis(500)).ok();
+
+        loop {
+            match output_rx.try_recv() {
+                Ok(Some(data)) => output.push_str(&data),
+                Ok(None) | Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+
+    if process_guard.is_cancelled() {
+        shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let status = match exit_status {
+        Some(status) => status,
+        None => child.wait()?,
+    };
     if status.success() {
         return Ok(output);
     }
@@ -797,6 +1859,103 @@ fn run_openssh_exec_command(
     let message = output.trim();
     if message.is_empty() {
         return Err(format!("OpenSSH command failed with code {}", status.exit_code()).into());
+    }
+
+    Err(message.to_string().into())
+}
+
+fn run_openssh_exec_command_noninteractive(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_command: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let process_guard = register_openssh_process(processes, session_id);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let private_key = prepare_private_key_for_noninteractive_openssh(config)?;
+    let mut command = std::process::Command::new("ssh");
+    configure_subprocess(&mut command);
+    command
+        .arg("-T")
+        .arg("-p")
+        .arg(config.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=0");
+
+    if let Some(private_key) = private_key.as_ref() {
+        command.arg("-i").arg(&private_key.path);
+    }
+
+    command
+        .arg(format!("{}@{}", config.username, config.host))
+        .arg(remote_command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().ok_or("Unable to read OpenSSH stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Unable to read OpenSSH stderr")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).ok();
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).ok();
+        output
+    });
+    let started_at = Instant::now();
+    let status;
+
+    loop {
+        if process_guard.is_cancelled() {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command cancelled".into());
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            status = exit_status;
+            break;
+        }
+
+        if started_at.elapsed() > Duration::from_secs(20) {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command timed out".into());
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let combined = format!("{stdout}{stderr}");
+
+    if status.success() {
+        return Ok(combined);
+    }
+
+    let message = combined.trim();
+    if message.is_empty() {
+        return Err(format!("OpenSSH command failed with code {:?}", status.code()).into());
     }
 
     Err(message.to_string().into())
@@ -827,35 +1986,42 @@ fn run_ssh_session(
 
     let private_key = prepare_private_key(&config)?;
     let command = build_ssh_command(&config, private_key.as_ref(), None);
-    let mut child = pair.slave.spawn_command(command)?;
-    drop(pair.slave);
+    let master = pair.master;
+    let slave = pair.slave;
+    let mut child = slave.spawn_command(command)?;
+    drop(slave);
 
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
+    let mut reader = master.try_clone_reader()?;
+    let mut writer = Some(master.take_writer()?);
+    let mut master = Some(master);
     let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let private_key_passphrase = config
+        .private_key_passphrase
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     let password = config
         .password
         .clone()
         .filter(|value| !value.trim().is_empty());
-    let private_key_passphrase = config
-        .private_key_passphrase
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            connection_uses_private_key(&config)
-                .then(|| password.clone())
-                .flatten()
-        });
+    let should_capture_private_key_passphrase =
+        connection_uses_private_key(&config) && private_key_passphrase.is_none();
+    let private_key_passphrase_prompted = Arc::new(AtomicBool::new(false));
+    let should_capture_password = password.is_none();
+    let password_prompted = Arc::new(AtomicBool::new(false));
+    let authenticated = Arc::new(AtomicBool::new(false));
     let writer_tx = app
         .state::<SshSessions>()
         .0
         .lock()
         .ok()
-        .and_then(|store| store.get(&session_id).cloned());
+        .and_then(|store| store.get(&session_id).map(|entry| entry.sender.clone()));
 
     thread::spawn({
         let app = app.clone();
         let session_id = session_id.clone();
+        let private_key_passphrase_prompted = private_key_passphrase_prompted.clone();
+        let password_prompted = password_prompted.clone();
+        let authenticated = authenticated.clone();
         move || {
             let mut buffer = [0_u8; 8192];
             let mut password_sent = false;
@@ -878,6 +2044,14 @@ fn run_ssh_session(
                                 .rev()
                                 .collect();
                         }
+                        if !authenticated.load(Ordering::Relaxed)
+                            && output_looks_authenticated(&auth_prompt_buffer)
+                        {
+                            authenticated.store(true, Ordering::Relaxed);
+                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                            password_prompted.store(false, Ordering::Relaxed);
+                        }
+
                         let prompt = auth_prompt_buffer.to_lowercase();
                         if !passphrase_sent
                             && prompt.contains("passphrase")
@@ -892,12 +2066,24 @@ fn run_ssh_session(
                                     .ok();
                             }
                         }
+                        if !authenticated.load(Ordering::Relaxed)
+                            && should_capture_private_key_passphrase
+                            && prompt.contains("passphrase")
+                        {
+                            private_key_passphrase_prompted.store(true, Ordering::Relaxed);
+                        }
 
                         if !password_sent && prompt.contains("password:") && password.is_some() {
                             password_sent = true;
                             if let (Some(sender), Some(password)) = (&writer_tx, &password) {
                                 sender.send(SshCommand::Write(format!("{password}\n"))).ok();
                             }
+                        }
+                        if !authenticated.load(Ordering::Relaxed)
+                            && should_capture_password
+                            && prompt.contains("password:")
+                        {
+                            password_prompted.store(true, Ordering::Relaxed);
                         }
 
                         app.emit(
@@ -917,29 +2103,104 @@ fn run_ssh_session(
         }
     });
 
+    let mut captured_private_key_passphrase = String::new();
+    let mut captured_password = String::new();
+
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(SshCommand::Write(data)) => {
-                writer.write_all(data.as_bytes())?;
-                writer.flush()?;
+                if !authenticated.load(Ordering::Relaxed)
+                    && should_capture_private_key_passphrase
+                    && private_key_passphrase_prompted.load(Ordering::Relaxed)
+                {
+                    for ch in data.chars() {
+                        if ch == '\u{3}' {
+                            captured_private_key_passphrase.clear();
+                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                            break;
+                        }
+
+                        if ch == '\u{7f}' || ch == '\u{8}' {
+                            captured_private_key_passphrase.pop();
+                            continue;
+                        }
+
+                        if ch == '\r' || ch == '\n' {
+                            if !captured_private_key_passphrase.is_empty() {
+                                remember_session_private_key_passphrase(
+                                    &app.state::<SshSessionSecrets>(),
+                                    &session_id,
+                                    captured_private_key_passphrase.clone(),
+                                );
+                            }
+                            captured_private_key_passphrase.clear();
+                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                            break;
+                        }
+
+                        if !ch.is_control() {
+                            captured_private_key_passphrase.push(ch);
+                        }
+                    }
+                }
+
+                if !authenticated.load(Ordering::Relaxed)
+                    && should_capture_password
+                    && password_prompted.load(Ordering::Relaxed)
+                {
+                    for ch in data.chars() {
+                        if ch == '\u{3}' {
+                            captured_password.clear();
+                            password_prompted.store(false, Ordering::Relaxed);
+                            break;
+                        }
+
+                        if ch == '\u{7f}' || ch == '\u{8}' {
+                            captured_password.pop();
+                            continue;
+                        }
+
+                        if ch == '\r' || ch == '\n' {
+                            if !captured_password.is_empty() {
+                                remember_session_password(
+                                    &app.state::<SshSessionSecrets>(),
+                                    &session_id,
+                                    captured_password.clone(),
+                                );
+                            }
+                            captured_password.clear();
+                            password_prompted.store(false, Ordering::Relaxed);
+                            break;
+                        }
+
+                        if !ch.is_control() {
+                            captured_password.push(ch);
+                        }
+                    }
+                }
+
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_all(data.as_bytes())?;
+                    writer.flush()?;
+                }
             }
             Ok(SshCommand::Resize { cols, rows }) => {
-                pair.master.resize(PtySize {
-                    rows: rows as u16,
-                    cols: cols as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
+                if let Some(master) = master.as_ref() {
+                    master.resize(PtySize {
+                        rows: rows as u16,
+                        cols: cols as u16,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })?;
+                }
             }
             Ok(SshCommand::Disconnect) => {
-                child.kill().ok();
-                child.wait().ok();
+                shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
                 return Ok(());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                child.kill().ok();
-                child.wait().ok();
+                shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
                 return Ok(());
             }
         }
@@ -956,22 +2217,21 @@ fn run_ssh_session(
 }
 
 fn run_ssh_test_connection(
+    processes: &OpenSshProcesses,
     config: ConnectionConfig,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if connection_uses_private_key(&config) {
-        run_openssh_exec_command(&config, "true")?;
+        run_openssh_exec_command(processes, None, &config, "true")?;
         return Ok("Connection test succeeded".to_string());
     }
 
-    let session = connect_ssh_session(&config)?;
-    let mut channel = session.channel_session()?;
-    channel.exec("true")?;
-    channel.wait_close()?;
-
-    if channel.exit_status()? == 0 {
-        Ok("Connection test succeeded".to_string())
-    } else {
-        Err("Connection test command failed".into())
+    match run_ssh2_exec_command(&config, "true") {
+        Ok(_) => Ok("Connection test succeeded".to_string()),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            run_openssh_exec_command(processes, None, &config, "true")?;
+            Ok("Connection test succeeded".to_string())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -986,6 +2246,9 @@ fn main() {
             }
         }))
         .manage(SshSessions::default())
+        .manage(OpenSshProcesses::default())
+        .manage(SshSessionSecrets::default())
+        .manage(AppClosing::default())
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
             ssh_test_connection,
@@ -998,10 +2261,25 @@ fn main() {
             ssh_get_system_usage
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                let sessions = window.app_handle().state::<SshSessions>();
-                disconnect_all_sessions(&sessions);
-                thread::sleep(Duration::from_millis(250));
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+
+                let app = window.app_handle().clone();
+                let closing = app.state::<AppClosing>();
+                if closing.0.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+
+                window.hide().ok();
+                thread::spawn(move || {
+                    let sessions = app.state::<SshSessions>();
+                    let processes = app.state::<OpenSshProcesses>();
+                    cancel_all_openssh_processes(&processes);
+                    disconnect_all_sessions(&sessions);
+                    #[cfg(windows)]
+                    terminate_descendant_processes(std::process::id());
+                    app.exit(0);
+                });
             }
         })
         .setup(|app| {
@@ -1015,4 +2293,190 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running TerSterm");
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use super::collect_descendants_from_entries;
+    use super::{
+        output_looks_authenticated, parse_openssh_file_list, parse_system_usage_output,
+        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
+        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
+    };
+    use std::{env, io};
+
+    #[cfg(windows)]
+    #[test]
+    fn collects_nested_descendants_without_including_root() {
+        let entries = vec![(10, 1), (11, 10), (12, 11), (20, 1), (21, 20), (99, 0)];
+
+        assert_eq!(
+            collect_descendants_from_entries(1, &entries),
+            vec![12, 11, 10, 21, 20]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ignores_self_parent_and_unrelated_processes() {
+        let entries = vec![(7, 7), (8, 42), (9, 8), (10, 9), (11, 99)];
+
+        assert_eq!(
+            collect_descendants_from_entries(42, &entries),
+            vec![10, 9, 8]
+        );
+    }
+
+    #[test]
+    fn parses_noisy_openssh_file_list_output() {
+        let output = concat!(
+            "Welcome to Ubuntu\r\n",
+            "PATH\t/root\r\n",
+            "ENTRY\td\t..\t\t\r\n",
+            "ENTRY\tf\trelease.log\t18432\t2026-05-11 15:09\r\n",
+            "ENTRY\td\tuploads\t\t2026-05-11 15:10\r\n",
+            "root@host:~# "
+        );
+
+        let list = parse_openssh_file_list(output).expect("file list should parse");
+
+        assert_eq!(list.path, "/root");
+        assert_eq!(list.entries[0].name, "..");
+        assert_eq!(list.entries[0].path, "/root/..");
+        assert_eq!(list.entries[1].name, "uploads");
+        assert_eq!(list.entries[1].kind, "directory");
+        assert_eq!(list.entries[2].name, "release.log");
+        assert_eq!(list.entries[2].size, Some(18432));
+    }
+
+    #[test]
+    fn parses_system_usage_output_with_login_noise() {
+        let output = concat!(
+            "Last login: Mon May 11 15:00:53 CST 2026\r\n",
+            "CPU 12.5\r\n",
+            "MEM 3.25 16.00\r\n",
+            "DISK 84.00 256.00\r\n"
+        );
+
+        let usage = parse_system_usage_output(output).expect("system usage should parse");
+
+        assert_eq!(usage.cpu_percent, 12.5);
+        assert_eq!(usage.memory_used_gb, 3.25);
+        assert_eq!(usage.memory_total_gb, 16.0);
+        assert_eq!(usage.storage_used_gb, 84.0);
+        assert_eq!(usage.storage_total_gb, 256.0);
+    }
+
+    #[test]
+    fn falls_back_to_openssh_for_private_key_compatibility_errors() {
+        let config = ConnectionConfig {
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            password: None,
+            private_key_path: Some("C:\\Users\\me\\.ssh\\id_ed25519".to_string()),
+            private_key: None,
+            private_key_passphrase: None,
+        };
+        let error = io::Error::other("SSH private key authentication failed: invalid key format");
+
+        assert!(should_fallback_to_openssh(&config, &error));
+    }
+
+    #[test]
+    fn falls_back_to_openssh_for_password_auth_errors() {
+        let config = ConnectionConfig {
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            password: Some("secret".to_string()),
+            private_key_path: None,
+            private_key: None,
+            private_key_passphrase: None,
+        };
+        let error = io::Error::other("SSH password authentication failed: keyboard-interactive auth required");
+
+        assert!(should_fallback_to_openssh(&config, &error));
+    }
+
+    #[test]
+    fn detects_authenticated_output_from_shell_prompt() {
+        let output = concat!(
+            "\u{1b}[?2004hroot@hk-ser01:~# ",
+            "\u{1b}[?2004l"
+        );
+
+        assert!(output_looks_authenticated(output));
+    }
+
+    #[test]
+    #[ignore = "Requires real SSH host credentials via TERSTERM_REAL_* env vars"]
+    fn probes_real_host_file_list_and_system_usage() {
+        let host = env::var("TERSTERM_REAL_HOST").expect("TERSTERM_REAL_HOST is required");
+        let port = env::var("TERSTERM_REAL_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(22);
+        let username = env::var("TERSTERM_REAL_USERNAME").expect("TERSTERM_REAL_USERNAME is required");
+        let private_key_path = env::var("TERSTERM_REAL_PRIVATE_KEY_PATH").ok();
+        let private_key = env::var("TERSTERM_REAL_PRIVATE_KEY").ok();
+        let private_key_passphrase = env::var("TERSTERM_REAL_PRIVATE_KEY_PASSPHRASE").ok();
+        let password = env::var("TERSTERM_REAL_PASSWORD").ok();
+        let config = ConnectionConfig {
+            name: "real-host".to_string(),
+            host,
+            port,
+            username,
+            password,
+            private_key_path,
+            private_key,
+            private_key_passphrase,
+        };
+        let processes = OpenSshProcesses::default();
+
+        eprintln!("starting real host pwd probe");
+        let pwd = run_openssh_exec_command(&processes, None, &config, "pwd")
+            .expect("real host pwd probe should succeed");
+        eprintln!("real host pwd probe finished: {}", pwd.trim());
+
+        eprintln!("starting real host file list probe");
+        let files = run_remote_file_list(&processes, None, config.clone(), "~".to_string())
+            .expect("real host file list probe should succeed");
+        eprintln!("real host file list probe finished: {} entries", files.entries.len());
+        assert!(!files.path.trim().is_empty(), "real host file list path should not be empty");
+        assert!(
+            !files.entries.is_empty(),
+            "real host file list should include at least one entry"
+        );
+
+        eprintln!("starting real host system usage probe");
+        let usage = run_remote_system_usage(&processes, None, config)
+            .expect("real host system usage probe should succeed");
+        eprintln!("real host system usage probe finished: cpu={}", usage.cpu_percent);
+        assert!(usage.cpu_percent >= 0.0, "real host cpu usage should be non-negative");
+        assert!(
+            usage.memory_total_gb > 0.0 && usage.storage_total_gb > 0.0,
+            "real host total resource values should be positive"
+        );
+    }
+
+    #[test]
+    fn does_not_fallback_to_openssh_for_remote_sftp_errors() {
+        let config = ConnectionConfig {
+            name: "test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            password: None,
+            private_key_path: Some("C:\\Users\\me\\.ssh\\id_ed25519".to_string()),
+            private_key: None,
+            private_key_passphrase: None,
+        };
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied");
+
+        assert!(!should_fallback_to_openssh(&config, &error));
+    }
 }

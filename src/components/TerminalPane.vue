@@ -37,6 +37,7 @@ const emit = defineEmits<{
   close: [paneId: string]
   connect: [paneId: string]
   input: [payload: { pane_id: string; data: string }]
+  authenticated: [payload: { pane_id: string; session_id: string }]
   disconnected: [payload: { pane_id: string; session_id: string; reason?: string }]
 }>()
 
@@ -45,6 +46,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const fileManagerOpen = ref(false)
 const remotePath = ref('~')
 const remoteFiles = ref<RemoteFileEntry[]>([])
+const fileError = ref('')
 const fileLoading = ref(false)
 const transferring = ref(false)
 const dragActive = ref(false)
@@ -58,8 +60,59 @@ let inputBuffer = ''
 let refreshTimer: number | undefined
 let refreshRequestId = 0
 let queuedRefreshPath: string | undefined
+let authProbeBuffer = ''
+let authenticatedSessionId: string | undefined
 
 const isConnected = computed(() => props.pane.status === 'connected' && !!props.pane.session_id)
+const shouldSuppressConfiguredPassphrasePrompt = computed(
+  () => props.pane.private_key_passphrase_origin === 'configured',
+)
+
+const stripConfiguredPassphrasePrompt = (data: string) =>
+  data.replace(/Enter passphrase for key[^\r\n]*:\s*/gi, '')
+
+const stripTerminalControlSequences = (output: string) =>
+  output.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g, '')
+
+const outputLines = (output: string) =>
+  output
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+const lineLooksLikeShellPrompt = (line: string) =>
+  /[@][^\s:]+(?::|[~/]|\s+)[^\r\n]*[#>$%]$/.test(line) ||
+  /^\[[^\]]+\][#>$%]$/.test(line) ||
+  /^[^\s]{1,80}[#>$%]$/.test(line)
+
+const outputLooksAuthenticated = (output: string) => {
+  const normalized = stripTerminalControlSequences(output)
+  const trailingLines = outputLines(normalized).slice(-8)
+
+  return (
+    normalized.includes('Welcome to ') ||
+    normalized.includes('Last login:') ||
+    trailingLines.some(lineLooksLikeShellPrompt)
+  )
+}
+
+const trackAuthenticatedOutput = (session_id: string, data: string) => {
+  if (authenticatedSessionId === session_id) return
+
+  authProbeBuffer = `${authProbeBuffer}${data}`.slice(-12000)
+  if (!outputLooksAuthenticated(authProbeBuffer)) return
+
+  authenticatedSessionId = session_id
+  emit('authenticated', { pane_id: props.pane.id, session_id })
+}
+
+const remoteFeaturesReady = computed(() => isConnected.value && props.pane.remote_features_ready)
+const fileManagerStatusText = computed(() => {
+  if (!remoteFeaturesReady.value) return '等待认证完成后加载文件列表'
+  if (fileLoading.value) return '正在加载文件列表...'
+  if (fileError.value) return fileError.value
+  return '目录为空'
+})
 const statusText = computed(() => {
   if (props.pane.status === 'connecting') return '连接中'
   if (props.pane.status === 'connected') return '已连接'
@@ -101,6 +154,23 @@ const resetTerminal = (notice?: string) => {
 const disconnectPane = () => emit('disconnect', props.pane.id)
 
 const closePane = () => emit('close', props.pane.id)
+
+const resetFileManagerState = () => {
+  refreshRequestId += 1
+  if (refreshTimer) {
+    window.clearTimeout(refreshTimer)
+    refreshTimer = undefined
+  }
+  queuedRefreshPath = undefined
+  remotePath.value = '~'
+  remoteFiles.value = []
+  fileError.value = ''
+  fileLoading.value = false
+  transferring.value = false
+  dragActive.value = false
+  fileManagerOpen.value = false
+  if (fileInput.value) fileInput.value.value = ''
+}
 
 const normalizePath = (path: string) => {
   const combined = path.startsWith('/') || path.startsWith('~') ? path : `${remotePath.value}/${path}`
@@ -228,18 +298,26 @@ const describeUploadFiles = (files: File[]) => {
 }
 
 const refreshFiles = async (path = remotePath.value) => {
-  if (!props.pane.connection || !isConnected.value) return
+  const sessionId = props.pane.session_id
+  if (!props.pane.connection || !sessionId) return
+  if (!remoteFeaturesReady.value) {
+    queuedRefreshPath = path
+    return
+  }
   const requestId = ++refreshRequestId
 
   fileLoading.value = true
+  fileError.value = ''
   try {
-    const result = await sshListFiles(props.pane.connection, path)
-    if (requestId !== refreshRequestId) return
+    const result = await sshListFiles(props.pane.connection, path, sessionId)
+    if (requestId !== refreshRequestId || props.pane.session_id !== sessionId) return
     remotePath.value = result.path
     remoteFiles.value = result.entries
+    fileError.value = ''
   } catch (error) {
-    if (requestId !== refreshRequestId) return
-    message.error(error instanceof Error ? error.message : String(error))
+    if (requestId !== refreshRequestId || props.pane.session_id !== sessionId) return
+    fileError.value = error instanceof Error ? error.message : String(error)
+    message.error(fileError.value)
   } finally {
     if (requestId === refreshRequestId) {
       fileLoading.value = false
@@ -268,7 +346,19 @@ const scheduleRefreshFiles = (path = remotePath.value) => {
 }
 
 const openFileManager = async () => {
+  if (!isConnected.value) {
+    message.warning('请先连接主机')
+    return
+  }
+
   fileManagerOpen.value = !fileManagerOpen.value
+  if (!fileManagerOpen.value) return
+
+  if (!remoteFeaturesReady.value) {
+    queuedRefreshPath = remotePath.value
+    return
+  }
+
   if (fileManagerOpen.value && remoteFiles.value.length === 0) {
     await refreshFiles()
   }
@@ -280,13 +370,13 @@ const enterDirectory = async (entry: RemoteFileEntry) => {
 }
 
 const uploadFiles = async (files: File[]) => {
-  if (!props.pane.connection || !isConnected.value || files.length === 0) return
+  if (!props.pane.connection || !remoteFeaturesReady.value || files.length === 0) return
 
   transferring.value = true
   try {
     for (const file of files) {
       const content = await fileToBase64(file)
-      await sshUploadFile(props.pane.connection, remotePath.value, file.name, content)
+      await sshUploadFile(props.pane.connection, remotePath.value, file.name, content, props.pane.session_id)
     }
     message.success(files.length === 1 ? '文件已上传' : `已上传 ${files.length} 个文件`)
     await refreshFiles()
@@ -299,6 +389,11 @@ const uploadFiles = async (files: File[]) => {
 }
 
 const chooseUploadFiles = () => {
+  if (!remoteFeaturesReady.value) {
+    message.warning('请先完成认证后再上传文件')
+    return
+  }
+
   fileInput.value?.click()
 }
 
@@ -308,11 +403,11 @@ const handleFileInput = (event: Event) => {
 }
 
 const downloadFile = async (entry: RemoteFileEntry) => {
-  if (!props.pane.connection || entry.kind === 'directory') return
+  if (!props.pane.connection || !remoteFeaturesReady.value || entry.kind === 'directory') return
 
   transferring.value = true
   try {
-    const localPath = await sshDownloadFile(props.pane.connection, entry.path)
+    const localPath = await sshDownloadFile(props.pane.connection, entry.path, props.pane.session_id)
     message.success(`已下载到 ${localPath}`)
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
@@ -322,7 +417,7 @@ const downloadFile = async (entry: RemoteFileEntry) => {
 }
 
 const handleDragOver = () => {
-  if (!isConnected.value) return
+  if (!remoteFeaturesReady.value) return
   dragActive.value = true
 }
 
@@ -336,6 +431,11 @@ const handleDrop = async (event: DragEvent) => {
   dragActive.value = false
   if (!props.pane.connection || !isConnected.value) {
     message.warning('请先连接主机')
+    return
+  }
+
+  if (!remoteFeaturesReady.value) {
+    message.warning('请先完成认证后再传输文件')
     return
   }
 
@@ -358,6 +458,22 @@ const handleDrop = async (event: DragEvent) => {
 }
 
 watch(
+  remoteFeaturesReady,
+  (ready) => {
+    if (
+      ready &&
+      fileManagerOpen.value &&
+      !fileLoading.value &&
+      (remoteFiles.value.length === 0 || queuedRefreshPath)
+    ) {
+      const nextPath = queuedRefreshPath || remotePath.value
+      queuedRefreshPath = undefined
+      void refreshFiles(nextPath)
+    }
+  },
+)
+
+watch(
   () => props.pane.status,
   (status) => {
     if (!terminal) return
@@ -368,9 +484,11 @@ watch(
 
     if (status === 'idle') {
       resetTerminal()
-      remotePath.value = '~'
-      remoteFiles.value = []
-      fileManagerOpen.value = false
+      resetFileManagerState()
+    }
+
+    if (status === 'closed' || status === 'error') {
+      resetFileManagerState()
     }
 
     if (status === 'error' && props.pane.error) {
@@ -382,9 +500,10 @@ watch(
 watch(
   () => props.pane.session_id,
   async (session_id) => {
+    authProbeBuffer = ''
+    authenticatedSessionId = undefined
+    resetFileManagerState()
     if (!session_id) return
-    remotePath.value = '~'
-    remoteFiles.value = []
     await nextTick()
     fitTerminal()
     terminal?.focus()
@@ -396,8 +515,8 @@ onMounted(async () => {
     cursorBlink: true,
     convertEol: true,
     fontFamily: 'Cascadia Mono, JetBrains Mono, Consolas, monospace',
-    fontSize: 13,
-    lineHeight: 1.15,
+    fontSize: 12,
+    lineHeight: 1.08,
     scrollback: 5000,
     theme: {
       background: '#101417',
@@ -421,7 +540,12 @@ onMounted(async () => {
   }
 
   terminal.onData((data) => {
-    if (!props.pane.session_id || props.pane.status !== 'connected') return
+    if (
+      !props.pane.session_id ||
+      (props.pane.status !== 'connecting' && props.pane.status !== 'connected')
+    ) {
+      return
+    }
     trackShellInput(data)
     emit('input', { pane_id: props.pane.id, data })
   })
@@ -431,9 +555,15 @@ onMounted(async () => {
 
   unlistenData = await onSshData(({ session_id, data }) => {
     if (session_id !== props.pane.session_id) return
-    trackOscCurrentDirectory(data)
-    trackPromptCurrentDirectory(data)
-    terminal?.write(data)
+    const visibleData = shouldSuppressConfiguredPassphrasePrompt.value
+      ? stripConfiguredPassphrasePrompt(data)
+      : data
+    trackAuthenticatedOutput(session_id, visibleData)
+    trackOscCurrentDirectory(visibleData)
+    trackPromptCurrentDirectory(visibleData)
+    if (visibleData) {
+      terminal?.write(visibleData)
+    }
   })
 
   unlistenDisconnected = await onSshDisconnected(({ session_id, reason }) => {
@@ -449,9 +579,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (refreshTimer) {
-    window.clearTimeout(refreshTimer)
-  }
+  resetFileManagerState()
   resizeObserver?.disconnect()
   unlistenData?.()
   unlistenDisconnected?.()
@@ -490,10 +618,16 @@ defineExpose({
         <span v-if="pane.system_usage">
           存储 {{ formatGbPair(pane.system_usage.storage_used_gb, pane.system_usage.storage_total_gb) }}
         </span>
-        <span v-if="!pane.system_usage && pane.system_usage_error" :title="pane.system_usage_error">
+        <span
+          v-if="!pane.system_usage && pane.system_usage_loading"
+          title="正在读取远程资源占用"
+        >
+          资源加载中
+        </span>
+        <span v-else-if="!pane.system_usage && pane.system_usage_error" :title="pane.system_usage_error">
           资源错误
         </span>
-        <span v-if="!pane.system_usage && !pane.system_usage_error">资源 --</span>
+        <span v-else-if="!pane.system_usage">资源 --</span>
       </div>
       <div class="pane-actions">
         <a-tooltip title="文件管理">
@@ -596,7 +730,13 @@ defineExpose({
             </a-tooltip>
           </span>
         </button>
-        <div v-if="!fileLoading && remoteFiles.length === 0" class="file-empty">目录为空</div>
+        <div v-if="fileLoading && remoteFiles.length === 0" class="file-empty">
+          {{ fileManagerStatusText }}
+        </div>
+        <div v-else-if="!fileLoading && fileError" class="file-empty">{{ fileManagerStatusText }}</div>
+        <div v-else-if="!fileLoading && remoteFiles.length === 0" class="file-empty">
+          {{ fileManagerStatusText }}
+        </div>
       </div>
     </div>
 

@@ -32,7 +32,7 @@ textarea {
 
 .app-shell {
   display: grid;
-  grid-template-columns: var(--sidebar-width, 292px) 8px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 228px) 4px minmax(0, 1fr);
   height: 100vh;
   color: #25313d;
   background:
@@ -44,15 +44,15 @@ textarea {
   display: flex;
   min-height: 0;
   flex-direction: column;
-  gap: 14px;
-  padding: 18px;
+  gap: 8px;
+  padding: 10px;
   border-right: 1px solid #d6dde2;
   background: rgba(248, 250, 251, 0.92);
 }
 
 .sidebar-resizer {
   position: relative;
-  min-width: 8px;
+  min-width: 4px;
   cursor: col-resize;
   background: linear-gradient(90deg, #d6dde2 0 1px, transparent 1px);
 }
@@ -60,7 +60,7 @@ textarea {
 .sidebar-resizer::after {
   position: absolute;
   top: 50%;
-  left: 3px;
+  left: 1px;
   width: 2px;
   height: 44px;
   border-radius: 999px;
@@ -86,39 +86,39 @@ textarea {
 .brand-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 4px 2px 6px;
+  gap: 8px;
+  padding: 0 2px 2px;
 }
 
 .brand-mark {
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 26px;
+  height: 26px;
   place-items: center;
   border-radius: 8px;
   color: #ffffff;
   background: #1f6f66;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 800;
 }
 
 .brand-row h1 {
   margin: 0;
   color: #18242f;
-  font-size: 19px;
+  font-size: 15px;
   line-height: 1.1;
   letter-spacing: 0;
 }
 
 .brand-row span {
   color: #71808c;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .sidebar-actions {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 40px;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 6px;
 }
 
 .connection-list {
@@ -126,7 +126,7 @@ textarea {
   min-height: 0;
   flex: 1;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
   overflow: auto;
   padding-right: 2px;
 }
@@ -134,12 +134,12 @@ textarea {
 .connection-group {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 5px;
 }
 
 .group-title {
   display: flex;
-  min-height: 28px;
+  min-height: 24px;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -212,19 +212,19 @@ textarea {
 .group-items {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .connection-item {
   display: flex;
   width: 100%;
-  min-height: 58px;
+  min-height: 46px;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   border: 1px solid #dde4e8;
   border-radius: 8px;
-  padding: 9px 8px 9px 11px;
+  padding: 6px 7px 6px 9px;
   color: inherit;
   background: #ffffff;
   text-align: left;
@@ -305,75 +305,57 @@ textarea {
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  gap: 14px;
-  padding: 18px;
+  gap: 5px;
+  padding: 6px;
 }
 
-.workspace-toolbar {
+.workspace-strip {
   display: flex;
-  min-height: 52px;
+  min-height: 30px;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 6px;
   border: 1px solid #d7dfe4;
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 3px 6px;
   background: rgba(255, 255, 255, 0.9);
-}
-
-.toolbar-title {
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  gap: 10px;
-}
-
-.toolbar-title > span {
-  color: #1f6f66;
-  font-size: 18px;
-}
-
-.toolbar-title div {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-}
-
-.toolbar-title strong {
-  color: #1e2b36;
-  font-size: 14px;
-}
-
-.toolbar-title span {
-  overflow: hidden;
-  max-width: 42vw;
-  color: #71808c;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .toolbar-actions {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.workspace-strip .ant-btn {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  line-height: 24px;
+}
+
+.sidebar-actions .ant-btn {
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
 }
 
 .split-layouts {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   border: 1px solid #dde4e8;
   border-radius: 8px;
-  padding: 4px;
+  padding: 1px;
   background: #f7f9fa;
 }
 
 .split-layout-button {
   display: grid;
-  width: 34px;
-  height: 30px;
+  width: 24px;
+  height: 24px;
   place-items: center;
   border: 0;
   border-radius: 6px;
@@ -395,24 +377,25 @@ textarea {
 
 .session-strip {
   display: flex;
-  min-height: 36px;
-  flex: 0 0 auto;
+  min-height: 24px;
+  flex: 1 1 auto;
+  min-width: 0;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   overflow-x: auto;
-  padding: 0 2px 2px;
+  padding: 0 2px;
 }
 
 .session-chip {
   display: inline-flex;
-  max-width: 240px;
+  max-width: 150px;
   min-width: 0;
   flex: 0 0 auto;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   border: 1px solid #d7dfe4;
   border-radius: 8px;
-  padding: 7px 10px;
+  padding: 2px 6px;
   color: #5f6f7a;
   background: #ffffff;
   cursor: pointer;
@@ -420,8 +403,8 @@ textarea {
 
 .session-chip-close {
   display: grid;
-  width: 18px;
-  height: 18px;
+  width: 14px;
+  height: 14px;
   flex: 0 0 auto;
   place-items: center;
   border-radius: 50%;
@@ -441,7 +424,7 @@ textarea {
   min-width: 0;
   flex-direction: column;
   overflow: hidden;
-  line-height: 1.1;
+  line-height: 1;
 }
 
 .session-chip-text strong,
@@ -450,7 +433,7 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
 }
 
@@ -459,7 +442,7 @@ textarea {
   min-width: 0;
   overflow: hidden;
   color: #7a8995;
-  font-size: 11px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -476,12 +459,12 @@ textarea {
 
 .sync-strip {
   display: flex;
-  min-height: 34px;
+  min-height: 28px;
   flex: 0 0 auto;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   overflow-x: auto;
-  margin-top: -8px;
+  margin-top: -4px;
   padding: 0 2px 2px;
 }
 
@@ -493,14 +476,14 @@ textarea {
 
 .sync-chip {
   display: inline-flex;
-  max-width: 210px;
+  max-width: 190px;
   min-width: 0;
   flex: 0 0 auto;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   border: 1px solid #d7dfe4;
   border-radius: 8px;
-  padding: 6px 9px;
+  padding: 4px 7px;
   color: #5f6f7a;
   background: #fbfcfd;
   cursor: pointer;
@@ -526,8 +509,8 @@ textarea {
 
 .layout-icon {
   display: grid;
-  width: 18px;
-  height: 16px;
+  width: 16px;
+  height: 14px;
   gap: 2px;
 }
 
@@ -579,7 +562,7 @@ textarea {
   display: grid;
   min-height: 0;
   flex: 1;
-  gap: 12px;
+  gap: 6px;
 }
 
 .terminal-grid.grid-1 {
@@ -606,7 +589,7 @@ textarea {
   position: relative;
   display: flex;
   min-width: 0;
-  min-height: 240px;
+  min-height: 160px;
   flex-direction: column;
   overflow: hidden;
   border: 1px solid #26353c;
@@ -628,36 +611,36 @@ textarea {
 
 .pane-header {
   display: flex;
-  height: 42px;
+  height: 28px;
   flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 5px;
   border-bottom: 1px solid #263238;
-  padding: 7px 8px 7px 11px;
+  padding: 2px 5px 2px 7px;
   background: #172026;
 }
 
 .pane-title {
   display: inline-flex;
   min-width: 0;
-  flex: 1 1 180px;
+  flex: 1 1 132px;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
 }
 
 .pane-title div {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  line-height: 1.1;
+  line-height: 1;
 }
 
 .pane-title strong {
   overflow: hidden;
   max-width: 100%;
   color: #edf3f4;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -665,7 +648,7 @@ textarea {
 
 .pane-title span {
   color: #8fa0aa;
-  font-size: 11px;
+  font-size: 9px;
 }
 
 .pane-metrics {
@@ -674,7 +657,7 @@ textarea {
   flex: 0 1 auto;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 4px;
   overflow: hidden;
 }
 
@@ -683,18 +666,18 @@ textarea {
   flex: 0 1 auto;
   overflow: hidden;
   border: 1px solid #314149;
-  border-radius: 6px;
-  padding: 2px 6px;
+  border-radius: 4px;
+  padding: 1px 4px;
   color: #cad6dc;
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: 10px;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .status-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: #7b8790;
@@ -719,7 +702,13 @@ textarea {
 .pane-actions {
   display: inline-flex;
   flex: 0 0 auto;
-  gap: 2px;
+  gap: 0;
+}
+
+.pane-actions .ant-btn.ant-btn-sm {
+  width: 22px;
+  height: 22px;
+  padding: 0;
 }
 
 .pane-actions .ant-btn {
@@ -735,7 +724,7 @@ textarea {
   min-width: 0;
   min-height: 0;
   flex: 1;
-  padding: 9px 10px;
+  padding: 2px 4px;
 }
 
 .terminal-host .xterm {
@@ -744,8 +733,8 @@ textarea {
 
 .file-manager {
   display: flex;
-  max-height: 42%;
-  min-height: 168px;
+  max-height: 30%;
+  min-height: 112px;
   flex: 0 0 auto;
   flex-direction: column;
   border-bottom: 1px solid #263238;
@@ -754,9 +743,9 @@ textarea {
 
 .file-manager-toolbar {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(3, 32px);
-  gap: 6px;
-  padding: 8px;
+  grid-template-columns: minmax(0, 1fr) repeat(3, 28px);
+  gap: 4px;
+  padding: 5px;
   border-bottom: 1px solid #263238;
 }
 

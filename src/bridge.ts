@@ -100,9 +100,12 @@ export async function sshDisconnect(session_id: string) {
   })
 }
 
-export async function sshGetSystemUsage(config: ConnectionProfile): Promise<SystemUsage> {
+export async function sshGetSystemUsage(
+  config: ConnectionProfile,
+  session_id?: string,
+): Promise<SystemUsage> {
   if (isTauriRuntime()) {
-    return invoke<SystemUsage>('ssh_get_system_usage', { config })
+    return invoke<SystemUsage>('ssh_get_system_usage', { config, sessionId: session_id })
   }
 
   return {
@@ -117,9 +120,10 @@ export async function sshGetSystemUsage(config: ConnectionProfile): Promise<Syst
 export async function sshListFiles(
   config: ConnectionProfile,
   remote_path: string,
+  session_id?: string,
 ): Promise<RemoteFileList> {
   if (isTauriRuntime()) {
-    return invoke<RemoteFileList>('ssh_list_files', { config, remotePath: remote_path })
+    return invoke<RemoteFileList>('ssh_list_files', { config, remotePath: remote_path, sessionId: session_id })
   }
 
   return {
@@ -153,6 +157,7 @@ export async function sshUploadFile(
   remote_path: string,
   filename: string,
   content_base64: string,
+  session_id?: string,
 ) {
   if (isTauriRuntime()) {
     return invoke<string>('ssh_upload_file', {
@@ -160,15 +165,20 @@ export async function sshUploadFile(
       remotePath: remote_path,
       filename,
       contentBase64: content_base64,
+      sessionId: session_id,
     })
   }
 
   return `${remote_path || '~'}/${filename}`
 }
 
-export async function sshDownloadFile(config: ConnectionProfile, remote_path: string) {
+export async function sshDownloadFile(
+  config: ConnectionProfile,
+  remote_path: string,
+  session_id?: string,
+) {
   if (isTauriRuntime()) {
-    return invoke<string>('ssh_download_file', { config, remotePath: remote_path })
+    return invoke<string>('ssh_download_file', { config, remotePath: remote_path, sessionId: session_id })
   }
 
   return `Downloads/${remote_path.split('/').pop() || 'download'}`
