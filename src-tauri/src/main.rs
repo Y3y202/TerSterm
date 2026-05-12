@@ -62,6 +62,12 @@ struct SshDataEvent {
 }
 
 #[derive(Debug, Serialize, Clone)]
+struct SshRawDataEvent {
+    session_id: String,
+    data_base64: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct SshDisconnectedEvent {
     session_id: String,
     reason: Option<String>,
@@ -93,6 +99,7 @@ struct SystemUsage {
 
 enum SshCommand {
     Write(String),
+    WriteBinary(Vec<u8>),
     Resize { cols: u32, rows: u32 },
     Disconnect,
 }
@@ -382,6 +389,19 @@ fn ssh_write(
 }
 
 #[tauri::command]
+fn ssh_write_binary(
+    sessions: State<'_, SshSessions>,
+    session_id: String,
+    data_base64: String,
+) -> Result<(), String> {
+    let bytes = general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|error| error.to_string())?;
+
+    send_command(&sessions, &session_id, SshCommand::WriteBinary(bytes))
+}
+
+#[tauri::command]
 fn ssh_resize(
     sessions: State<'_, SshSessions>,
     session_id: String,
@@ -491,6 +511,22 @@ async fn ssh_get_system_usage(
     .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn save_local_file(
+    app: AppHandle,
+    filename: String,
+    content_base64: String,
+) -> Result<String, String> {
+    let bytes = general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|error| error.to_string())?;
+    let downloads = app.path().download_dir().map_err(|error| error.to_string())?;
+    fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
+    let local_path = unique_local_path(&downloads, &filename);
+    fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
+    Ok(local_path.to_string_lossy().to_string())
+}
+
 fn send_command(
     sessions: &State<'_, SshSessions>,
     session_id: &str,
@@ -527,6 +563,30 @@ fn send_disconnect_command(
     sender
         .send(SshCommand::Disconnect)
         .map_err(|_| "SSH session is already closed".to_string())
+}
+
+fn emit_ssh_output(app: &AppHandle, session_id: &str, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    app.emit(
+        "ssh-data-raw",
+        SshRawDataEvent {
+            session_id: session_id.to_string(),
+            data_base64: general_purpose::STANDARD.encode(bytes),
+        },
+    )
+    .ok();
+
+    app.emit(
+        "ssh-data",
+        SshDataEvent {
+            session_id: session_id.to_string(),
+            data: String::from_utf8_lossy(bytes).to_string(),
+        },
+    )
+    .ok();
 }
 
 struct OpenSshProcessGuard<'a> {
@@ -1358,17 +1418,6 @@ fn run_remote_file_upload(
         return Err("File name is required".into());
     }
 
-    if connection_uses_private_key(&config) {
-        return run_remote_file_upload_openssh(
-            processes,
-            session_id,
-            &config,
-            remote_path,
-            safe_name,
-            content_base64,
-        );
-    }
-
     match run_remote_file_upload_ssh2(&config, &remote_path, &safe_name, &content_base64) {
         Ok(result) => Ok(result),
         Err(error) if should_fallback_to_openssh(&config, &*error) => {
@@ -1967,14 +2016,11 @@ fn run_ssh_session(
     config: ConnectionConfig,
     rx: mpsc::Receiver<SshCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    app.emit(
-        "ssh-data",
-        SshDataEvent {
-            session_id: session_id.clone(),
-            data: format!("Opening {} ({})...\r\n", config.name, config.host),
-        },
-    )
-    .ok();
+    emit_ssh_output(
+        &app,
+        &session_id,
+        format!("Opening {} ({})...\r\n", config.name, config.host).as_bytes(),
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -2086,14 +2132,7 @@ fn run_ssh_session(
                             password_prompted.store(true, Ordering::Relaxed);
                         }
 
-                        app.emit(
-                            "ssh-data",
-                            SshDataEvent {
-                                session_id: session_id.clone(),
-                                data,
-                            },
-                        )
-                        .ok();
+                        emit_ssh_output(&app, &session_id, &buffer[..size]);
                     }
                     Err(_) => break,
                 }
@@ -2184,6 +2223,12 @@ fn run_ssh_session(
                     writer.flush()?;
                 }
             }
+            Ok(SshCommand::WriteBinary(data)) => {
+                if let Some(writer) = writer.as_mut() {
+                    writer.write_all(&data)?;
+                    writer.flush()?;
+                }
+            }
             Ok(SshCommand::Resize { cols, rows }) => {
                 if let Some(master) = master.as_ref() {
                     master.resize(PtySize {
@@ -2253,11 +2298,13 @@ fn main() {
             ssh_connect,
             ssh_test_connection,
             ssh_write,
+            ssh_write_binary,
             ssh_resize,
             ssh_disconnect,
             ssh_list_files,
             ssh_upload_file,
             ssh_download_file,
+            save_local_file,
             ssh_get_system_usage
         ])
         .on_window_event(|window, event| {

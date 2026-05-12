@@ -2,13 +2,16 @@
 import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import {
+  CloseOutlined,
   DeleteOutlined,
   EditOutlined,
   FolderAddOutlined,
   FolderOpenOutlined,
+  LeftOutlined,
   PlusOutlined,
   RightOutlined,
   SearchOutlined,
+  SettingOutlined,
   SyncOutlined,
 } from '@ant-design/icons-vue'
 import { message } from 'ant-design-vue'
@@ -21,13 +24,17 @@ import {
   sshTestConnection,
   sshWrite,
 } from './bridge'
+import { locale as appLocale, setLocale, supportedLocales, t, type AppLocale } from './i18n'
 import type { ConnectionGroup, ConnectionProfile, SshPane } from './types'
 
 const CONNECTION_STORAGE_KEY = 'tersterm.connections'
 const GROUP_STORAGE_KEY = 'tersterm.groups'
 const SIDEBAR_WIDTH_STORAGE_KEY = 'tersterm.sidebarWidth'
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'tersterm.sidebarCollapsed'
+const THEME_STORAGE_KEY = 'tersterm.theme'
 const DEFAULT_GROUP_ID = 'default'
 const DEFAULT_GROUP_NAME = '默认'
+const DEFAULT_GROUP_ALIASES = new Set(['默认', 'Default'])
 const MAX_PANES = 4
 const MIN_SIDEBAR_WIDTH = 200
 const MAX_SIDEBAR_WIDTH = 420
@@ -35,6 +42,34 @@ const MAX_SIDEBAR_WIDTH = 420
 type ConnectionDraft = Omit<ConnectionProfile, 'id'> & { id?: string }
 type DeepLinkUnlisten = () => void
 type PendingPaneCredential = 'private_key_passphrase'
+
+const appThemes = [
+  {
+    id: 'sage',
+    titleKey: 'themeSageTitle',
+    descriptionKey: 'themeSageDescription',
+    preview: ['#2f8d7d', '#dcf2eb', '#eef4f6'],
+  },
+  {
+    id: 'ocean',
+    titleKey: 'themeOceanTitle',
+    descriptionKey: 'themeOceanDescription',
+    preview: ['#387ad6', '#dceafb', '#eef4fb'],
+  },
+  {
+    id: 'dawn',
+    titleKey: 'themeDawnTitle',
+    descriptionKey: 'themeDawnDescription',
+    preview: ['#d9835f', '#fde5d9', '#fcf4ee'],
+  },
+] as const
+
+type AppThemeId = (typeof appThemes)[number]['id']
+
+const DEFAULT_THEME_ID: AppThemeId = appThemes[0].id
+
+const isAppThemeId = (value: string | null): value is AppThemeId =>
+  Boolean(value && appThemes.some((theme) => theme.id === value))
 
 const createId = (prefix: string) => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -44,10 +79,25 @@ const createId = (prefix: string) => {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+const getDefaultPaneTitle = (index: number) => t('terminalIndexedTitle', index + 1)
+
+const getBasePaneTitle = () => t('terminalBaseTitle')
+
 const groupIdFromName = (name: string) => {
   const normalized = name.trim()
-  if (!normalized || normalized === DEFAULT_GROUP_NAME) return DEFAULT_GROUP_ID
+  if (!normalized || DEFAULT_GROUP_ALIASES.has(normalized)) return DEFAULT_GROUP_ID
   return `group-${normalized.toLowerCase().replace(/\s+/g, '-')}`
+}
+
+const readStoredTheme = (): AppThemeId => {
+  const storedTheme = localStorage.getItem(THEME_STORAGE_KEY)
+  return isAppThemeId(storedTheme) ? storedTheme : DEFAULT_THEME_ID
+}
+
+const readStoredSidebarCollapsed = () => localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true'
+
+const applyAppTheme = (themeId: AppThemeId) => {
+  document.documentElement.dataset.theme = themeId
 }
 
 const defaultGroup = (): ConnectionGroup => ({
@@ -58,7 +108,7 @@ const defaultGroup = (): ConnectionGroup => ({
 
 const createPane = (index: number): SshPane => ({
   id: createId('pane'),
-  title: `终端 ${index + 1}`,
+  title: getDefaultPaneTitle(index),
   status: 'idle',
 })
 
@@ -145,7 +195,10 @@ const activePaneId = ref(panes.value[0].id)
 const searchText = ref('')
 const connectionModalOpen = ref(false)
 const groupModalOpen = ref(false)
+const settingsModalOpen = ref(false)
 const testingConnection = ref(false)
+const appTheme = ref<AppThemeId>(readStoredTheme())
+const sidebarCollapsed = ref(readStoredSidebarCollapsed())
 const sidebarWidth = ref(
   Math.min(
     MAX_SIDEBAR_WIDTH,
@@ -155,7 +208,6 @@ const sidebarWidth = ref(
 const resizingSidebar = ref(false)
 const selectedConnectionId = ref<string>()
 const syncInputEnabled = ref(false)
-const syncInputConfigOpen = ref(false)
 const syncedPaneIds = ref<string[]>([])
 const terminalRefs = ref<Record<string, InstanceType<typeof TerminalPane>>>({})
 let unlistenDeepLink: DeepLinkUnlisten | undefined
@@ -183,12 +235,17 @@ const groupForm = reactive({
   name: '',
 })
 
+const languageOptions = [
+  { value: 'zh-CN', label: '中文' },
+  { value: 'en-US', label: 'English' },
+] as const
+
 const splitLayouts = [
-  { count: 1, title: '单屏', icon: 'single' },
-  { count: 2, title: '双屏', icon: 'dual' },
-  { count: 3, title: '主副三屏', icon: 'triple' },
-  { count: 4, title: '四分屏', icon: 'quad' },
-]
+  { count: 1, titleKey: 'layoutSingle', icon: 'single' },
+  { count: 2, titleKey: 'layoutDual', icon: 'dual' },
+  { count: 3, titleKey: 'layoutTriple', icon: 'triple' },
+  { count: 4, titleKey: 'layoutQuad', icon: 'quad' },
+] as const
 
 const visiblePanes = computed(() =>
   visiblePaneIds.value
@@ -203,19 +260,72 @@ const syncTargetPanes = computed(() =>
   visibleConnectedPanes.value.filter((pane) => syncedPaneIds.value.includes(pane.id)),
 )
 const canBroadcastInput = computed(() => syncInputEnabled.value && syncTargetPanes.value.length >= 2)
+const activeAppTheme = computed(() => appThemes.find((theme) => theme.id === appTheme.value) ?? appThemes[0])
+const currentLanguageLabel = computed(
+  () => languageOptions.find((option) => option.value === appLocale.value)?.label ?? '中文',
+)
+const getThemeTitle = (theme: (typeof appThemes)[number]) => t(theme.titleKey)
+const getThemeDescription = (theme: (typeof appThemes)[number]) => t(theme.descriptionKey)
+const getSplitLayoutTitle = (layout: (typeof splitLayouts)[number]) => t(layout.titleKey)
+const getGroupDisplayName = (group: Pick<ConnectionGroup, 'id' | 'name'>) =>
+  group.id === DEFAULT_GROUP_ID ? t('defaultGroupName') : group.name
+const syncStatusSummary = computed(() => {
+  if (visibleConnectedPanes.value.length < 2) {
+    return t('syncNeedTwoSessions')
+  }
+
+  if (syncInputEnabled.value) {
+    return t('syncSyncedCount', syncedPaneIds.value.length)
+  }
+
+  if (syncedPaneIds.value.length >= 2) {
+    return t('syncSelectedCount', syncedPaneIds.value.length)
+  }
+
+  return t('syncNotEnabled')
+})
 
 const groupOptions = computed(() =>
   groups.value.map((group) => ({
-    label: group.name,
+    label: getGroupDisplayName(group),
     value: group.id,
   })),
 )
 
 const groupNameById = computed(() => {
   const names = new Map<string, string>()
-  groups.value.forEach((group) => names.set(group.id, group.name))
+  groups.value.forEach((group) => names.set(group.id, getGroupDisplayName(group)))
   return names
 })
+
+watch(
+  appTheme,
+  (themeId) => {
+    applyAppTheme(themeId)
+    localStorage.setItem(THEME_STORAGE_KEY, themeId)
+  },
+  { immediate: true },
+)
+
+watch(
+  sidebarCollapsed,
+  (value) => localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(value)),
+  { immediate: true },
+)
+
+watch(appLocale, () => {
+  panes.value.forEach((pane, index) => {
+    if (!pane.connection) {
+      pane.title = getDefaultPaneTitle(index)
+    }
+  })
+})
+
+const setAppLocale = (value: string | number) => {
+  if (supportedLocales.includes(value as AppLocale)) {
+    setLocale(value as AppLocale)
+  }
+}
 
 const filteredConnections = computed(() => {
   const query = searchText.value.trim().toLowerCase()
@@ -287,6 +397,18 @@ const fitAllTerminals = () => {
   })
 }
 
+const setSidebarCollapsed = (collapsed: boolean) => {
+  if (sidebarCollapsed.value === collapsed) return
+
+  sidebarCollapsed.value = collapsed
+  resizingSidebar.value = false
+  fitAllTerminals()
+}
+
+const toggleSidebarCollapsed = () => {
+  setSidebarCollapsed(!sidebarCollapsed.value)
+}
+
 const showPane = async (paneId: string) => {
   const current = visiblePaneIds.value.filter((id) => panes.value.some((pane) => pane.id === id))
   if (!current.includes(paneId)) {
@@ -323,9 +445,6 @@ const pruneSyncTargets = () => {
   if (syncedPaneIds.value.length < 2) {
     syncInputEnabled.value = false
   }
-  if (!syncInputEnabled.value && syncedPaneIds.value.length === 0) {
-    syncInputConfigOpen.value = false
-  }
 }
 
 const toggleSyncInput = () => {
@@ -333,7 +452,6 @@ const toggleSyncInput = () => {
 
   if (syncInputEnabled.value) {
     syncInputEnabled.value = false
-    syncInputConfigOpen.value = false
     return
   }
 
@@ -342,12 +460,11 @@ const toggleSyncInput = () => {
   }
 
   if (!syncInputEnabled.value && syncedPaneIds.value.length < 2) {
-    message.warning('请至少选择 2 个已连接的分屏会话')
+    message.warning(t('syncNeedTwoVisiblePanes'))
     return
   }
 
   syncInputEnabled.value = true
-  syncInputConfigOpen.value = true
 }
 
 const toggleSyncPane = (paneId: string) => {
@@ -358,9 +475,13 @@ const toggleSyncPane = (paneId: string) => {
   }
 
   pruneSyncTargets()
-  if (syncInputConfigOpen.value && syncedPaneIds.value.length >= 2) {
+  if (syncedPaneIds.value.length >= 2) {
     syncInputEnabled.value = true
   }
+}
+
+const setAppTheme = (themeId: AppThemeId) => {
+  appTheme.value = themeId
 }
 
 const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string }) => {
@@ -387,6 +508,12 @@ const handleTerminalInput = ({ pane_id, data }: { pane_id: string; data: string 
       void sshWrite(pane.session_id, data)
     }
   })
+}
+
+const handlePaneZmodemState = ({ pane_id, active }: { pane_id: string; active: boolean }) => {
+  const pane = panes.value.find((item) => item.id === pane_id)
+  if (!pane) return
+  pane.zmodem_active = active
 }
 
 const connectionUsesPrivateKey = (connection?: ConnectionProfile) =>
@@ -561,6 +688,7 @@ const stopPaneSession = async (pane: SshPane) => {
     private_key_passphrase_origin: undefined,
     remote_features_ready: false,
     error: undefined,
+    zmodem_active: false,
     system_usage: undefined,
     system_usage_loading: false,
     system_usage_error: undefined,
@@ -607,6 +735,8 @@ const stopSystemUsagePolling = () => {
 }
 
 const startSidebarResize = (event: PointerEvent) => {
+  if (sidebarCollapsed.value) return
+
   const startX = event.clientX
   const startWidth = sidebarWidth.value
   resizingSidebar.value = true
@@ -688,7 +818,7 @@ const openConnectionModal = (connection?: ConnectionProfile, groupId?: string) =
 
 const profileFromConnectionForm = (): ConnectionProfile | undefined => {
   if (!connectionForm.name.trim() || !connectionForm.host.trim() || !connectionForm.username.trim()) {
-    message.warning('请填写名称、主机和用户名')
+    message.warning(t('fillConnectionRequired'))
     return undefined
   }
 
@@ -726,7 +856,7 @@ const saveConnection = () => {
 
   selectedConnectionId.value = profile.id
   connectionModalOpen.value = false
-  message.success('已保存连接')
+  message.success(t('connectionSaved'))
 }
 
 const readUrlValue = (url: URL, names: string[]) => {
@@ -749,6 +879,7 @@ const isTerstermDeepLink = (url: URL) => url.protocol.toLowerCase() === 'terster
 const groupIdFromDeepLink = (value: string) => {
   const groupName = value.trim()
   if (!groupName) return DEFAULT_GROUP_ID
+  if (DEFAULT_GROUP_ALIASES.has(groupName)) return DEFAULT_GROUP_ID
 
   const existing = groups.value.find(
     (group) => group.id === groupName || group.name.toLowerCase() === groupName.toLowerCase(),
@@ -786,7 +917,7 @@ const profileFromDeepLink = (
     readUrlValue(url, ['username', 'user', 'login']) || decodeURIComponent(url.username)
 
   if (!host || !username) {
-    message.warning('Quick session link needs host and username')
+    message.warning(t('quickSessionLinkNeedsHostAndUsername'))
     return undefined
   }
 
@@ -848,7 +979,7 @@ const openQuickSessionUrls = async (urls: string[]) => {
     const profile = quickSession.profile
     if (quickSession.save) {
       saveOrUpdateQuickConnection(profile)
-      message.success(`Saved quick session: ${profile.name}`)
+      message.success(t('quickSessionSaved', profile.name))
     }
 
     if (quickSession.connect) {
@@ -867,7 +998,7 @@ const testConnection = async () => {
   testingConnection.value = true
   try {
     await sshTestConnection(profile)
-    message.success('测试连接成功')
+    message.success(t('testConnectionSuccess'))
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
   } finally {
@@ -877,22 +1008,22 @@ const testConnection = async () => {
 
 const openGroupModal = (group?: ConnectionGroup) => {
   groupForm.id = group?.id || ''
-  groupForm.name = group?.name || ''
+  groupForm.name = group ? getGroupDisplayName(group) : ''
   groupModalOpen.value = true
 }
 
 const saveGroup = () => {
   const name = groupForm.name.trim()
   if (!name) {
-    message.warning('请填写分组名称')
+    message.warning(t('fillGroupName'))
     return
   }
 
   const duplicate = groups.value.some(
-    (group) => group.name === name && group.id !== groupForm.id,
+    (group) => getGroupDisplayName(group).toLowerCase() === name.toLowerCase() && group.id !== groupForm.id,
   )
   if (duplicate) {
-    message.warning('分组名称已存在')
+    message.warning(t('duplicateGroupName'))
     return
   }
 
@@ -910,12 +1041,12 @@ const saveGroup = () => {
   }
 
   groupModalOpen.value = false
-  message.success('已保存分组')
+  message.success(t('groupSaved'))
 }
 
 const deleteGroup = (group: ConnectionGroup) => {
   if (group.id === DEFAULT_GROUP_ID) {
-    message.warning('默认分组不能删除')
+    message.warning(t('defaultGroupCannotDelete'))
     return
   }
 
@@ -938,7 +1069,7 @@ const deleteGroup = (group: ConnectionGroup) => {
     }
   })
 
-  message.success('已删除分组，连接已移到默认分组')
+  message.success(t('groupDeletedMovedToDefault'))
 }
 
 const deleteConnection = async (connection: ConnectionProfile) => {
@@ -951,13 +1082,14 @@ const deleteConnection = async (connection: ConnectionProfile) => {
     if (pane.connection?.id !== connection.id) continue
     await stopPaneSession(pane)
     Object.assign(pane, {
-      title: '终端',
+      title: getBasePaneTitle(),
       status: 'idle',
       session_id: undefined,
       connection: undefined,
       private_key_passphrase_origin: undefined,
       remote_features_ready: false,
       error: undefined,
+      zmodem_active: false,
       system_usage: undefined,
       system_usage_loading: false,
       system_usage_error: undefined,
@@ -975,6 +1107,7 @@ const disconnectPane = async (pane: SshPane) => {
     private_key_passphrase_origin: undefined,
     remote_features_ready: false,
     error: undefined,
+    zmodem_active: false,
     system_usage: undefined,
     system_usage_loading: false,
     system_usage_error: undefined,
@@ -1056,6 +1189,7 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
     session_id: undefined,
     error: undefined,
     terminal_output: '',
+    zmodem_active: false,
     system_usage: undefined,
     system_usage_loading: false,
     system_usage_error: undefined,
@@ -1071,6 +1205,7 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
         status: 'connecting',
         remote_features_ready: false,
         error: undefined,
+        zmodem_active: false,
       })
     }
     await nextTick()
@@ -1082,6 +1217,7 @@ const openConnectionInPane = async (connection: ConnectionProfile, paneId = acti
       private_key_passphrase_origin: undefined,
       remote_features_ready: false,
       error: error instanceof Error ? error.message : String(error),
+      zmodem_active: false,
     })
   }
 }
@@ -1121,6 +1257,7 @@ const handleDisconnected = ({
     private_key_passphrase_origin: undefined,
     remote_features_ready: false,
     error: reason,
+    zmodem_active: false,
     system_usage: undefined,
     system_usage_loading: false,
     system_usage_error: undefined,
@@ -1131,6 +1268,7 @@ const handleDisconnected = ({
 const appendTerminalOutput = (session_id: string, data: string) => {
   const pane = panes.value.find((item) => item.session_id === session_id)
   if (!pane) return
+  if (pane.zmodem_active) return
 
   const visibleData = pane.private_key_passphrase_origin === 'configured'
     ? stripConfiguredPassphrasePrompt(data)
@@ -1192,19 +1330,24 @@ onBeforeUnmount(() => {
 <template>
   <main
     class="app-shell"
-    :class="{ 'is-resizing-sidebar': resizingSidebar }"
-    :style="{ '--sidebar-width': `${sidebarWidth}px` }"
+    :class="{ 'is-resizing-sidebar': resizingSidebar, 'is-sidebar-collapsed': sidebarCollapsed }"
+    :style="{
+      '--sidebar-width': sidebarCollapsed ? '0px' : `${sidebarWidth}px`,
+      '--sidebar-resizer-width': sidebarCollapsed ? '0px' : '8px',
+    }"
   >
-    <aside class="sidebar">
-      <div class="brand-row">
-        <div class="brand-mark">TS</div>
-        <div>
-          <h1>TerSterm</h1>
-          <span>SSH Manager</span>
+    <aside v-if="!sidebarCollapsed" class="sidebar">
+      <div class="brand-panel">
+        <div class="brand-row">
+          <div class="brand-mark">TS</div>
+          <div>
+            <h1>TerSterm</h1>
+            <span>{{ t('brandSubtitle') }}</span>
+          </div>
         </div>
       </div>
 
-      <a-input v-model:value="searchText" placeholder="搜索连接或分组" allow-clear>
+      <a-input v-model:value="searchText" :placeholder="t('searchConnectionsOrGroups')" allow-clear>
         <template #prefix>
           <SearchOutlined />
         </template>
@@ -1212,27 +1355,27 @@ onBeforeUnmount(() => {
 
       <div class="sidebar-actions">
         <a-button type="primary" :icon="h(PlusOutlined)" @click="openConnectionModal()">
-          新建连接
+          {{ t('newConnection') }}
         </a-button>
-        <a-tooltip title="新建分组">
+        <a-tooltip :title="t('newGroup')">
           <a-button :icon="h(FolderAddOutlined)" @click="openGroupModal()" />
         </a-tooltip>
       </div>
 
       <div class="connection-list">
-        <a-empty v-if="connections.length === 0" description="暂无连接" />
-        <a-empty v-else-if="filteredConnections.length === 0" description="没有匹配连接" />
+        <a-empty v-if="connections.length === 0" :description="t('noConnections')" />
+        <a-empty v-else-if="filteredConnections.length === 0" :description="t('noMatchingConnections')" />
 
         <section v-for="group in groupedConnections" :key="group.id" class="connection-group">
           <div class="group-title">
             <button class="group-toggle" type="button" @click="toggleGroup(group.id)">
               <RightOutlined :class="{ expanded: group.expanded }" />
               <FolderOpenOutlined />
-              <span>{{ group.name }}</span>
+              <span>{{ getGroupDisplayName(group) }}</span>
               <small>{{ group.items.length }}</small>
             </button>
             <span class="group-actions">
-              <a-tooltip title="添加连接">
+              <a-tooltip :title="t('addConnection')">
                 <a-button
                   type="text"
                   size="small"
@@ -1240,7 +1383,7 @@ onBeforeUnmount(() => {
                   @click.stop="openConnectionModal(undefined, group.id)"
                 />
               </a-tooltip>
-              <a-tooltip title="重命名">
+              <a-tooltip :title="t('renameGroup')">
                 <a-button
                   type="text"
                   size="small"
@@ -1249,12 +1392,12 @@ onBeforeUnmount(() => {
                 />
               </a-tooltip>
               <a-popconfirm
-                title="删除后连接会移到默认分组"
-                ok-text="删除"
-                cancel-text="取消"
+                :title="t('deleteGroupMoveNotice')"
+                :ok-text="t('delete')"
+                :cancel-text="t('cancel')"
                 @confirm="deleteGroup(group)"
               >
-                <a-tooltip title="删除分组">
+                <a-tooltip :title="t('deleteGroup')">
                   <a-button
                     type="text"
                     size="small"
@@ -1281,7 +1424,7 @@ onBeforeUnmount(() => {
                 <small>{{ connection.username }}@{{ connection.host }}:{{ connection.port }}</small>
               </span>
               <span class="connection-actions">
-                <a-tooltip title="编辑">
+                <a-tooltip :title="t('edit')">
                   <a-button
                     type="text"
                     size="small"
@@ -1289,7 +1432,7 @@ onBeforeUnmount(() => {
                     @click.stop="openConnectionModal(connection)"
                   />
                 </a-tooltip>
-                <a-tooltip title="删除">
+                <a-tooltip :title="t('delete')">
                   <a-button
                     type="text"
                     size="small"
@@ -1308,43 +1451,77 @@ onBeforeUnmount(() => {
               @click="openConnectionModal(undefined, group.id)"
             >
               <PlusOutlined />
-              <span>添加连接</span>
+              <span>{{ t('addConnection') }}</span>
             </button>
           </div>
         </section>
       </div>
+
+      <div class="sidebar-footer">
+        <a-tooltip :title="t('interfaceSettings')">
+          <a-button class="sidebar-settings-button" :icon="h(SettingOutlined)" @click="settingsModalOpen = true">
+            {{ t('interfaceSettings') }}
+          </a-button>
+        </a-tooltip>
+        <a-tooltip :title="t('collapseSidebar')">
+          <a-button
+            class="sidebar-collapse-button"
+            :icon="h(LeftOutlined)"
+            :aria-label="t('collapseSidebar')"
+            @click="toggleSidebarCollapsed"
+          />
+        </a-tooltip>
+      </div>
     </aside>
-    <div class="sidebar-resizer" role="separator" aria-label="调整侧边栏宽度" @pointerdown="startSidebarResize" />
+    <div
+      v-if="!sidebarCollapsed"
+      class="sidebar-resizer"
+      role="separator"
+      :aria-label="t('resizeSidebar')"
+      @pointerdown="startSidebarResize"
+    />
 
     <section class="workspace">
       <header class="workspace-strip">
-        <div class="session-strip" aria-label="会话列表">
-          <button
-            v-for="pane in panes"
-            :key="pane.id"
-            class="session-chip"
-            :class="{ active: pane.id === activePaneId, visible: visiblePaneIds.includes(pane.id) }"
-            type="button"
-            @click="switchToPane(pane.id)"
-          >
-            <span class="status-dot" :class="pane.status" />
-            <span class="session-chip-text">
-              <strong>{{ pane.title }}</strong>
-            </span>
-            <span class="session-chip-close" role="button" title="关闭会话" @click.stop="closePane(pane.id)">
-              x
-            </span>
-          </button>
+        <div class="workspace-context">
+          <a-tooltip v-if="sidebarCollapsed" :title="t('expandSidebar')">
+            <button
+              class="workspace-sidebar-toggle"
+              type="button"
+              :aria-label="t('expandSidebar')"
+              @click="toggleSidebarCollapsed"
+            >
+              <RightOutlined />
+            </button>
+          </a-tooltip>
+          <div class="session-strip" :aria-label="t('sessionList')">
+            <button
+              v-for="pane in panes"
+              :key="pane.id"
+              class="session-chip"
+              :class="{ active: pane.id === activePaneId, visible: visiblePaneIds.includes(pane.id) }"
+              type="button"
+              @click="switchToPane(pane.id)"
+            >
+              <span class="status-dot" :class="pane.status" />
+              <span class="session-chip-text">
+                <strong>{{ pane.title }}</strong>
+              </span>
+              <span class="session-chip-close" role="button" :title="t('closeSession')" @click.stop="closePane(pane.id)">
+                <CloseOutlined />
+              </span>
+            </button>
+          </div>
         </div>
 
         <div class="toolbar-actions">
-          <div class="split-layouts" aria-label="分屏布局">
-            <a-tooltip v-for="layout in splitLayouts" :key="layout.count" :title="layout.title">
+          <div class="split-layouts toolbar-layouts" :aria-label="t('workspaceLayout')">
+            <a-tooltip v-for="layout in splitLayouts" :key="layout.count" :title="getSplitLayoutTitle(layout)">
               <button
                 class="split-layout-button"
                 :class="{ active: visiblePaneIds.length === layout.count }"
                 type="button"
-                :aria-label="layout.title"
+                :aria-label="getSplitLayoutTitle(layout)"
                 @click="setSplitCount(layout.count)"
               >
                 <span class="layout-icon" :class="`layout-${layout.icon}`">
@@ -1356,38 +1533,57 @@ onBeforeUnmount(() => {
               </button>
             </a-tooltip>
           </div>
-          <a-button
-            :type="syncInputEnabled ? 'primary' : 'default'"
-            :disabled="visibleConnectedPanes.length < 2"
-            :icon="h(SyncOutlined)"
-            aria-label="同步输入"
-            title="同步输入"
-            @click="toggleSyncInput"
-          />
-        </div>
-      </header>
 
-      <div
-        v-if="syncInputConfigOpen && visibleConnectedPanes.length > 1"
-        class="sync-strip"
-        aria-label="同步输入会话"
-      >
-        <span class="sync-strip-label">同步到</span>
-        <button
-          v-for="pane in visibleConnectedPanes"
-          :key="pane.id"
-          class="sync-chip"
-          :class="{ selected: syncedPaneIds.includes(pane.id) }"
-          type="button"
-          @click="toggleSyncPane(pane.id)"
-        >
-          <span class="sync-check">{{ syncedPaneIds.includes(pane.id) ? 'on' : '' }}</span>
-          <span class="sync-chip-text">
-            <strong>{{ pane.title }}</strong>
-            <small>{{ pane.connection?.host }}</small>
-          </span>
-        </button>
-      </div>
+          <a-tooltip :title="t('syncInput')">
+            <a-popover placement="bottomRight" trigger="click">
+              <template #content>
+                <div class="sync-popover-panel">
+                  <div class="settings-card-header sync-popover-header">
+                    <div>
+                      <strong>{{ t('syncInput') }}</strong>
+                      <span>{{ syncStatusSummary }}</span>
+                    </div>
+                    <a-button
+                      :type="syncInputEnabled ? 'primary' : 'default'"
+                      :disabled="visibleConnectedPanes.length < 2"
+                      :icon="h(SyncOutlined)"
+                      @click="toggleSyncInput"
+                    >
+                      {{ syncInputEnabled ? t('syncDisable') : t('syncEnable') }}
+                    </a-button>
+                  </div>
+                  <p class="settings-note">{{ t('syncHint') }}</p>
+                  <div v-if="visibleConnectedPanes.length > 0" class="settings-sync-list" :aria-label="t('syncInput')">
+                    <button
+                      v-for="pane in visibleConnectedPanes"
+                      :key="pane.id"
+                      class="sync-chip"
+                      :class="{ selected: syncedPaneIds.includes(pane.id) }"
+                      type="button"
+                      @click="toggleSyncPane(pane.id)"
+                    >
+                      <span class="sync-check">{{ syncedPaneIds.includes(pane.id) ? 'on' : '' }}</span>
+                      <span class="sync-chip-text">
+                        <strong>{{ pane.title }}</strong>
+                        <small>{{ pane.connection?.host }}</small>
+                      </span>
+                    </button>
+                  </div>
+                  <p v-else class="settings-note">{{ t('noConnectedSessions') }}</p>
+                </div>
+              </template>
+              <a-button
+                class="toolbar-sync-trigger"
+                :type="syncInputEnabled ? 'primary' : 'default'"
+                :icon="h(SyncOutlined)"
+                :aria-label="t('syncInput')"
+                :title="t('syncInput')"
+              />
+            </a-popover>
+          </a-tooltip>
+        </div>
+
+      </header>
 
       <div class="terminal-grid" :class="`grid-${visiblePanes.length}`">
         <TerminalPane
@@ -1396,11 +1592,13 @@ onBeforeUnmount(() => {
           :ref="(component) => setTerminalRef(pane.id, component as InstanceType<typeof TerminalPane> | null)"
           :pane="pane"
           :active="pane.id === activePaneId"
+          :app-theme="appTheme"
           @focus="activePaneId = $event"
           @disconnect="disconnectPaneById"
           @close="closePane"
           @connect="connectFromPane"
           @input="handleTerminalInput"
+          @zmodem="handlePaneZmodemState"
           @authenticated="handlePaneAuthenticated"
           @disconnected="handleDisconnected"
         />
@@ -1408,8 +1606,62 @@ onBeforeUnmount(() => {
     </section>
 
     <a-modal
+      v-model:open="settingsModalOpen"
+      :title="t('settingsTitle')"
+      width="560px"
+      class="settings-modal"
+      :footer="null"
+    >
+      <div class="settings-panel">
+        <section class="settings-card">
+          <div class="settings-card-header">
+            <div>
+              <strong>{{ t('themeSettings') }}</strong>
+              <span>{{ t('currentTheme', getThemeTitle(activeAppTheme)) }}</span>
+            </div>
+            <small>{{ t('applyImmediatelyAndPersist') }}</small>
+          </div>
+
+          <div class="theme-grid" :aria-label="t('themeSettings')">
+            <button
+              v-for="theme in appThemes"
+              :key="theme.id"
+              class="theme-card"
+              :class="{ active: appTheme === theme.id }"
+              type="button"
+              :aria-pressed="appTheme === theme.id"
+              @click="setAppTheme(theme.id)"
+            >
+              <span class="theme-preview" aria-hidden="true">
+                <i v-for="(color, index) in theme.preview" :key="`${theme.id}-${index}`" :style="{ background: color }" />
+              </span>
+              <strong>{{ getThemeTitle(theme) }}</strong>
+              <small>{{ getThemeDescription(theme) }}</small>
+            </button>
+          </div>
+
+          <p class="settings-note">{{ t('themeHint') }}</p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-header">
+            <div>
+              <strong>{{ t('languageSettings') }}</strong>
+              <span>{{ t('currentLanguage', currentLanguageLabel) }}</span>
+            </div>
+            <small>{{ t('applyImmediatelyAndPersist') }}</small>
+          </div>
+
+          <a-segmented :value="appLocale" :options="languageOptions" block @change="setAppLocale" />
+
+          <p class="settings-note">{{ t('languageHint') }}</p>
+        </section>
+      </div>
+    </a-modal>
+
+    <a-modal
       v-model:open="connectionModalOpen"
-      :title="connectionForm.id ? '编辑连接' : '新建连接'"
+      :title="connectionForm.id ? t('connectionEditTitle') : t('connectionNewTitle')"
       width="640px"
       class="connection-modal"
       :destroy-on-close="false"
@@ -1417,55 +1669,55 @@ onBeforeUnmount(() => {
     >
       <template #footer>
         <div class="connection-modal-footer">
-          <a-button :loading="testingConnection" @click="testConnection">测试连接</a-button>
+          <a-button :loading="testingConnection" @click="testConnection">{{ t('testConnection') }}</a-button>
           <span>
-            <a-button @click="connectionModalOpen = false">取消</a-button>
-            <a-button type="primary" @click="saveConnection">确定</a-button>
+            <a-button @click="connectionModalOpen = false">{{ t('cancel') }}</a-button>
+            <a-button type="primary" @click="saveConnection">{{ t('confirm') }}</a-button>
           </span>
         </div>
       </template>
       <a-form layout="vertical" class="connection-form">
         <div class="connection-form-grid primary">
-          <a-form-item label="名称" required>
-            <a-input v-model:value="connectionForm.name" placeholder="Production" />
+          <a-form-item :label="t('nameLabel')" required>
+            <a-input v-model:value="connectionForm.name" :placeholder="t('connectionNamePlaceholder')" />
           </a-form-item>
-          <a-form-item label="主机" required>
-            <a-input v-model:value="connectionForm.host" placeholder="192.168.1.10" />
+          <a-form-item :label="t('hostLabel')" required>
+            <a-input v-model:value="connectionForm.host" :placeholder="t('hostPlaceholder')" />
           </a-form-item>
-          <a-form-item label="端口">
+          <a-form-item :label="t('portLabel')">
             <a-input-number v-model:value="connectionForm.port" :min="1" :max="65535" />
           </a-form-item>
         </div>
         <div class="connection-form-grid secondary">
-          <a-form-item label="用户名" required>
-            <a-input v-model:value="connectionForm.username" placeholder="root" />
+          <a-form-item :label="t('usernameLabel')" required>
+            <a-input v-model:value="connectionForm.username" :placeholder="t('usernamePlaceholder')" />
           </a-form-item>
-          <a-form-item label="分组">
+          <a-form-item :label="t('groupLabel')">
             <a-select v-model:value="connectionForm.group_id" :options="groupOptions" />
           </a-form-item>
-          <a-form-item label="密码">
+          <a-form-item :label="t('passwordLabel')">
             <a-input-password v-model:value="connectionForm.password" autocomplete="current-password" />
           </a-form-item>
         </div>
 
         <div class="auth-panel">
-          <div class="auth-panel-title">密钥认证</div>
+          <div class="auth-panel-title">{{ t('keyAuthTitle') }}</div>
           <div class="connection-form-grid key-fields">
-            <a-form-item label="私钥路径">
-              <a-input v-model:value="connectionForm.private_key_path" placeholder="C:\\Users\\me\\.ssh\\id_rsa" />
+            <a-form-item :label="t('privateKeyPathLabel')">
+              <a-input v-model:value="connectionForm.private_key_path" :placeholder="t('privateKeyPathPlaceholder')" />
             </a-form-item>
-            <a-form-item label="证书密码">
+            <a-form-item :label="t('privateKeyPassphraseLabel')">
               <a-input-password
                 v-model:value="connectionForm.private_key_passphrase"
                 autocomplete="current-password"
               />
             </a-form-item>
           </div>
-          <a-form-item label="粘贴私钥" class="private-key-field">
+          <a-form-item :label="t('pastePrivateKeyLabel')" class="private-key-field">
             <a-textarea
               v-model:value="connectionForm.private_key"
               :auto-size="{ minRows: 3, maxRows: 5 }"
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+              :placeholder="t('privateKeyPlaceholder')"
             />
           </a-form-item>
         </div>
@@ -1474,14 +1726,17 @@ onBeforeUnmount(() => {
 
     <a-modal
       v-model:open="groupModalOpen"
-      :title="groupForm.id ? '重命名分组' : '新建分组'"
+      :title="groupForm.id ? t('groupRenameTitle') : t('groupNewTitle')"
       width="420px"
+      class="group-modal"
       :destroy-on-close="false"
+      :ok-text="t('confirm')"
+      :cancel-text="t('cancel')"
       @ok="saveGroup"
     >
       <a-form layout="vertical" class="connection-form">
-        <a-form-item label="分组名称" required>
-          <a-input v-model:value="groupForm.name" placeholder="生产环境" />
+        <a-form-item :label="t('groupNameLabel')" required>
+          <a-input v-model:value="groupForm.name" :placeholder="t('groupNamePlaceholder')" />
         </a-form-item>
       </a-form>
     </a-modal>

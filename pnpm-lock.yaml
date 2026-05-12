@@ -29,6 +29,9 @@ importers:
       vue:
         specifier: ^3.5.32
         version: 3.5.34(typescript@6.0.3)
+      zmodem.js:
+        specifier: ^0.1.10
+        version: 0.1.10
     devDependencies:
       '@tauri-apps/cli':
         specifier: ^2.11.1
@@ -395,6 +398,11 @@ packages:
   core-js@3.49.0:
     resolution: {integrity: sha512-es1U2+YTtzpwkxVLwAFdSpaIMyQaq0PBgm3YD1W3Qpsn1NAmO3KSgZfu+oGSWVu6NvLHoHCV/aYcsE5wiB7ALg==}
 
+  crc-32@1.2.2:
+    resolution: {integrity: sha512-ROmzCKrTnOwybPcJApAA6WBWij23HVfGVNKqqrZpuyZOHqK2CwHSvpGuyt/UNNvaIjEd8X5IFGp4Mh+Ie1IHJQ==}
+    engines: {node: '>=0.8'}
+    hasBin: true
+
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
 
@@ -659,6 +667,9 @@ packages:
 
   warning@4.0.3:
     resolution: {integrity: sha512-rpJyN222KWIvHJ/F53XSZv0Zl/accqHR8et1kpaMTD/fLCRxtV8iX8czMzY7sVZupTI3zcUTg8eycS2kNF9l6w==}
+
+  zmodem.js@0.1.10:
+    resolution: {integrity: sha512-Z1DWngunZ/j3BmIzSJpFZVNV73iHkj89rxXX4IciJdU9ga3nZ7rJ5LkfjV/QDsKhc7bazDWTTJCLJ+iRXD82dw==}
 
 snapshots:
 
@@ -969,6 +980,8 @@ snapshots:
 
   core-js@3.49.0: {}
 
+  crc-32@1.2.2: {}
+
   csstype@3.2.3: {}
 
   dayjs@1.11.20: {}
@@ -1157,3 +1170,7 @@ snapshots:
   warning@4.0.3:
     dependencies:
       loose-envify: 1.4.0
+
+  zmodem.js@0.1.10:
+    dependencies:
+      crc-32: 1.2.2

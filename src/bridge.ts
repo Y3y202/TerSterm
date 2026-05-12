@@ -4,6 +4,7 @@ import type {
   ConnectionProfile,
   RemoteFileList,
   SshDataEvent,
+  SshDataRawEvent,
   SshDisconnectedEvent,
   SystemUsage,
 } from './types'
@@ -19,6 +20,19 @@ const isTauriRuntime = () =>
 
 const emitMock = <T>(eventName: string, payload: T) => {
   mockBus.dispatchEvent(new CustomEvent(eventName, { detail: payload }))
+}
+
+const emitMockSshOutput = (session_id: string, data: string) => {
+  emitMock<SshDataEvent>('ssh-data', { session_id, data })
+  const bytes = new TextEncoder().encode(data)
+  let binary = ''
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte)
+  }
+  emitMock<SshDataRawEvent>('ssh-data-raw', {
+    session_id,
+    data_base64: btoa(binary),
+  })
 }
 
 const createId = () => {
@@ -38,10 +52,7 @@ export async function sshConnect(config: ConnectionProfile, session_id = createI
   mockSessions.set(session_id, { prompt, connected: true })
 
   window.setTimeout(() => {
-    emitMock<SshDataEvent>('ssh-data', {
-      session_id,
-      data: `Connected to ${config.name} (${config.host})\r\n${prompt}`,
-    })
+    emitMockSshOutput(session_id, `Connected to ${config.name} (${config.host})\r\n${prompt}`)
   }, 260)
 
   return session_id
@@ -66,16 +77,26 @@ export async function sshWrite(session_id: string, data: string) {
   if (!session?.connected) return
 
   if (data === '\u007f') {
-    emitMock<SshDataEvent>('ssh-data', { session_id, data: '\b \b' })
+    emitMockSshOutput(session_id, '\b \b')
     return
   }
 
   if (data === '\r') {
-    emitMock<SshDataEvent>('ssh-data', { session_id, data: `\r\n${session.prompt}` })
+    emitMockSshOutput(session_id, `\r\n${session.prompt}`)
     return
   }
 
-  emitMock<SshDataEvent>('ssh-data', { session_id, data })
+  emitMockSshOutput(session_id, data)
+}
+
+export async function sshWriteBinary(session_id: string, data_base64: string) {
+  if (isTauriRuntime()) {
+    return invoke<void>('ssh_write_binary', { sessionId: session_id, dataBase64: data_base64 })
+  }
+
+  const bytes = Uint8Array.from(atob(data_base64), (char) => char.charCodeAt(0))
+  const data = new TextDecoder().decode(bytes)
+  return sshWrite(session_id, data)
 }
 
 export async function sshResize(session_id: string, cols: number, rows: number) {
@@ -184,6 +205,14 @@ export async function sshDownloadFile(
   return `Downloads/${remote_path.split('/').pop() || 'download'}`
 }
 
+export async function saveLocalFile(filename: string, content_base64: string) {
+  if (isTauriRuntime()) {
+    return invoke<string>('save_local_file', { filename, contentBase64: content_base64 })
+  }
+
+  return `Downloads/${filename || 'download'}`
+}
+
 export async function onSshData(callback: (payload: SshDataEvent) => void): Promise<UnlistenFn> {
   if (isTauriRuntime()) {
     return listen<SshDataEvent>('ssh-data', (event) => callback(event.payload))
@@ -204,4 +233,14 @@ export async function onSshDisconnected(
   const handler = (event: Event) => callback((event as CustomEvent<SshDisconnectedEvent>).detail)
   mockBus.addEventListener('ssh-disconnected', handler)
   return () => mockBus.removeEventListener('ssh-disconnected', handler)
+}
+
+export async function onSshDataRaw(callback: (payload: SshDataRawEvent) => void): Promise<UnlistenFn> {
+  if (isTauriRuntime()) {
+    return listen<SshDataRawEvent>('ssh-data-raw', (event) => callback(event.payload))
+  }
+
+  const handler = (event: Event) => callback((event as CustomEvent<SshDataRawEvent>).detail)
+  mockBus.addEventListener('ssh-data-raw', handler)
+  return () => mockBus.removeEventListener('ssh-data-raw', handler)
 }

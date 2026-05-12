@@ -30,6 +30,7 @@ export interface SshPane {
   remote_features_ready?: boolean
   error?: string
   terminal_output?: string
+  zmodem_active?: boolean
   system_usage?: SystemUsage
   system_usage_loading?: boolean
   system_usage_error?: string
@@ -38,6 +39,11 @@ export interface SshPane {
 export interface SshDataEvent {
   session_id: string
   data: string
+}
+
+export interface SshDataRawEvent {
+  session_id: string
+  data_base64: string
 }
 
 export interface SshDisconnectedEvent {
