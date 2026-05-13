@@ -7,6 +7,8 @@ use portable_pty::{
 use serde::{Deserialize, Serialize};
 use ssh2::{ExtendedData, FileStat, Session, Sftp};
 use std::cmp::Ordering as VersionOrdering;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -21,8 +23,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use tauri::{
     menu::{MenuBuilder, MenuItem},
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
@@ -39,8 +39,7 @@ use windows_sys::Win32::{
             TH32CS_SNAPPROCESS,
         },
         Threading::{
-            OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
-            PROCESS_TERMINATE,
+            OpenProcess, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_TERMINATE,
         },
     },
 };
@@ -52,7 +51,8 @@ const MAIN_TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_MENU_ID: &str = "tray-show";
 const TRAY_QUIT_MENU_ID: &str = "tray-quit";
 const APP_UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "app-update-download-progress";
-const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
+const GITHUB_RELEASES_API: &str =
+    "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Y3y202/TerSterm/releases/download/";
 
@@ -443,7 +443,11 @@ fn apply_session_auth_secrets(config: &mut ConnectionConfig, secrets: Option<Ses
         return;
     };
 
-    if config.password.as_deref().is_none_or(|value| value.trim().is_empty()) {
+    if config
+        .password
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
         if let Some(password) = secrets.password.filter(|value| !value.trim().is_empty()) {
             config.password = Some(password);
         }
@@ -511,10 +515,7 @@ fn ssh_connect(
             store.remove(&thread_session_id);
         }
 
-        forget_session_auth_secrets(
-            &app.state::<SshSessionSecrets>(),
-            &thread_session_id,
-        );
+        forget_session_auth_secrets(&app.state::<SshSessionSecrets>(), &thread_session_id);
         clear_session_openssh_cancellation(&app.state::<OpenSshProcesses>(), &thread_session_id);
 
         app.emit(
@@ -561,10 +562,12 @@ async fn download_app_update(
     download_url: String,
     filename: String,
 ) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || run_download_app_update(&app, &download_url, &filename))
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        run_download_app_update(&app, &download_url, &filename)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -631,7 +634,8 @@ async fn ssh_list_files(
     session_id: Option<String>,
 ) -> Result<RemoteFileList, String> {
     validate_connection_config(&config)?;
-    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
     apply_session_auth_secrets(&mut config, session_auth_secrets);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -653,7 +657,8 @@ async fn ssh_upload_file(
     session_id: Option<String>,
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
-    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
     apply_session_auth_secrets(&mut config, session_auth_secrets);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -680,7 +685,8 @@ async fn ssh_download_file(
     session_id: Option<String>,
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
-    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
     apply_session_auth_secrets(&mut config, session_auth_secrets);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -699,7 +705,8 @@ async fn ssh_get_system_usage(
     session_id: Option<String>,
 ) -> Result<SystemUsage, String> {
     validate_connection_config(&config)?;
-    let session_auth_secrets = get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
     apply_session_auth_secrets(&mut config, session_auth_secrets);
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -720,7 +727,10 @@ fn save_local_file(
     let bytes = general_purpose::STANDARD
         .decode(content_base64)
         .map_err(|error| error.to_string())?;
-    let downloads = app.path().download_dir().map_err(|error| error.to_string())?;
+    let downloads = app
+        .path()
+        .download_dir()
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
     let local_path = unique_local_path(&downloads, &filename);
     fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
@@ -876,9 +886,9 @@ fn preferred_release_asset(assets: &[GithubReleaseAsset]) -> Option<AppUpdateAss
 }
 
 fn select_release(releases: Vec<GithubRelease>, allow_prerelease: bool) -> Option<GithubRelease> {
-    releases.into_iter().find(|release| {
-        !release.draft && (allow_prerelease || !release.prerelease)
-    })
+    releases
+        .into_iter()
+        .find(|release| !release.draft && (allow_prerelease || !release.prerelease))
 }
 
 fn run_check_app_update(
@@ -1951,6 +1961,13 @@ fn run_remote_file_upload_ssh2(
     Ok(target)
 }
 
+fn remote_file_upload_shell_fragment(remote_target: &str) -> String {
+    format!(
+        r#"target={}; parent=$(dirname -- "$target") || exit 1; mkdir -p -- "$parent" || exit 1; base64 -d > "$target""#,
+        shell_quote(remote_target),
+    )
+}
+
 fn run_remote_file_upload_openssh(
     processes: &OpenSshProcesses,
     session_id: Option<&str>,
@@ -1961,19 +1978,36 @@ fn run_remote_file_upload_openssh(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let target = remote_join(&normalize_remote_path(&remote_path), &safe_name);
     let remote_target = sftp_path(&target);
-    let marker = format!("TERSTERM_UPLOAD_{}", Uuid::new_v4().simple());
-    let fragment = format!(
-        r#"target={}; parent=$(dirname -- "$target") || exit 1; mkdir -p -- "$parent" || exit 1; base64 -d > "$target" <<'{}'
+    let has_interactive_secret = config
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if has_interactive_secret {
+        let marker = format!("TERSTERM_UPLOAD_{}", Uuid::new_v4().simple());
+        let fragment = format!(
+            r#"{} <<'{}'
 {}
 {}
 "#,
-        shell_quote(&remote_target),
-        marker,
-        content_base64,
-        marker
-    );
-    let command = format!("sh -lc {}", shell_quote(&fragment));
-    run_openssh_exec_command(processes, session_id, config, &command)?;
+            remote_file_upload_shell_fragment(&remote_target),
+            marker,
+            content_base64,
+            marker
+        );
+        let command = format!("sh -lc {}", shell_quote(&fragment));
+        run_openssh_exec_command(processes, session_id, config, &command)?;
+    } else {
+        let fragment = remote_file_upload_shell_fragment(&remote_target);
+        let command = format!("sh -lc {}", shell_quote(&fragment));
+        run_openssh_exec_command_noninteractive_with_stdin(
+            processes,
+            session_id,
+            config,
+            &command,
+            Some(content_base64.as_bytes()),
+        )?;
+    }
 
     Ok(target)
 }
@@ -2386,7 +2420,9 @@ fn run_openssh_exec_command(
         loop {
             match output_rx.try_recv() {
                 Ok(Some(data)) => output.push_str(&data),
-                Ok(None) | Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                Ok(None)
+                | Err(mpsc::TryRecvError::Empty)
+                | Err(mpsc::TryRecvError::Disconnected) => {
                     break;
                 }
             }
@@ -2420,6 +2456,34 @@ fn run_openssh_exec_command_noninteractive(
     config: &ConnectionConfig,
     remote_command: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    run_openssh_exec_command_noninteractive_with_stdin(
+        processes,
+        session_id,
+        config,
+        remote_command,
+        None,
+    )
+}
+
+fn join_openssh_stdin_writer(
+    writer: Option<thread::JoinHandle<std::io::Result<()>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match writer {
+        Some(writer) => match writer.join() {
+            Ok(result) => result.map_err(|error| error.into()),
+            Err(_) => Err("OpenSSH stdin writer panicked".into()),
+        },
+        None => Ok(()),
+    }
+}
+
+fn run_openssh_exec_command_noninteractive_with_stdin(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_command: &str,
+    stdin_data: Option<&[u8]>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let process_guard = register_openssh_process(processes, session_id);
     if process_guard.is_cancelled() {
         return Err("OpenSSH command cancelled".into());
@@ -2450,11 +2514,26 @@ fn run_openssh_exec_command_noninteractive(
     command
         .arg(format!("{}@{}", config.username, config.host))
         .arg(remote_command)
-        .stdin(std::process::Stdio::null())
+        .stdin(if stdin_data.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
     let mut child = command.spawn()?;
+    let stdin_writer = if let Some(data) = stdin_data {
+        let mut stdin = child.stdin.take().ok_or("Unable to write OpenSSH stdin")?;
+        let data = data.to_vec();
+        Some(thread::spawn(move || -> std::io::Result<()> {
+            stdin.write_all(&data)?;
+            stdin.flush()?;
+            Ok(())
+        }))
+    } else {
+        None
+    };
     let mut stdout = child.stdout.take().ok_or("Unable to read OpenSSH stdout")?;
     let mut stderr = child.stderr.take().ok_or("Unable to read OpenSSH stderr")?;
     let stdout_reader = thread::spawn(move || {
@@ -2476,6 +2555,7 @@ fn run_openssh_exec_command_noninteractive(
             child.wait().ok();
             stdout_reader.join().ok();
             stderr_reader.join().ok();
+            join_openssh_stdin_writer(stdin_writer).ok();
             return Err("OpenSSH command cancelled".into());
         }
 
@@ -2489,6 +2569,7 @@ fn run_openssh_exec_command_noninteractive(
             child.wait().ok();
             stdout_reader.join().ok();
             stderr_reader.join().ok();
+            join_openssh_stdin_writer(stdin_writer).ok();
             return Err("OpenSSH command timed out".into());
         }
 
@@ -2497,9 +2578,11 @@ fn run_openssh_exec_command_noninteractive(
 
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    let stdin_result = join_openssh_stdin_writer(stdin_writer);
     let combined = format!("{stdout}{stderr}");
 
     if status.success() {
+        stdin_result?;
         return Ok(combined);
     }
 
@@ -2898,8 +2981,10 @@ fn main() {
         .setup(|app| {
             let locale = app.state::<AppLocaleState>().get();
             let (show_text, quit_text) = tray_menu_text(locale);
-            let show_item = MenuItem::with_id(app, TRAY_SHOW_MENU_ID, show_text, true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, quit_text, true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, TRAY_SHOW_MENU_ID, show_text, true, None::<&str>)?;
+            let quit_item =
+                MenuItem::with_id(app, TRAY_QUIT_MENU_ID, quit_text, true, None::<&str>)?;
 
             let tray_menu = MenuBuilder::new(app)
                 .item(&show_item)
@@ -2961,9 +3046,9 @@ mod tests {
     use super::collect_descendants_from_entries;
     use super::{
         compare_release_versions, output_looks_authenticated, parse_openssh_file_list,
-        parse_system_usage_output, run_openssh_exec_command, run_remote_file_list,
-        run_remote_system_usage, should_fallback_to_openssh, ConnectionConfig,
-        OpenSshProcesses,
+        parse_system_usage_output, remote_file_upload_shell_fragment, run_openssh_exec_command,
+        run_remote_file_list, run_remote_system_usage, should_fallback_to_openssh,
+        ConnectionConfig, OpenSshProcesses,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
 
@@ -2991,14 +3076,26 @@ mod tests {
 
     #[test]
     fn compares_release_versions_with_numeric_segments() {
-        assert_eq!(compare_release_versions("v0.1.10", "0.1.9"), CmpOrdering::Greater);
-        assert_eq!(compare_release_versions("0.2.0", "v0.2.0"), CmpOrdering::Equal);
+        assert_eq!(
+            compare_release_versions("v0.1.10", "0.1.9"),
+            CmpOrdering::Greater
+        );
+        assert_eq!(
+            compare_release_versions("0.2.0", "v0.2.0"),
+            CmpOrdering::Equal
+        );
     }
 
     #[test]
     fn treats_prerelease_as_older_than_stable() {
-        assert_eq!(compare_release_versions("1.0.0-beta.1", "1.0.0"), CmpOrdering::Less);
-        assert_eq!(compare_release_versions("1.0.0", "1.0.0-beta.1"), CmpOrdering::Greater);
+        assert_eq!(
+            compare_release_versions("1.0.0-beta.1", "1.0.0"),
+            CmpOrdering::Less
+        );
+        assert_eq!(
+            compare_release_versions("1.0.0", "1.0.0-beta.1"),
+            CmpOrdering::Greater
+        );
     }
 
     #[test]
@@ -3021,6 +3118,14 @@ mod tests {
         assert_eq!(list.entries[1].kind, "directory");
         assert_eq!(list.entries[2].name, "release.log");
         assert_eq!(list.entries[2].size, Some(18432));
+    }
+
+    #[test]
+    fn builds_upload_fragment_that_reads_content_from_stdin() {
+        let fragment = remote_file_upload_shell_fragment("./uploads/release.log");
+
+        assert!(fragment.contains("base64 -d > \"$target\""));
+        assert!(!fragment.contains("<<'"));
     }
 
     #[test]
@@ -3070,17 +3175,16 @@ mod tests {
             private_key: None,
             private_key_passphrase: None,
         };
-        let error = io::Error::other("SSH password authentication failed: keyboard-interactive auth required");
+        let error = io::Error::other(
+            "SSH password authentication failed: keyboard-interactive auth required",
+        );
 
         assert!(should_fallback_to_openssh(&config, &error));
     }
 
     #[test]
     fn detects_authenticated_output_from_shell_prompt() {
-        let output = concat!(
-            "\u{1b}[?2004hroot@hk-ser01:~# ",
-            "\u{1b}[?2004l"
-        );
+        let output = concat!("\u{1b}[?2004hroot@hk-ser01:~# ", "\u{1b}[?2004l");
 
         assert!(output_looks_authenticated(output));
     }
@@ -3093,7 +3197,8 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(22);
-        let username = env::var("TERSTERM_REAL_USERNAME").expect("TERSTERM_REAL_USERNAME is required");
+        let username =
+            env::var("TERSTERM_REAL_USERNAME").expect("TERSTERM_REAL_USERNAME is required");
         let private_key_path = env::var("TERSTERM_REAL_PRIVATE_KEY_PATH").ok();
         let private_key = env::var("TERSTERM_REAL_PRIVATE_KEY").ok();
         let private_key_passphrase = env::var("TERSTERM_REAL_PRIVATE_KEY_PASSPHRASE").ok();
@@ -3118,8 +3223,14 @@ mod tests {
         eprintln!("starting real host file list probe");
         let files = run_remote_file_list(&processes, None, config.clone(), "~".to_string())
             .expect("real host file list probe should succeed");
-        eprintln!("real host file list probe finished: {} entries", files.entries.len());
-        assert!(!files.path.trim().is_empty(), "real host file list path should not be empty");
+        eprintln!(
+            "real host file list probe finished: {} entries",
+            files.entries.len()
+        );
+        assert!(
+            !files.path.trim().is_empty(),
+            "real host file list path should not be empty"
+        );
         assert!(
             !files.entries.is_empty(),
             "real host file list should include at least one entry"
@@ -3128,8 +3239,14 @@ mod tests {
         eprintln!("starting real host system usage probe");
         let usage = run_remote_system_usage(&processes, None, config)
             .expect("real host system usage probe should succeed");
-        eprintln!("real host system usage probe finished: cpu={}", usage.cpu_percent);
-        assert!(usage.cpu_percent >= 0.0, "real host cpu usage should be non-negative");
+        eprintln!(
+            "real host system usage probe finished: cpu={}",
+            usage.cpu_percent
+        );
+        assert!(
+            usage.cpu_percent >= 0.0,
+            "real host cpu usage should be non-negative"
+        );
         assert!(
             usage.memory_total_gb > 0.0 && usage.storage_total_gb > 0.0,
             "real host total resource values should be positive"
