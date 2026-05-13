@@ -3,8 +3,6 @@ import { computed, h, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import {
   CloseOutlined,
-  DeleteOutlined,
-  EditOutlined,
   FolderAddOutlined,
   FolderOpenOutlined,
   LeftOutlined,
@@ -14,10 +12,12 @@ import {
   SettingOutlined,
   SyncOutlined,
 } from '@ant-design/icons-vue'
-import { message } from 'ant-design-vue'
+import { message, Modal } from 'ant-design-vue'
 import TerminalPane from './components/TerminalPane.vue'
 import {
   onSshData,
+  setDesktopLocale as syncDesktopLocale,
+  setWindowCloseBehavior as syncWindowCloseBehavior,
   sshConnect,
   sshDisconnect,
   sshGetSystemUsage,
@@ -31,13 +31,16 @@ const CONNECTION_STORAGE_KEY = 'tersterm.connections'
 const GROUP_STORAGE_KEY = 'tersterm.groups'
 const SIDEBAR_WIDTH_STORAGE_KEY = 'tersterm.sidebarWidth'
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'tersterm.sidebarCollapsed'
+const WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY = 'tersterm.windowCloseBehavior'
 const THEME_STORAGE_KEY = 'tersterm.theme'
 const DEFAULT_GROUP_ID = 'default'
 const DEFAULT_GROUP_NAME = '默认'
 const DEFAULT_GROUP_ALIASES = new Set(['默认', 'Default'])
 const MAX_PANES = 4
-const MIN_SIDEBAR_WIDTH = 200
-const MAX_SIDEBAR_WIDTH = 420
+const MIN_SIDEBAR_WIDTH = 176
+const MAX_SIDEBAR_WIDTH = 340
+const DEFAULT_SIDEBAR_WIDTH = 184
+const LEGACY_SIDEBAR_WIDTHS = new Set([195, 210, 228, 240, 270, 300])
 
 type ConnectionDraft = Omit<ConnectionProfile, 'id'> & { id?: string }
 type DeepLinkUnlisten = () => void
@@ -65,6 +68,7 @@ const appThemes = [
 ] as const
 
 type AppThemeId = (typeof appThemes)[number]['id']
+type WindowCloseBehavior = 'tray' | 'exit'
 
 const DEFAULT_THEME_ID: AppThemeId = appThemes[0].id
 
@@ -96,6 +100,24 @@ const readStoredTheme = (): AppThemeId => {
 
 const readStoredSidebarCollapsed = () => localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true'
 
+const clampSidebarWidthValue = (width: number) => Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width))
+
+const readStoredSidebarWidth = () => {
+  const storedWidth = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY))
+  if (!Number.isFinite(storedWidth) || storedWidth <= 0) return DEFAULT_SIDEBAR_WIDTH
+
+  const nextWidth = LEGACY_SIDEBAR_WIDTHS.has(storedWidth) ? DEFAULT_SIDEBAR_WIDTH : storedWidth
+  return clampSidebarWidthValue(nextWidth)
+}
+
+const isWindowCloseBehavior = (value: string | null): value is WindowCloseBehavior =>
+  value === 'tray' || value === 'exit'
+
+const readStoredWindowCloseBehavior = (): WindowCloseBehavior => {
+  const storedBehavior = localStorage.getItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY)
+  return isWindowCloseBehavior(storedBehavior) ? storedBehavior : 'exit'
+}
+
 const applyAppTheme = (themeId: AppThemeId) => {
   document.documentElement.dataset.theme = themeId
 }
@@ -105,6 +127,32 @@ const defaultGroup = (): ConnectionGroup => ({
   name: DEFAULT_GROUP_NAME,
   expanded: true,
 })
+
+const getPreferredGroupId = (
+  availableGroups: Pick<ConnectionGroup, 'id'>[],
+  preferredGroupId = DEFAULT_GROUP_ID,
+) => {
+  if (availableGroups.some((group) => group.id === preferredGroupId)) return preferredGroupId
+  return availableGroups[0]?.id || preferredGroupId
+}
+
+const resolveConnectionGroupId = (
+  connection: Pick<ConnectionProfile, 'group_id' | 'group'>,
+  availableGroups: Pick<ConnectionGroup, 'id'>[],
+) => {
+  const knownGroupIds = new Set(availableGroups.map((group) => group.id))
+
+  if (connection.group_id && knownGroupIds.has(connection.group_id)) {
+    return connection.group_id
+  }
+
+  const legacyGroupId = groupIdFromName(connection.group || '')
+  if (knownGroupIds.has(legacyGroupId)) {
+    return legacyGroupId
+  }
+
+  return getPreferredGroupId(availableGroups)
+}
 
 const createPane = (index: number): SshPane => ({
   id: createId('pane'),
@@ -136,7 +184,7 @@ const readStoredGroups = (rawConnections: ConnectionProfile[]): ConnectionGroup[
   }
 
   const byId = new Map<string, ConnectionGroup>()
-  ;[defaultGroup(), ...storedGroups].forEach((group) => {
+  storedGroups.forEach((group) => {
     const id = group.id || groupIdFromName(group.name)
     const name = group.name?.trim() || DEFAULT_GROUP_NAME
     byId.set(id, {
@@ -160,31 +208,24 @@ const readStoredGroups = (rawConnections: ConnectionProfile[]): ConnectionGroup[
     }
   })
 
+  if (byId.size === 0) {
+    const group = defaultGroup()
+    byId.set(group.id, group)
+  }
+
   return Array.from(byId.values())
 }
 
 const normalizeConnections = (
   rawConnections: ConnectionProfile[],
   availableGroups: ConnectionGroup[],
-): ConnectionProfile[] => {
-  const knownGroupIds = new Set(availableGroups.map((group) => group.id))
-
-  return rawConnections.map((connection) => {
-    const legacyGroupId = groupIdFromName(connection.group || '')
-    const group_id = knownGroupIds.has(connection.group_id || '')
-      ? connection.group_id
-      : knownGroupIds.has(legacyGroupId)
-        ? legacyGroupId
-        : DEFAULT_GROUP_ID
-
-    return {
-      ...connection,
-      port: Number(connection.port || 22),
-      group_id,
-      group: undefined,
-    }
-  })
-}
+): ConnectionProfile[] =>
+  rawConnections.map((connection) => ({
+    ...connection,
+    port: Number(connection.port || 22),
+    group_id: resolveConnectionGroupId(connection, availableGroups),
+    group: undefined,
+  }))
 
 const rawConnections = readRawConnections()
 const groups = ref<ConnectionGroup[]>(readStoredGroups(rawConnections))
@@ -199,12 +240,8 @@ const settingsModalOpen = ref(false)
 const testingConnection = ref(false)
 const appTheme = ref<AppThemeId>(readStoredTheme())
 const sidebarCollapsed = ref(readStoredSidebarCollapsed())
-const sidebarWidth = ref(
-  Math.min(
-    MAX_SIDEBAR_WIDTH,
-    Math.max(MIN_SIDEBAR_WIDTH, Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY)) || 228),
-  ),
-)
+const windowCloseBehavior = ref<WindowCloseBehavior>(readStoredWindowCloseBehavior())
+const sidebarWidth = ref(readStoredSidebarWidth())
 const resizingSidebar = ref(false)
 const selectedConnectionId = ref<string>()
 const syncInputEnabled = ref(false)
@@ -227,7 +264,7 @@ const connectionForm = reactive<ConnectionDraft>({
   private_key_path: '',
   private_key: '',
   private_key_passphrase: '',
-  group_id: DEFAULT_GROUP_ID,
+  group_id: getPreferredGroupId(groups.value),
 })
 
 const groupForm = reactive({
@@ -261,8 +298,17 @@ const syncTargetPanes = computed(() =>
 )
 const canBroadcastInput = computed(() => syncInputEnabled.value && syncTargetPanes.value.length >= 2)
 const activeAppTheme = computed(() => appThemes.find((theme) => theme.id === appTheme.value) ?? appThemes[0])
+const closeBehaviorOptions = computed(() => [
+  { value: 'tray', label: t('windowCloseBehaviorTray') },
+  { value: 'exit', label: t('windowCloseBehaviorExit') },
+] as const)
 const currentLanguageLabel = computed(
   () => languageOptions.find((option) => option.value === appLocale.value)?.label ?? '中文',
+)
+const currentWindowCloseBehaviorLabel = computed(
+  () =>
+    closeBehaviorOptions.value.find((option) => option.value === windowCloseBehavior.value)?.label ??
+    t('windowCloseBehaviorExit'),
 )
 const getThemeTitle = (theme: (typeof appThemes)[number]) => t(theme.titleKey)
 const getThemeDescription = (theme: (typeof appThemes)[number]) => t(theme.descriptionKey)
@@ -313,6 +359,23 @@ watch(
   { immediate: true },
 )
 
+watch(
+  windowCloseBehavior,
+  (value) => {
+    localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, value)
+    void syncWindowCloseBehavior(value)
+  },
+  { immediate: true },
+)
+
+watch(
+  appLocale,
+  (value) => {
+    void syncDesktopLocale(value)
+  },
+  { immediate: true },
+)
+
 watch(appLocale, () => {
   panes.value.forEach((pane, index) => {
     if (!pane.connection) {
@@ -327,6 +390,12 @@ const setAppLocale = (value: string | number) => {
   }
 }
 
+const setWindowCloseBehaviorValue = (value: string | number) => {
+  if (value === 'tray' || value === 'exit') {
+    windowCloseBehavior.value = value
+  }
+}
+
 const filteredConnections = computed(() => {
   const query = searchText.value.trim().toLowerCase()
   if (!query) return connections.value
@@ -336,7 +405,7 @@ const filteredConnections = computed(() => {
       connection.name,
       connection.host,
       connection.username,
-      groupNameById.value.get(connection.group_id || DEFAULT_GROUP_ID),
+      groupNameById.value.get(resolveConnectionGroupId(connection, groups.value)),
     ]
       .filter(Boolean)
       .some((part) => part!.toLowerCase().includes(query)),
@@ -349,7 +418,7 @@ const groupedConnections = computed(() => {
   return groups.value
     .map((group) => {
       const items = filteredConnections.value.filter(
-        (connection) => (connection.group_id || DEFAULT_GROUP_ID) === group.id,
+        (connection) => resolveConnectionGroupId(connection, groups.value) === group.id,
       )
 
       return {
@@ -388,8 +457,7 @@ const setTerminalRef = (paneId: string, component: InstanceType<typeof TerminalP
   terminalRefs.value[paneId] = component
 }
 
-const clampSidebarWidth = (width: number) =>
-  Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, width))
+const clampSidebarWidth = clampSidebarWidthValue
 
 const fitAllTerminals = () => {
   requestAnimationFrame(() => {
@@ -805,7 +873,9 @@ const resetConnectionForm = (connection?: ConnectionProfile) => {
   connectionForm.private_key_path = connection?.private_key_path || ''
   connectionForm.private_key = connection?.private_key || ''
   connectionForm.private_key_passphrase = connection?.private_key_passphrase || ''
-  connectionForm.group_id = connection?.group_id || DEFAULT_GROUP_ID
+  connectionForm.group_id = connection
+    ? resolveConnectionGroupId(connection, groups.value)
+    : getPreferredGroupId(groups.value)
 }
 
 const openConnectionModal = (connection?: ConnectionProfile, groupId?: string) => {
@@ -822,9 +892,7 @@ const profileFromConnectionForm = (): ConnectionProfile | undefined => {
     return undefined
   }
 
-  const group_id = groups.value.some((group) => group.id === connectionForm.group_id)
-    ? connectionForm.group_id
-    : DEFAULT_GROUP_ID
+  const group_id = getPreferredGroupId(groups.value, connectionForm.group_id)
 
   return {
     id: connectionForm.id || createId('connection'),
@@ -878,8 +946,8 @@ const isTerstermDeepLink = (url: URL) => url.protocol.toLowerCase() === 'terster
 
 const groupIdFromDeepLink = (value: string) => {
   const groupName = value.trim()
-  if (!groupName) return DEFAULT_GROUP_ID
-  if (DEFAULT_GROUP_ALIASES.has(groupName)) return DEFAULT_GROUP_ID
+  if (!groupName) return getPreferredGroupId(groups.value)
+  if (DEFAULT_GROUP_ALIASES.has(groupName)) return getPreferredGroupId(groups.value)
 
   const existing = groups.value.find(
     (group) => group.id === groupName || group.name.toLowerCase() === groupName.toLowerCase(),
@@ -924,7 +992,7 @@ const profileFromDeepLink = (
   const port = Number(readUrlValue(url, ['port']) || url.port || 22)
   const name = readUrlValue(url, ['name', 'title']) || `${username}@${host}`
   const groupValue = readUrlValue(url, ['group', 'group_id', 'folder'])
-  const group_id = groupValue ? groupIdFromDeepLink(groupValue) : DEFAULT_GROUP_ID
+  const group_id = groupValue ? groupIdFromDeepLink(groupValue) : getPreferredGroupId(groups.value)
   const password = readUrlValue(url, ['password', 'pass']) || decodeURIComponent(url.password)
   const private_key_path = readUrlValue(url, ['private_key_path', 'key_path', 'identity'])
   const private_key = readUrlValue(url, ['private_key', 'key'])
@@ -1045,31 +1113,46 @@ const saveGroup = () => {
 }
 
 const deleteGroup = (group: ConnectionGroup) => {
-  if (group.id === DEFAULT_GROUP_ID) {
-    message.warning(t('defaultGroupCannotDelete'))
+  const currentGroups = groups.value
+  const remainingGroups = currentGroups.filter((item) => item.id !== group.id)
+  if (remainingGroups.length === 0) {
+    message.warning(t('keepOneGroup'))
     return
   }
 
+  const fallbackGroupId = getPreferredGroupId(remainingGroups)
+
   connections.value = connections.value.map((connection) =>
-    connection.group_id === group.id
+    resolveConnectionGroupId(connection, currentGroups) === group.id
       ? {
           ...connection,
-          group_id: DEFAULT_GROUP_ID,
+          group_id: fallbackGroupId,
         }
       : connection,
   )
-  groups.value = groups.value.filter((item) => item.id !== group.id)
 
   panes.value.forEach((pane) => {
-    if (pane.connection?.group_id === group.id) {
+    if (pane.connection && resolveConnectionGroupId(pane.connection, currentGroups) === group.id) {
       pane.connection = {
         ...pane.connection,
-        group_id: DEFAULT_GROUP_ID,
+        group_id: fallbackGroupId,
       }
     }
   })
 
-  message.success(t('groupDeletedMovedToDefault'))
+  groups.value = remainingGroups
+  message.success(t('groupDeleted'))
+}
+
+const confirmDeleteGroup = (group: ConnectionGroup) => {
+  Modal.confirm({
+    title: t('deleteGroup'),
+    content: t('deleteGroupMoveNotice'),
+    okText: t('delete'),
+    cancelText: t('cancel'),
+    okButtonProps: { danger: true },
+    onOk: () => deleteGroup(group),
+  })
 }
 
 const deleteConnection = async (connection: ConnectionProfile) => {
@@ -1367,82 +1450,59 @@ onBeforeUnmount(() => {
         <a-empty v-else-if="filteredConnections.length === 0" :description="t('noMatchingConnections')" />
 
         <section v-for="group in groupedConnections" :key="group.id" class="connection-group">
-          <div class="group-title">
-            <button class="group-toggle" type="button" @click="toggleGroup(group.id)">
-              <RightOutlined :class="{ expanded: group.expanded }" />
-              <FolderOpenOutlined />
-              <span>{{ getGroupDisplayName(group) }}</span>
-              <small>{{ group.items.length }}</small>
-            </button>
-            <span class="group-actions">
-              <a-tooltip :title="t('addConnection')">
-                <a-button
-                  type="text"
-                  size="small"
-                  :icon="h(PlusOutlined)"
-                  @click.stop="openConnectionModal(undefined, group.id)"
-                />
-              </a-tooltip>
-              <a-tooltip :title="t('renameGroup')">
-                <a-button
-                  type="text"
-                  size="small"
-                  :icon="h(EditOutlined)"
-                  @click.stop="openGroupModal(group)"
-                />
-              </a-tooltip>
-              <a-popconfirm
-                :title="t('deleteGroupMoveNotice')"
-                :ok-text="t('delete')"
-                :cancel-text="t('cancel')"
-                @confirm="deleteGroup(group)"
-              >
-                <a-tooltip :title="t('deleteGroup')">
-                  <a-button
-                    type="text"
-                    size="small"
-                    danger
-                    :disabled="group.id === DEFAULT_GROUP_ID"
-                    :icon="h(DeleteOutlined)"
-                    @click.stop
-                  />
-                </a-tooltip>
-              </a-popconfirm>
-            </span>
-          </div>
+          <a-dropdown class="group-context-menu" :trigger="['contextmenu']">
+            <div class="group-title">
+              <button class="group-toggle" type="button" @click="toggleGroup(group.id)">
+                <RightOutlined :class="{ expanded: group.expanded }" />
+                <FolderOpenOutlined />
+                <span>{{ getGroupDisplayName(group) }}</span>
+                <small>{{ group.items.length }}</small>
+              </button>
+            </div>
+            <template #overlay>
+              <a-menu>
+                <a-menu-item key="add" @click="openConnectionModal(undefined, group.id)">
+                  {{ t('addConnection') }}
+                </a-menu-item>
+                <a-menu-item key="rename" @click="openGroupModal(group)">
+                  {{ t('renameGroup') }}
+                </a-menu-item>
+                <a-menu-item key="delete" danger @click="confirmDeleteGroup(group)">
+                  {{ t('deleteGroup') }}
+                </a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
 
           <div v-show="group.expanded" class="group-items">
-            <button
+            <a-dropdown
               v-for="connection in group.items"
               :key="connection.id"
-              class="connection-item"
-              :class="{ selected: selectedConnectionId === connection.id }"
-              @click="openConnectionFromSidebar(connection)"
+              class="connection-context-menu"
+              :trigger="['contextmenu']"
             >
-              <span class="connection-main">
-                <strong>{{ connection.name }}</strong>
-                <small>{{ connection.username }}@{{ connection.host }}:{{ connection.port }}</small>
-              </span>
-              <span class="connection-actions">
-                <a-tooltip :title="t('edit')">
-                  <a-button
-                    type="text"
-                    size="small"
-                    :icon="h(EditOutlined)"
-                    @click.stop="openConnectionModal(connection)"
-                  />
-                </a-tooltip>
-                <a-tooltip :title="t('delete')">
-                  <a-button
-                    type="text"
-                    size="small"
-                    danger
-                    :icon="h(DeleteOutlined)"
-                    @click.stop="deleteConnection(connection)"
-                  />
-                </a-tooltip>
-              </span>
-            </button>
+              <button
+                class="connection-item"
+                :class="{ selected: selectedConnectionId === connection.id }"
+                type="button"
+                @click="openConnectionFromSidebar(connection)"
+              >
+                <span class="connection-main">
+                  <strong>{{ connection.name }}</strong>
+                  <small>{{ connection.username }}@{{ connection.host }}:{{ connection.port }}</small>
+                </span>
+              </button>
+              <template #overlay>
+                <a-menu>
+                  <a-menu-item key="edit" @click="openConnectionModal(connection)">
+                    {{ t('edit') }}
+                  </a-menu-item>
+                  <a-menu-item key="delete" danger @click="deleteConnection(connection)">
+                    {{ t('delete') }}
+                  </a-menu-item>
+                </a-menu>
+              </template>
+            </a-dropdown>
 
             <button
               v-if="group.items.length === 0 && !searchText"
@@ -1655,6 +1715,25 @@ onBeforeUnmount(() => {
           <a-segmented :value="appLocale" :options="languageOptions" block @change="setAppLocale" />
 
           <p class="settings-note">{{ t('languageHint') }}</p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-header">
+            <div>
+              <strong>{{ t('windowCloseSettings') }}</strong>
+              <span>{{ t('currentWindowCloseBehavior', currentWindowCloseBehaviorLabel) }}</span>
+            </div>
+            <small>{{ t('applyImmediatelyAndPersist') }}</small>
+          </div>
+
+          <a-segmented
+            :value="windowCloseBehavior"
+            :options="closeBehaviorOptions"
+            block
+            @change="setWindowCloseBehaviorValue"
+          />
+
+          <p class="settings-note">{{ t('windowCloseBehaviorHint') }}</p>
         </section>
       </div>
     </a-modal>

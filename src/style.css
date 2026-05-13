@@ -32,7 +32,7 @@ textarea {
 
 .app-shell {
   display: grid;
-  grid-template-columns: var(--sidebar-width, 228px) var(--sidebar-resizer-width, 4px) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 184px) var(--sidebar-resizer-width, 4px) minmax(0, 1fr);
   height: 100vh;
   color: #25313d;
   background:
@@ -221,17 +221,10 @@ textarea {
   font-weight: 700;
 }
 
-.group-actions {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 1px;
-  opacity: 0;
-  transition: opacity 0.16s ease;
-}
-
-.connection-group:hover .group-actions {
-  opacity: 1;
+.group-context-menu,
+.connection-context-menu {
+  display: block;
+  width: 100%;
 }
 
 .group-items {
@@ -283,26 +276,15 @@ textarea {
 
 .connection-main strong {
   color: #202b35;
-  font-size: 13px;
+  font-size: 11px;
 }
 
 .connection-main small {
-  overflow: hidden;
   color: #7a8893;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.connection-actions {
-  display: inline-flex;
-  flex: 0 0 auto;
-  opacity: 0;
-  transition: opacity 0.16s ease;
-}
-
-.connection-item:hover .connection-actions {
-  opacity: 1;
+  font-size: 10px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .empty-group-action {
@@ -1118,8 +1100,8 @@ body {
 }
 
 .app-shell {
-  grid-template-columns: var(--sidebar-width, 248px) var(--sidebar-resizer-width, 8px) minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: var(--sidebar-width, 184px) var(--sidebar-resizer-width, 8px) minmax(0, 1fr);
+  gap: 6px;
   padding: 12px;
   color: var(--text-primary);
   background: transparent;
@@ -1139,7 +1121,7 @@ body {
 
 .sidebar {
   gap: 12px;
-  padding: 14px;
+  padding: 8px;
   border-radius: 24px;
   background: var(--surface-panel);
 }
@@ -1224,7 +1206,7 @@ body {
 }
 
 .connection-list {
-  gap: 12px;
+  gap: 10px;
   padding-right: 4px;
 }
 
@@ -1250,10 +1232,10 @@ body {
 }
 
 .connection-group {
-  gap: 10px;
-  padding: 10px;
+  gap: 8px;
+  padding: 6px;
   border: 1px solid var(--border-subtle);
-  border-radius: 18px;
+  border-radius: 16px;
   background: linear-gradient(180deg, var(--surface-card-muted-start), var(--surface-card-muted-end));
   box-shadow: var(--shadow-soft);
 }
@@ -1263,7 +1245,7 @@ body {
 }
 
 .group-toggle {
-  min-height: 28px;
+  min-height: 26px;
 }
 
 .group-toggle small {
@@ -1271,17 +1253,12 @@ body {
   background: var(--accent-soft);
 }
 
-.group-actions .ant-btn,
-.connection-actions .ant-btn {
-  border-radius: 10px;
-}
-
 .connection-item {
-  min-height: 54px;
-  gap: 12px;
+  min-height: 50px;
+  gap: 8px;
   border-color: transparent;
-  border-radius: 16px;
-  padding: 9px 10px 9px 12px;
+  border-radius: 14px;
+  padding: 8px 8px 8px 10px;
   background: var(--surface-panel-strong);
   box-shadow: inset 0 0 0 1px var(--border-subtle);
 }

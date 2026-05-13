@@ -13,7 +13,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
@@ -22,7 +22,11 @@ use std::{
 };
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{
+    menu::{MenuBuilder, MenuItem},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State,
+};
 use tauri_plugin_deep_link::DeepLinkExt;
 use uuid::Uuid;
 #[cfg(windows)]
@@ -42,6 +46,10 @@ use windows_sys::Win32::{
 
 #[cfg(windows)]
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+const MAIN_TRAY_ID: &str = "main-tray";
+const TRAY_SHOW_MENU_ID: &str = "tray-show";
+const TRAY_QUIT_MENU_ID: &str = "tray-quit";
 
 #[derive(Debug, Deserialize, Clone)]
 struct ConnectionConfig {
@@ -134,6 +142,110 @@ struct SessionAuthSecrets {
 
 #[derive(Default)]
 struct AppClosing(AtomicBool);
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum WindowCloseBehavior {
+    Tray,
+    #[default]
+    Exit,
+}
+
+impl WindowCloseBehavior {
+    fn from_value(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("tray") {
+            Self::Tray
+        } else {
+            Self::Exit
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Tray => 1,
+            Self::Exit => 0,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Tray,
+            _ => Self::Exit,
+        }
+    }
+}
+
+struct WindowCloseBehaviorState(AtomicU8);
+
+impl Default for WindowCloseBehaviorState {
+    fn default() -> Self {
+        Self(AtomicU8::new(WindowCloseBehavior::default().as_u8()))
+    }
+}
+
+impl WindowCloseBehaviorState {
+    fn get(&self) -> WindowCloseBehavior {
+        WindowCloseBehavior::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, behavior: WindowCloseBehavior) {
+        self.0.store(behavior.as_u8(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum AppLocale {
+    #[default]
+    ZhCn,
+    EnUs,
+}
+
+impl AppLocale {
+    fn from_value(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("en-US") || value.eq_ignore_ascii_case("en") {
+            Self::EnUs
+        } else {
+            Self::ZhCn
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::ZhCn => 0,
+            Self::EnUs => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::EnUs,
+            _ => Self::ZhCn,
+        }
+    }
+}
+
+struct AppLocaleState(AtomicU8);
+
+impl Default for AppLocaleState {
+    fn default() -> Self {
+        Self(AtomicU8::new(AppLocale::default().as_u8()))
+    }
+}
+
+impl AppLocaleState {
+    fn get(&self) -> AppLocale {
+        AppLocale::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, locale: AppLocale) {
+        self.0.store(locale.as_u8(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct TrayMenuState {
+    show_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    quit_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+}
 
 impl Drop for SshSessions {
     fn drop(&mut self) {
@@ -365,6 +477,21 @@ fn ssh_connect(
     });
 
     Ok(session_id)
+}
+
+#[tauri::command]
+fn set_window_close_behavior(
+    close_behavior: State<'_, WindowCloseBehaviorState>,
+    behavior: String,
+) {
+    close_behavior.set(WindowCloseBehavior::from_value(&behavior));
+}
+
+#[tauri::command]
+fn set_app_locale(app: AppHandle, locale_state: State<'_, AppLocaleState>, locale: String) {
+    let locale = AppLocale::from_value(&locale);
+    locale_state.set(locale);
+    update_tray_menu_locale(&app, locale);
 }
 
 #[tauri::command]
@@ -2280,20 +2407,85 @@ fn run_ssh_test_connection(
     }
 }
 
+fn tray_menu_text(locale: AppLocale) -> (&'static str, &'static str) {
+    match locale {
+        AppLocale::ZhCn => ("显示 TerSterm", "退出"),
+        AppLocale::EnUs => ("Show TerSterm", "Exit"),
+    }
+}
+
+fn update_tray_menu_locale(app: &AppHandle, locale: AppLocale) {
+    let (show_text, quit_text) = tray_menu_text(locale);
+    let tray_menu = app.state::<TrayMenuState>();
+    let show_item = tray_menu
+        .show_item
+        .lock()
+        .ok()
+        .and_then(|item| item.as_ref().cloned());
+    let quit_item = tray_menu
+        .quit_item
+        .lock()
+        .ok()
+        .and_then(|item| item.as_ref().cloned());
+
+    if let Some(show_item) = show_item {
+        show_item.set_text(show_text).ok();
+    }
+
+    if let Some(quit_item) = quit_item {
+        quit_item.set_text(quit_text).ok();
+    }
+}
+
+fn set_tray_visibility(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
+        tray.set_visible(visible).ok();
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().ok();
+        window.unminimize().ok();
+        window.set_focus().ok();
+        set_tray_visibility(app, false);
+    }
+}
+
+fn exit_application(app: AppHandle) {
+    let closing = app.state::<AppClosing>();
+    if closing.0.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().ok();
+    }
+
+    thread::spawn(move || {
+        let sessions = app.state::<SshSessions>();
+        let processes = app.state::<OpenSshProcesses>();
+        cancel_all_openssh_processes(&processes);
+        disconnect_all_sessions(&sessions);
+        #[cfg(windows)]
+        terminate_descendant_processes(std::process::id());
+        app.exit(0);
+    });
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                window.show().ok();
-                window.unminimize().ok();
-                window.set_focus().ok();
-            }
+            show_main_window(app);
         }))
         .manage(SshSessions::default())
         .manage(OpenSshProcesses::default())
         .manage(SshSessionSecrets::default())
         .manage(AppClosing::default())
+        .manage(WindowCloseBehaviorState::default())
+        .manage(AppLocaleState::default())
+        .manage(TrayMenuState::default())
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
             ssh_test_connection,
@@ -2305,31 +2497,76 @@ fn main() {
             ssh_upload_file,
             ssh_download_file,
             save_local_file,
-            ssh_get_system_usage
+            ssh_get_system_usage,
+            set_window_close_behavior,
+            set_app_locale
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-
                 let app = window.app_handle().clone();
-                let closing = app.state::<AppClosing>();
-                if closing.0.swap(true, Ordering::Relaxed) {
+                if app.state::<AppClosing>().0.load(Ordering::Relaxed) {
                     return;
                 }
 
-                window.hide().ok();
-                thread::spawn(move || {
-                    let sessions = app.state::<SshSessions>();
-                    let processes = app.state::<OpenSshProcesses>();
-                    cancel_all_openssh_processes(&processes);
-                    disconnect_all_sessions(&sessions);
-                    #[cfg(windows)]
-                    terminate_descendant_processes(std::process::id());
-                    app.exit(0);
-                });
+                api.prevent_close();
+
+                if app.state::<WindowCloseBehaviorState>().get() == WindowCloseBehavior::Tray {
+                    set_tray_visibility(&app, true);
+                    window.hide().ok();
+                    return;
+                }
+
+                exit_application(app);
             }
         })
         .setup(|app| {
+            let locale = app.state::<AppLocaleState>().get();
+            let (show_text, quit_text) = tray_menu_text(locale);
+            let show_item = MenuItem::with_id(app, TRAY_SHOW_MENU_ID, show_text, true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, quit_text, true, None::<&str>)?;
+
+            let tray_menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let tray_menu_state = app.state::<TrayMenuState>();
+            if let Ok(mut item) = tray_menu_state.show_item.lock() {
+                *item = Some(show_item.clone());
+            }
+            if let Ok(mut item) = tray_menu_state.quit_item.lock() {
+                *item = Some(quit_item.clone());
+            }
+
+            let mut tray_builder = TrayIconBuilder::with_id(MAIN_TRAY_ID)
+                .menu(&tray_menu)
+                .tooltip("TerSterm")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    TRAY_SHOW_MENU_ID => show_main_window(app),
+                    TRAY_QUIT_MENU_ID => exit_application(app.clone()),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+
+            let tray = tray_builder.build(app)?;
+            tray.set_visible(false).ok();
+
             app.deep_link().register_all().ok();
             let window = app
                 .get_webview_window("main")

@@ -213,6 +213,18 @@ export async function saveLocalFile(filename: string, content_base64: string) {
   return `Downloads/${filename || 'download'}`
 }
 
+export async function setWindowCloseBehavior(behavior: 'tray' | 'exit') {
+  if (isTauriRuntime()) {
+    return invoke<void>('set_window_close_behavior', { behavior })
+  }
+}
+
+export async function setDesktopLocale(locale: 'zh-CN' | 'en-US') {
+  if (isTauriRuntime()) {
+    return invoke<void>('set_app_locale', { locale })
+  }
+}
+
 export async function onSshData(callback: (payload: SshDataEvent) => void): Promise<UnlistenFn> {
   if (isTauriRuntime()) {
     return listen<SshDataEvent>('ssh-data', (event) => callback(event.payload))

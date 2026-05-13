@@ -1031,15 +1031,6 @@ defineExpose({
             @click.stop="openFileManager"
           />
         </a-tooltip>
-        <a-tooltip :title="t('connect')">
-          <a-button
-            type="text"
-            size="small"
-            :icon="h(LinkOutlined)"
-            :disabled="pane.status === 'connecting'"
-            @click.stop="emit('connect', pane.id)"
-          />
-        </a-tooltip>
         <a-tooltip :title="t('disconnect')">
           <a-button
             type="text"
