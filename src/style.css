@@ -1720,6 +1720,10 @@ body {
   gap: 12px;
 }
 
+.settings-update-header .ant-btn {
+  flex: 0 0 auto;
+}
+
 .settings-card-header > div {
   display: flex;
   flex-direction: column;
@@ -1746,6 +1750,88 @@ body {
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.settings-update-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.settings-update-channel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-update-channel > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-update-channel strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.settings-update-channel small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.settings-update-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: var(--surface-panel-strong);
+}
+
+.settings-update-item small,
+.settings-update-meta small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.settings-update-item strong,
+.settings-update-meta span {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.settings-update-meta span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.settings-update-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.settings-update-actions {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.settings-update-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-update-progress-meta {
+  margin-bottom: 0;
 }
 
 .settings-sync-list {
@@ -1895,6 +1981,7 @@ body {
 
 @media (max-width: 640px) {
   .theme-grid,
+  .settings-update-grid,
   .sidebar-actions {
     grid-template-columns: minmax(0, 1fr);
   }

@@ -6,6 +6,7 @@ use portable_pty::{
 };
 use serde::{Deserialize, Serialize};
 use ssh2::{ExtendedData, FileStat, Session, Sftp};
+use std::cmp::Ordering as VersionOrdering;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -50,6 +51,10 @@ const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const MAIN_TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_MENU_ID: &str = "tray-show";
 const TRAY_QUIT_MENU_ID: &str = "tray-quit";
+const APP_UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "app-update-download-progress";
+const GITHUB_RELEASES_API: &str = "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
+const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Y3y202/TerSterm/releases/download/";
 
 #[derive(Debug, Deserialize, Clone)]
 struct ConnectionConfig {
@@ -103,6 +108,54 @@ struct SystemUsage {
     memory_total_gb: f32,
     storage_used_gb: f32,
     storage_total_gb: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct AppUpdateAsset {
+    name: String,
+    download_url: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AppUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    release_name: String,
+    release_tag: String,
+    release_url: String,
+    published_at: Option<String>,
+    prerelease: bool,
+    download_asset: Option<AppUpdateAsset>,
+    update_available: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AppUpdateDownloadProgress {
+    status: String,
+    filename: Option<String>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    percent: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    name: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GithubReleaseAsset>,
 }
 
 enum SshCommand {
@@ -495,6 +548,26 @@ fn set_app_locale(app: AppHandle, locale_state: State<'_, AppLocaleState>, local
 }
 
 #[tauri::command]
+async fn check_app_update(allow_prerelease: bool) -> Result<AppUpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || run_check_app_update(allow_prerelease))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn download_app_update(
+    app: AppHandle,
+    download_url: String,
+    filename: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_download_app_update(&app, &download_url, &filename))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn ssh_test_connection(app: AppHandle, config: ConnectionConfig) -> Result<String, String> {
     validate_connection_config(&config)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -651,6 +724,307 @@ fn save_local_file(
     fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
     let local_path = unique_local_path(&downloads, &filename);
     fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
+    Ok(local_path.to_string_lossy().to_string())
+}
+
+fn github_client(
+    timeout: Option<Duration>,
+) -> Result<reqwest::blocking::Client, Box<dyn std::error::Error + Send + Sync>> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(format!("TerSterm/{}", env!("CARGO_PKG_VERSION")));
+
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+
+    Ok(builder.build()?)
+}
+
+fn emit_app_update_download_progress(
+    app: &AppHandle,
+    status: &str,
+    filename: Option<&str>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) {
+    let percent = total_bytes
+        .filter(|value| *value > 0)
+        .map(|value| (downloaded_bytes as f32 / value as f32 * 100.0).clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+
+    app.emit(
+        APP_UPDATE_DOWNLOAD_PROGRESS_EVENT,
+        AppUpdateDownloadProgress {
+            status: status.to_string(),
+            filename: filename.map(|value| value.to_string()),
+            downloaded_bytes,
+            total_bytes,
+            percent,
+        },
+    )
+    .ok();
+}
+
+fn normalize_release_version(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches(|ch| ch == 'v' || ch == 'V')
+        .to_string()
+}
+
+fn compare_release_versions(left: &str, right: &str) -> VersionOrdering {
+    let left = normalize_release_version(left);
+    let right = normalize_release_version(right);
+    let left_prerelease = left.contains('-');
+    let right_prerelease = right.contains('-');
+    let left_parts = left
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(&left)
+        .split('.')
+        .map(|value| value.parse::<u32>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let right_parts = right
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(&right)
+        .split('.')
+        .map(|value| value.parse::<u32>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let part_count = left_parts.len().max(right_parts.len());
+
+    for index in 0..part_count {
+        let left_value = left_parts.get(index).copied().unwrap_or(0);
+        let right_value = right_parts.get(index).copied().unwrap_or(0);
+        match left_value.cmp(&right_value) {
+            VersionOrdering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+
+    match (left_prerelease, right_prerelease) {
+        (true, false) => VersionOrdering::Less,
+        (false, true) => VersionOrdering::Greater,
+        _ => VersionOrdering::Equal,
+    }
+}
+
+fn release_asset_priority(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+
+    #[cfg(target_os = "windows")]
+    let base = if lower.ends_with(".msi") {
+        Some(400)
+    } else if lower.ends_with(".exe") {
+        Some(320)
+    } else if lower.ends_with(".zip") {
+        Some(240)
+    } else {
+        None
+    };
+
+    #[cfg(target_os = "macos")]
+    let base = if lower.ends_with(".dmg") {
+        Some(400)
+    } else if lower.ends_with(".app.tar.gz") {
+        Some(320)
+    } else if lower.ends_with(".zip") {
+        Some(240)
+    } else {
+        None
+    };
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let base = if lower.ends_with(".appimage") {
+        Some(400)
+    } else if lower.ends_with(".deb") {
+        Some(360)
+    } else if lower.ends_with(".rpm") {
+        Some(320)
+    } else if lower.ends_with(".tar.gz") {
+        Some(240)
+    } else {
+        None
+    };
+
+    base.map(|value| {
+        let mut score = value;
+        if lower.contains("tersterm") {
+            score += 10;
+        }
+        if lower.contains("x64") || lower.contains("x86_64") || lower.contains("amd64") {
+            score += 6;
+        }
+        if lower.contains("setup") || lower.contains("installer") {
+            score += 4;
+        }
+        score
+    })
+}
+
+fn preferred_release_asset(assets: &[GithubReleaseAsset]) -> Option<AppUpdateAsset> {
+    assets
+        .iter()
+        .filter(|asset| asset.state.as_deref().unwrap_or("uploaded") == "uploaded")
+        .filter_map(|asset| release_asset_priority(&asset.name).map(|priority| (priority, asset)))
+        .max_by_key(|(priority, asset)| (*priority, asset.size))
+        .map(|(_, asset)| AppUpdateAsset {
+            name: asset.name.clone(),
+            download_url: asset.browser_download_url.clone(),
+            size_bytes: asset.size,
+        })
+}
+
+fn select_release(releases: Vec<GithubRelease>, allow_prerelease: bool) -> Option<GithubRelease> {
+    releases.into_iter().find(|release| {
+        !release.draft && (allow_prerelease || !release.prerelease)
+    })
+}
+
+fn run_check_app_update(
+    allow_prerelease: bool,
+) -> Result<AppUpdateInfo, Box<dyn std::error::Error + Send + Sync>> {
+    let client = github_client(Some(Duration::from_secs(30)))?;
+    let releases = client
+        .get(GITHUB_RELEASES_API)
+        .header("Accept", "application/vnd.github+json")
+        .send()?
+        .error_for_status()?
+        .json::<Vec<GithubRelease>>()?;
+    let release = select_release(releases, allow_prerelease).ok_or("No matching release found")?;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let latest_version = normalize_release_version(&release.tag_name);
+    let update_available =
+        compare_release_versions(&latest_version, &current_version) == VersionOrdering::Greater;
+
+    Ok(AppUpdateInfo {
+        current_version,
+        latest_version,
+        release_name: release
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&release.tag_name)
+            .to_string(),
+        release_tag: release.tag_name,
+        release_url: release.html_url,
+        published_at: release.published_at,
+        prerelease: release.prerelease,
+        download_asset: preferred_release_asset(&release.assets),
+        update_available,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if extension == "msi" {
+        std::process::Command::new("msiexec")
+            .arg("/i")
+            .arg(path)
+            .spawn()?;
+        return Ok(());
+    }
+
+    if extension == "exe" {
+        std::process::Command::new(path).spawn()?;
+        return Ok(());
+    }
+
+    let path_arg = path.to_string_lossy().to_string();
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", path_arg.as_str()])
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::process::Command::new("open").arg(path).spawn()?;
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::process::Command::new("xdg-open").arg(path).spawn()?;
+    Ok(())
+}
+
+fn schedule_update_exit(app: AppHandle) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(900));
+        exit_application(app);
+    });
+}
+
+fn run_download_app_update(
+    app: &AppHandle,
+    download_url: &str,
+    filename: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if !download_url.starts_with(GITHUB_RELEASE_DOWNLOAD_PREFIX) {
+        return Err("Unsupported release asset URL".into());
+    }
+
+    let fallback_name = download_url
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("tersterm-update");
+    let filename = if filename.trim().is_empty() {
+        fallback_name
+    } else {
+        filename
+    };
+    let downloads = app.path().download_dir()?;
+    fs::create_dir_all(&downloads)?;
+    let local_path = unique_local_path(&downloads, filename);
+    let mut response = github_client(Some(Duration::from_secs(600)))?
+        .get(download_url)
+        .send()?
+        .error_for_status()?;
+    let total_bytes = response.content_length();
+    let file_name = local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename);
+    let mut file = fs::File::create(&local_path)?;
+    let mut downloaded_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..read])?;
+        downloaded_bytes += read as u64;
+        emit_app_update_download_progress(
+            app,
+            "downloading",
+            Some(file_name),
+            downloaded_bytes,
+            total_bytes,
+        );
+    }
+
+    file.flush()?;
+    emit_app_update_download_progress(
+        app,
+        "installing",
+        Some(file_name),
+        downloaded_bytes,
+        total_bytes.or(Some(downloaded_bytes)),
+    );
+    launch_update_installer(&local_path)?;
+    schedule_update_exit(app.clone());
+
     Ok(local_path.to_string_lossy().to_string())
 }
 
@@ -2498,6 +2872,8 @@ fn main() {
             ssh_download_file,
             save_local_file,
             ssh_get_system_usage,
+            check_app_update,
+            download_app_update,
             set_window_close_behavior,
             set_app_locale
         ])
@@ -2584,11 +2960,12 @@ mod tests {
     #[cfg(windows)]
     use super::collect_descendants_from_entries;
     use super::{
-        output_looks_authenticated, parse_openssh_file_list, parse_system_usage_output,
-        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
-        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
+        compare_release_versions, output_looks_authenticated, parse_openssh_file_list,
+        parse_system_usage_output, run_openssh_exec_command, run_remote_file_list,
+        run_remote_system_usage, should_fallback_to_openssh, ConnectionConfig,
+        OpenSshProcesses,
     };
-    use std::{env, io};
+    use std::{cmp::Ordering as CmpOrdering, env, io};
 
     #[cfg(windows)]
     #[test]
@@ -2610,6 +2987,18 @@ mod tests {
             collect_descendants_from_entries(42, &entries),
             vec![10, 9, 8]
         );
+    }
+
+    #[test]
+    fn compares_release_versions_with_numeric_segments() {
+        assert_eq!(compare_release_versions("v0.1.10", "0.1.9"), CmpOrdering::Greater);
+        assert_eq!(compare_release_versions("0.2.0", "v0.2.0"), CmpOrdering::Equal);
+    }
+
+    #[test]
+    fn treats_prerelease_as_older_than_stable() {
+        assert_eq!(compare_release_versions("1.0.0-beta.1", "1.0.0"), CmpOrdering::Less);
+        assert_eq!(compare_release_versions("1.0.0", "1.0.0-beta.1"), CmpOrdering::Greater);
     }
 
     #[test]

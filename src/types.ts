@@ -73,3 +73,29 @@ export interface RemoteFileList {
   path: string
   entries: RemoteFileEntry[]
 }
+
+export interface AppUpdateAsset {
+  name: string
+  download_url: string
+  size_bytes: number
+}
+
+export interface AppUpdateInfo {
+  current_version: string
+  latest_version: string
+  release_name: string
+  release_tag: string
+  release_url: string
+  published_at?: string
+  prerelease: boolean
+  download_asset?: AppUpdateAsset
+  update_available: boolean
+}
+
+export interface AppUpdateDownloadProgress {
+  status: 'downloading' | 'installing'
+  filename?: string
+  downloaded_bytes: number
+  total_bytes?: number
+  percent: number
+}

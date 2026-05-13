@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
+  AppUpdateDownloadProgress,
+  AppUpdateInfo,
   ConnectionProfile,
   RemoteFileList,
   SshDataEvent,
@@ -223,6 +225,40 @@ export async function setDesktopLocale(locale: 'zh-CN' | 'en-US') {
   if (isTauriRuntime()) {
     return invoke<void>('set_app_locale', { locale })
   }
+}
+
+export async function checkAppUpdate(allow_prerelease = false): Promise<AppUpdateInfo> {
+  if (isTauriRuntime()) {
+    return invoke<AppUpdateInfo>('check_app_update', { allowPrerelease: allow_prerelease })
+  }
+
+  return {
+    current_version: '0.1.1',
+    latest_version: '0.1.1',
+    release_name: 'TerSterm 0.1.1',
+    release_tag: 'v0.1.1',
+    release_url: 'https://github.com/Y3y202/TerSterm/releases/latest',
+    prerelease: false,
+    update_available: false,
+  }
+}
+
+export async function downloadAppUpdate(download_url: string, filename: string) {
+  if (isTauriRuntime()) {
+    return invoke<string>('download_app_update', { downloadUrl: download_url, filename })
+  }
+
+  return `Downloads/${filename || 'tersterm-update'}`
+}
+
+export async function onAppUpdateDownloadProgress(
+  callback: (payload: AppUpdateDownloadProgress) => void,
+): Promise<UnlistenFn> {
+  if (isTauriRuntime()) {
+    return listen<AppUpdateDownloadProgress>('app-update-download-progress', (event) => callback(event.payload))
+  }
+
+  return () => undefined
 }
 
 export async function onSshData(callback: (payload: SshDataEvent) => void): Promise<UnlistenFn> {

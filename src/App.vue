@@ -15,6 +15,9 @@ import {
 import { message, Modal } from 'ant-design-vue'
 import TerminalPane from './components/TerminalPane.vue'
 import {
+  checkAppUpdate as fetchAppUpdate,
+  downloadAppUpdate as fetchAppUpdatePackage,
+  onAppUpdateDownloadProgress,
   onSshData,
   setDesktopLocale as syncDesktopLocale,
   setWindowCloseBehavior as syncWindowCloseBehavior,
@@ -25,13 +28,14 @@ import {
   sshWrite,
 } from './bridge'
 import { locale as appLocale, setLocale, supportedLocales, t, type AppLocale } from './i18n'
-import type { ConnectionGroup, ConnectionProfile, SshPane } from './types'
+import type { AppUpdateDownloadProgress, AppUpdateInfo, ConnectionGroup, ConnectionProfile, SshPane } from './types'
 
 const CONNECTION_STORAGE_KEY = 'tersterm.connections'
 const GROUP_STORAGE_KEY = 'tersterm.groups'
 const SIDEBAR_WIDTH_STORAGE_KEY = 'tersterm.sidebarWidth'
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'tersterm.sidebarCollapsed'
 const WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY = 'tersterm.windowCloseBehavior'
+const UPDATE_CHANNEL_STORAGE_KEY = 'tersterm.updateChannel'
 const THEME_STORAGE_KEY = 'tersterm.theme'
 const DEFAULT_GROUP_ID = 'default'
 const DEFAULT_GROUP_NAME = '默认'
@@ -45,6 +49,7 @@ const LEGACY_SIDEBAR_WIDTHS = new Set([195, 210, 228, 240, 270, 300])
 type ConnectionDraft = Omit<ConnectionProfile, 'id'> & { id?: string }
 type DeepLinkUnlisten = () => void
 type PendingPaneCredential = 'private_key_passphrase'
+type UpdateChannel = 'stable' | 'prerelease'
 
 const appThemes = [
   {
@@ -116,6 +121,14 @@ const isWindowCloseBehavior = (value: string | null): value is WindowCloseBehavi
 const readStoredWindowCloseBehavior = (): WindowCloseBehavior => {
   const storedBehavior = localStorage.getItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY)
   return isWindowCloseBehavior(storedBehavior) ? storedBehavior : 'exit'
+}
+
+const isUpdateChannel = (value: string | null): value is UpdateChannel =>
+  value === 'stable' || value === 'prerelease'
+
+const readStoredUpdateChannel = (): UpdateChannel => {
+  const storedChannel = localStorage.getItem(UPDATE_CHANNEL_STORAGE_KEY)
+  return isUpdateChannel(storedChannel) ? storedChannel : 'stable'
 }
 
 const applyAppTheme = (themeId: AppThemeId) => {
@@ -238,8 +251,13 @@ const connectionModalOpen = ref(false)
 const groupModalOpen = ref(false)
 const settingsModalOpen = ref(false)
 const testingConnection = ref(false)
+const checkingAppUpdate = ref(false)
+const downloadingAppUpdate = ref(false)
+const appUpdateInfo = ref<AppUpdateInfo>()
+const appUpdateProgress = ref<AppUpdateDownloadProgress>()
 const appTheme = ref<AppThemeId>(readStoredTheme())
 const sidebarCollapsed = ref(readStoredSidebarCollapsed())
+const updateChannel = ref<UpdateChannel>(readStoredUpdateChannel())
 const windowCloseBehavior = ref<WindowCloseBehavior>(readStoredWindowCloseBehavior())
 const sidebarWidth = ref(readStoredSidebarWidth())
 const resizingSidebar = ref(false)
@@ -249,6 +267,7 @@ const syncedPaneIds = ref<string[]>([])
 const terminalRefs = ref<Record<string, InstanceType<typeof TerminalPane>>>({})
 let unlistenDeepLink: DeepLinkUnlisten | undefined
 let unlistenSshData: DeepLinkUnlisten | undefined
+let unlistenAppUpdateProgress: DeepLinkUnlisten | undefined
 let systemUsageTimer: number | undefined
 const systemUsageRequestIds = new Map<string, number>()
 const systemUsagePendingPaneIds = new Map<string, number>()
@@ -302,6 +321,10 @@ const closeBehaviorOptions = computed(() => [
   { value: 'tray', label: t('windowCloseBehaviorTray') },
   { value: 'exit', label: t('windowCloseBehaviorExit') },
 ] as const)
+const updateChannelOptions = computed(() => [
+  { value: 'stable', label: t('updateChannelStable') },
+  { value: 'prerelease', label: t('updateChannelPrerelease') },
+] as const)
 const currentLanguageLabel = computed(
   () => languageOptions.find((option) => option.value === appLocale.value)?.label ?? '中文',
 )
@@ -309,6 +332,38 @@ const currentWindowCloseBehaviorLabel = computed(
   () =>
     closeBehaviorOptions.value.find((option) => option.value === windowCloseBehavior.value)?.label ??
     t('windowCloseBehaviorExit'),
+)
+const currentUpdateChannelLabel = computed(
+  () => updateChannelOptions.value.find((option) => option.value === updateChannel.value)?.label ?? t('updateChannelStable'),
+)
+const appUpdateProgressPercent = computed(() => Math.round(appUpdateProgress.value?.percent || 0))
+const appUpdateStatusLabel = computed(() => {
+  if (appUpdateProgress.value?.status === 'installing') {
+    return t('updateInstalling')
+  }
+
+  if (downloadingAppUpdate.value) {
+    return t('updateDownloading')
+  }
+
+  if (checkingAppUpdate.value) {
+    return t('updateChecking')
+  }
+
+  if (!appUpdateInfo.value) {
+    return t('updateNotChecked')
+  }
+
+  if (appUpdateInfo.value.update_available) {
+    return appUpdateInfo.value.download_asset
+      ? t('updateAvailable', appUpdateInfo.value.latest_version)
+      : t('updateAvailableNoPackage', appUpdateInfo.value.latest_version)
+  }
+
+  return t('updateAlreadyLatest')
+})
+const appUpdateReleaseChannelLabel = computed(() =>
+  appUpdateInfo.value?.prerelease ? t('updateChannelPrerelease') : t('updateChannelStable'),
 )
 const getThemeTitle = (theme: (typeof appThemes)[number]) => t(theme.titleKey)
 const getThemeDescription = (theme: (typeof appThemes)[number]) => t(theme.descriptionKey)
@@ -360,6 +415,19 @@ watch(
 )
 
 watch(
+  updateChannel,
+  (value) => {
+    localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, value)
+    appUpdateInfo.value = undefined
+    appUpdateProgress.value = undefined
+    if (settingsModalOpen.value && !checkingAppUpdate.value) {
+      void checkForAppUpdate(true)
+    }
+  },
+  { immediate: true },
+)
+
+watch(
   windowCloseBehavior,
   (value) => {
     localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, value)
@@ -384,6 +452,12 @@ watch(appLocale, () => {
   })
 })
 
+watch(settingsModalOpen, (open) => {
+  if (open && !appUpdateInfo.value && !checkingAppUpdate.value) {
+    void checkForAppUpdate(true)
+  }
+})
+
 const setAppLocale = (value: string | number) => {
   if (supportedLocales.includes(value as AppLocale)) {
     setLocale(value as AppLocale)
@@ -393,6 +467,99 @@ const setAppLocale = (value: string | number) => {
 const setWindowCloseBehaviorValue = (value: string | number) => {
   if (value === 'tray' || value === 'exit') {
     windowCloseBehavior.value = value
+  }
+}
+
+const setUpdateChannelValue = (value: string | number) => {
+  if (value === 'stable' || value === 'prerelease') {
+    updateChannel.value = value
+  }
+}
+
+const formatReleaseDate = (value?: string) => {
+  if (!value) return '--'
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return date.toLocaleString(appLocale.value === 'zh-CN' ? 'zh-CN' : 'en-US', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  })
+}
+
+const formatUpdateBytes = (bytes?: number) => {
+  if (!bytes || bytes <= 0) return '--'
+
+  const units = ['B', 'KB', 'MB', 'GB']
+  let size = bytes
+  let index = 0
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024
+    index += 1
+  }
+
+  return `${size >= 100 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
+}
+
+const checkForAppUpdate = async (silent = false) => {
+  checkingAppUpdate.value = true
+  try {
+    const info = await fetchAppUpdate(updateChannel.value === 'prerelease')
+    appUpdateInfo.value = info
+
+    if (silent) return
+
+    if (info.update_available) {
+      if (info.download_asset) {
+        message.success(t('updateFound', info.latest_version))
+      } else {
+        message.warning(t('updateFoundNoPackage', info.latest_version))
+      }
+      return
+    }
+
+    message.success(t('updateAlreadyLatest'))
+  } catch (error) {
+    if (!silent) {
+      message.error(error instanceof Error ? error.message : String(error))
+    }
+  } finally {
+    checkingAppUpdate.value = false
+  }
+}
+
+const downloadLatestRelease = async () => {
+  const asset = appUpdateInfo.value?.download_asset
+  if (!asset) {
+    message.warning(t('updatePackageMissing'))
+    return
+  }
+
+  appUpdateProgress.value = {
+    status: 'downloading',
+    filename: asset.name,
+    downloaded_bytes: 0,
+    total_bytes: asset.size_bytes,
+    percent: 0,
+  }
+  downloadingAppUpdate.value = true
+  try {
+    const localPath = await fetchAppUpdatePackage(asset.download_url, asset.name)
+    appUpdateProgress.value = {
+      status: 'installing',
+      filename: asset.name,
+      downloaded_bytes: asset.size_bytes,
+      total_bytes: asset.size_bytes,
+      percent: 100,
+    }
+    message.success(t('updateInstallerStarted', localPath))
+  } catch (error) {
+    appUpdateProgress.value = undefined
+    downloadingAppUpdate.value = false
+    message.error(error instanceof Error ? error.message : String(error))
   }
 }
 
@@ -1388,6 +1555,9 @@ onMounted(async () => {
   unlistenSshData = await onSshData(({ session_id, data }) => {
     appendTerminalOutput(session_id, data)
   })
+  unlistenAppUpdateProgress = await onAppUpdateDownloadProgress((progress) => {
+    appUpdateProgress.value = progress
+  })
   try {
     unlistenDeepLink = await onOpenUrl((urls) => {
       void openQuickSessionUrls(urls)
@@ -1406,6 +1576,7 @@ onBeforeUnmount(() => {
   stopSystemUsagePolling()
   unlistenSshData?.()
   unlistenDeepLink?.()
+  unlistenAppUpdateProgress?.()
   void Promise.all(panes.value.map((pane) => (pane.session_id ? sshDisconnect(pane.session_id) : null)))
 })
 </script>
@@ -1734,6 +1905,75 @@ onBeforeUnmount(() => {
           />
 
           <p class="settings-note">{{ t('windowCloseBehaviorHint') }}</p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-header settings-update-header">
+            <div>
+              <strong>{{ t('updateSettings') }}</strong>
+              <span>{{ appUpdateStatusLabel }}</span>
+            </div>
+            <a-button :loading="checkingAppUpdate" @click="checkForAppUpdate()">
+              {{ t('checkUpdates') }}
+            </a-button>
+          </div>
+
+          <div class="settings-update-channel">
+            <div>
+              <strong>{{ t('updateChannelSettings') }}</strong>
+              <small>{{ t('currentUpdateChannel', currentUpdateChannelLabel) }}</small>
+            </div>
+            <a-segmented :value="updateChannel" :options="updateChannelOptions" block @change="setUpdateChannelValue" />
+          </div>
+
+          <div class="settings-update-grid">
+            <div class="settings-update-item">
+              <small>{{ t('updateCurrentVersionLabel') }}</small>
+              <strong>{{ appUpdateInfo?.current_version || '--' }}</strong>
+            </div>
+            <div class="settings-update-item">
+              <small>{{ t('updateLatestVersionLabel') }}</small>
+              <strong>{{ appUpdateInfo?.latest_version || '--' }}</strong>
+            </div>
+          </div>
+
+          <div v-if="appUpdateInfo" class="settings-update-meta">
+            <span>{{ appUpdateInfo.release_name }}</span>
+            <small>{{ appUpdateInfo.release_tag }} · {{ appUpdateReleaseChannelLabel }}</small>
+          </div>
+
+          <div v-if="appUpdateInfo?.published_at" class="settings-update-meta">
+            <span>{{ t('updatePublishedAt', formatReleaseDate(appUpdateInfo.published_at)) }}</span>
+          </div>
+
+          <div v-if="appUpdateInfo?.download_asset" class="settings-update-meta">
+            <span>{{ t('updatePackageLabel', appUpdateInfo.download_asset.name) }}</span>
+            <small>{{ t('updatePackageSize', Math.ceil(appUpdateInfo.download_asset.size_bytes / 1024 / 1024)) }}</small>
+          </div>
+
+          <div v-if="appUpdateProgress" class="settings-update-progress">
+            <div class="settings-update-meta settings-update-progress-meta">
+              <span>
+                {{
+                  appUpdateProgress.status === 'installing'
+                    ? t('updateInstallingProgress', appUpdateProgress.filename || '')
+                    : t('updateDownloadingProgress', appUpdateProgress.filename || '', appUpdateProgressPercent)
+                }}
+              </span>
+              <small>
+                {{ t('updateProgressBytes', formatUpdateBytes(appUpdateProgress.downloaded_bytes), formatUpdateBytes(appUpdateProgress.total_bytes)) }}
+              </small>
+            </div>
+            <a-progress :percent="appUpdateProgressPercent" :show-info="false" size="small" />
+          </div>
+
+          <div v-if="appUpdateInfo?.update_available && appUpdateInfo.download_asset" class="settings-update-actions">
+            <a-button type="primary" :loading="downloadingAppUpdate" @click="downloadLatestRelease">
+              {{ t('downloadAndInstallUpdate') }}
+            </a-button>
+          </div>
+
+          <p class="settings-note">{{ t('updateHint') }}</p>
         </section>
       </div>
     </a-modal>
