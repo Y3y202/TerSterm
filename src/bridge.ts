@@ -137,6 +137,8 @@ export async function sshGetSystemUsage(
     memory_total_gb: 16,
     storage_used_gb: 84,
     storage_total_gb: 256,
+    host_platform: 'linux',
+    linux_distro: 'ubuntu',
   }
 }
 
@@ -233,10 +235,10 @@ export async function checkAppUpdate(allow_prerelease = false): Promise<AppUpdat
   }
 
   return {
-    current_version: '0.1.3',
-    latest_version: '0.1.3',
-    release_name: 'TerSterm 0.1.3',
-    release_tag: 'v0.1.3',
+    current_version: '0.1.4',
+    latest_version: '0.1.4',
+    release_name: 'TerSterm 0.1.4',
+    release_tag: 'v0.1.4',
     release_url: 'https://github.com/Y3y202/TerSterm/releases/latest',
     prerelease: false,
     update_available: false,

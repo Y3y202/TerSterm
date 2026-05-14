@@ -53,11 +53,15 @@ const TRAY_QUIT_MENU_ID: &str = "tray-quit";
 const APP_UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "app-update-download-progress";
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
+const GITHUB_RELEASES_ATOM: &str = "https://github.com/Y3y202/TerSterm/releases.atom";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Y3y202/TerSterm/releases/download/";
+const NO_MATCHING_RELEASE_ERROR: &str = "No matching release found";
 const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
 const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 820.0;
+const OPENSSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const OPENSSH_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Deserialize, Clone)]
 struct ConnectionConfig {
@@ -111,6 +115,8 @@ struct SystemUsage {
     memory_total_gb: f32,
     storage_used_gb: f32,
     storage_total_gb: f32,
+    host_platform: Option<String>,
+    linux_distro: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +165,15 @@ struct GithubRelease {
     draft: bool,
     prerelease: bool,
     assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Clone)]
+struct GithubFeedRelease {
+    tag_name: String,
+    title: String,
+    html_url: String,
+    published_at: Option<String>,
+    prerelease: bool,
 }
 
 enum SshCommand {
@@ -634,22 +649,28 @@ fn ssh_connect(
         return Err("Session id is required".into());
     }
 
-    clear_session_openssh_cancellation(&app.state::<OpenSshProcesses>(), &session_id);
-    forget_session_auth_secrets(&app.state::<SshSessionSecrets>(), &session_id);
-
     let (tx, rx) = mpsc::channel::<SshCommand>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    sessions
-        .0
-        .lock()
-        .map_err(|_| "SSH session store is unavailable".to_string())?
-        .insert(
+    {
+        let mut store = sessions
+            .0
+            .lock()
+            .map_err(|_| "SSH session store is unavailable".to_string())?;
+        if store.contains_key(&session_id) {
+            return Err("SSH session id is already active".into());
+        }
+
+        store.insert(
             session_id.clone(),
             SessionEntry {
                 sender: tx,
                 done: done_rx,
             },
         );
+    }
+
+    clear_session_openssh_cancellation(&app.state::<OpenSshProcesses>(), &session_id);
+    forget_session_auth_secrets(&app.state::<SshSessionSecrets>(), &session_id);
 
     let thread_session_id = session_id.clone();
     thread::spawn(move || {
@@ -948,6 +969,71 @@ fn normalize_release_version(value: &str) -> String {
         .to_string()
 }
 
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn extract_text_between<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_index = value.find(start)? + start.len();
+    let remaining = &value[start_index..];
+    let end_index = remaining.find(end)?;
+    Some(&remaining[..end_index])
+}
+
+fn extract_entry_xml_text(entry: &str, tag: &str) -> Option<String> {
+    let start = format!("<{tag}>");
+    let end = format!("</{tag}>");
+    extract_text_between(entry, &start, &end).map(xml_unescape)
+}
+
+fn extract_release_link(entry: &str) -> Option<String> {
+    entry
+        .split("<link")
+        .find(|segment| segment.contains("/releases/tag/"))
+        .and_then(|segment| extract_text_between(segment, "href=\"", "\""))
+        .map(xml_unescape)
+}
+
+fn parse_github_releases_feed(feed: &str) -> Vec<GithubFeedRelease> {
+    feed.split("<entry>")
+        .skip(1)
+        .filter_map(|entry| {
+            let entry = entry.split("</entry>").next()?;
+            let html_url = extract_release_link(entry)?;
+            let tag_name = html_url.rsplit('/').next()?.trim().to_string();
+            if tag_name.is_empty() {
+                return None;
+            }
+
+            let title = extract_entry_xml_text(entry, "title").unwrap_or_else(|| tag_name.clone());
+            let published_at = extract_entry_xml_text(entry, "updated");
+            let prerelease = normalize_release_version(&tag_name).contains('-');
+
+            Some(GithubFeedRelease {
+                tag_name,
+                title,
+                html_url,
+                published_at,
+                prerelease,
+            })
+        })
+        .collect()
+}
+
+fn select_feed_release(
+    releases: Vec<GithubFeedRelease>,
+    allow_prerelease: bool,
+) -> Option<GithubFeedRelease> {
+    releases
+        .into_iter()
+        .find(|release| allow_prerelease || !release.prerelease)
+}
+
 fn compare_release_versions(left: &str, right: &str) -> VersionOrdering {
     let left = normalize_release_version(left);
     let right = normalize_release_version(right);
@@ -1057,17 +1143,134 @@ fn select_release(releases: Vec<GithubRelease>, allow_prerelease: bool) -> Optio
         .find(|release| !release.draft && (allow_prerelease || !release.prerelease))
 }
 
-fn run_check_app_update(
+fn release_asset_download_url(tag_name: &str, file_name: &str) -> String {
+    format!("{GITHUB_RELEASE_DOWNLOAD_PREFIX}{tag_name}/{file_name}")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn current_arch_aliases() -> &'static [&'static str] {
+    &["x64", "x86_64", "amd64"]
+}
+
+#[cfg(target_arch = "aarch64")]
+fn current_arch_aliases() -> &'static [&'static str] {
+    &["aarch64", "arm64"]
+}
+
+#[cfg(target_arch = "x86")]
+fn current_arch_aliases() -> &'static [&'static str] {
+    &["x86", "i686", "ia32"]
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
+fn current_arch_aliases() -> &'static [&'static str] {
+    &[std::env::consts::ARCH]
+}
+
+fn release_asset_name_candidates(version: &str) -> Vec<String> {
+    let version = normalize_release_version(version);
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    for arch in current_arch_aliases() {
+        candidates.push(format!("TerSterm_{version}_{arch}-setup.exe"));
+        candidates.push(format!("TerSterm_{version}_{arch}.msi"));
+        candidates.push(format!("TerSterm_{version}_{arch}.zip"));
+    }
+
+    #[cfg(target_os = "macos")]
+    for arch in current_arch_aliases() {
+        candidates.push(format!("TerSterm_{version}_{arch}.dmg"));
+        candidates.push(format!("TerSterm_{version}_{arch}.app.tar.gz"));
+        candidates.push(format!("TerSterm_{version}_{arch}.zip"));
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    for arch in current_arch_aliases() {
+        candidates.push(format!("TerSterm_{version}_{arch}.AppImage"));
+        candidates.push(format!("tersterm_{version}_{arch}.deb"));
+        candidates.push(format!("TerSterm_{version}_{arch}.rpm"));
+        candidates.push(format!("TerSterm_{version}_{arch}.tar.gz"));
+    }
+
+    candidates
+}
+
+fn detect_release_asset_from_public_release(
+    client: &reqwest::blocking::Client,
+    tag_name: &str,
+) -> Result<Option<AppUpdateAsset>, Box<dyn std::error::Error + Send + Sync>> {
+    for candidate in release_asset_name_candidates(tag_name) {
+        let download_url = release_asset_download_url(tag_name, &candidate);
+        let response = client.head(&download_url).send()?;
+        if response.status().is_success() {
+            return Ok(Some(AppUpdateAsset {
+                name: candidate,
+                download_url,
+                size_bytes: response.content_length().unwrap_or(0),
+            }));
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+
+        return Err(format!(
+            "Unexpected status {} while probing release asset {}",
+            response.status(),
+            candidate
+        )
+        .into());
+    }
+
+    Ok(None)
+}
+
+fn run_check_app_update_via_feed(
+    client: &reqwest::blocking::Client,
     allow_prerelease: bool,
 ) -> Result<AppUpdateInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let client = github_client(Some(Duration::from_secs(30)))?;
+    let feed = client
+        .get(GITHUB_RELEASES_ATOM)
+        .send()?
+        .error_for_status()?
+        .text()?;
+    let release = select_feed_release(parse_github_releases_feed(&feed), allow_prerelease)
+        .ok_or(NO_MATCHING_RELEASE_ERROR)?;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let latest_version = normalize_release_version(&release.tag_name);
+    let update_available =
+        compare_release_versions(&latest_version, &current_version) == VersionOrdering::Greater;
+    let download_asset = if update_available {
+        detect_release_asset_from_public_release(client, &release.tag_name)?
+    } else {
+        None
+    };
+
+    Ok(AppUpdateInfo {
+        current_version,
+        latest_version,
+        release_name: release.title,
+        release_tag: release.tag_name,
+        release_url: release.html_url,
+        published_at: release.published_at,
+        prerelease: release.prerelease,
+        download_asset,
+        update_available,
+    })
+}
+
+fn run_check_app_update_via_api(
+    client: &reqwest::blocking::Client,
+    allow_prerelease: bool,
+) -> Result<AppUpdateInfo, Box<dyn std::error::Error + Send + Sync>> {
     let releases = client
         .get(GITHUB_RELEASES_API)
         .header("Accept", "application/vnd.github+json")
         .send()?
         .error_for_status()?
         .json::<Vec<GithubRelease>>()?;
-    let release = select_release(releases, allow_prerelease).ok_or("No matching release found")?;
+    let release = select_release(releases, allow_prerelease).ok_or(NO_MATCHING_RELEASE_ERROR)?;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let latest_version = normalize_release_version(&release.tag_name);
     let update_available =
@@ -1089,6 +1292,17 @@ fn run_check_app_update(
         download_asset: preferred_release_asset(&release.assets),
         update_available,
     })
+}
+
+fn run_check_app_update(
+    allow_prerelease: bool,
+) -> Result<AppUpdateInfo, Box<dyn std::error::Error + Send + Sync>> {
+    let client = github_client(Some(Duration::from_secs(30)))?;
+    match run_check_app_update_via_feed(&client, allow_prerelease) {
+        Ok(result) => Ok(result),
+        Err(error) if format_error_chain(error.as_ref()) == NO_MATCHING_RELEASE_ERROR => Err(error),
+        Err(_) => run_check_app_update_via_api(&client, allow_prerelease),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2144,36 +2358,16 @@ fn run_remote_file_upload_openssh(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let target = remote_join(&normalize_remote_path(&remote_path), &safe_name);
     let remote_target = sftp_path(&target);
-    let has_interactive_secret = config
-        .password
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
-
-    if has_interactive_secret {
-        let marker = format!("TERSTERM_UPLOAD_{}", Uuid::new_v4().simple());
-        let fragment = format!(
-            r#"{} <<'{}'
-{}
-{}
-"#,
-            remote_file_upload_shell_fragment(&remote_target),
-            marker,
-            content_base64,
-            marker
-        );
-        let command = format!("sh -lc {}", shell_quote(&fragment));
-        run_openssh_exec_command(processes, session_id, config, &command)?;
-    } else {
-        let fragment = remote_file_upload_shell_fragment(&remote_target);
-        let command = format!("sh -lc {}", shell_quote(&fragment));
-        run_openssh_exec_command_noninteractive_with_stdin(
-            processes,
-            session_id,
-            config,
-            &command,
-            Some(content_base64.as_bytes()),
-        )?;
-    }
+    let fragment = remote_file_upload_shell_fragment(&remote_target);
+    let command = format!("sh -lc {}", shell_quote(&fragment));
+    run_openssh_exec_command_with_stdin_and_timeout(
+        processes,
+        session_id,
+        config,
+        &command,
+        Some(content_base64.as_bytes()),
+        OPENSSH_FILE_TRANSFER_TIMEOUT,
+    )?;
 
     Ok(target)
 }
@@ -2251,7 +2445,14 @@ fn run_remote_file_download_openssh(
         path = shell_quote(&sftp_path(remote_path)),
     );
     let command = format!("sh -lc {}", shell_quote(&fragment));
-    let output = run_openssh_exec_command(processes, session_id, config, &command)?;
+    let output = run_openssh_exec_command_with_stdin_and_timeout(
+        processes,
+        session_id,
+        config,
+        &command,
+        None,
+        OPENSSH_FILE_TRANSFER_TIMEOUT,
+    )?;
     let start = output
         .find(&start_marker)
         .ok_or("Unable to find download start marker")?;
@@ -2273,16 +2474,21 @@ fn parse_system_usage_output(
     let mut cpu_percent = None;
     let mut memory = None;
     let mut storage = None;
+    let mut linux_distro = None;
 
     for line in output.lines() {
         let line = line
-            .find("CPU ")
+            .find("OS ")
+            .or_else(|| line.find("CPU "))
             .or_else(|| line.find("MEM "))
             .or_else(|| line.find("DISK "))
             .map(|index| &line[index..])
             .unwrap_or(line);
         let mut parts = line.split_whitespace();
         match parts.next() {
+            Some("OS") => {
+                linux_distro = parts.next().map(|value| value.trim().to_ascii_lowercase());
+            }
             Some("CPU") => {
                 cpu_percent = parts.next().and_then(|value| value.parse::<f32>().ok());
             }
@@ -2314,6 +2520,8 @@ fn parse_system_usage_output(
         memory_total_gb,
         storage_used_gb,
         storage_total_gb,
+        host_platform: Some("linux".to_string()),
+        linux_distro,
     })
 }
 
@@ -2340,7 +2548,7 @@ fn run_remote_system_usage(
 }
 
 fn system_usage_shell_fragment() -> &'static str {
-    r#"printf "\n"; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -B1 / | awk "NR==2 { printf \"DISK %.2f %.2f\n\", \$3/1073741824, \$2/1073741824 }""#
+    r#"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -B1 / | awk "NR==2 { printf \"DISK %.2f %.2f\n\", \$3/1073741824, \$2/1073741824 }""#
 }
 
 fn run_ssh2_exec_command(
@@ -2386,6 +2594,24 @@ fn run_openssh_exec_command(
     config: &ConnectionConfig,
     remote_command: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    run_openssh_exec_command_with_stdin_and_timeout(
+        processes,
+        session_id,
+        config,
+        remote_command,
+        None,
+        OPENSSH_COMMAND_TIMEOUT,
+    )
+}
+
+fn run_openssh_exec_command_with_stdin_and_timeout(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_command: &str,
+    stdin_data: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let debug_enabled = env::var("TERSTERM_DEBUG_OPENSSH")
         .map(|value| value == "1")
         .unwrap_or(false);
@@ -2395,11 +2621,13 @@ fn run_openssh_exec_command(
         .is_some_and(|value| !value.trim().is_empty());
 
     if !has_interactive_secret {
-        return run_openssh_exec_command_noninteractive(
+        return run_openssh_exec_command_noninteractive_with_stdin_and_timeout(
             processes,
             session_id,
             config,
             remote_command,
+            stdin_data,
+            timeout,
         );
     }
 
@@ -2471,6 +2699,7 @@ fn run_openssh_exec_command(
     let mut prompt_buffer = String::new();
     let requires_passphrase = private_key_passphrase.is_some();
     let requires_password = password.is_some();
+    let mut stdin_payload = stdin_data.map(|data| data.to_vec());
     let mut password_sent = false;
     let mut passphrase_sent = false;
     let mut exit_status = None;
@@ -2545,11 +2774,23 @@ fn run_openssh_exec_command(
                     }
                 }
 
-                // Remote exec probes never need stdin after credentials are supplied.
+                // Once auth is done, forward any pending stdin payload and then close stdin.
                 if writer.is_some()
                     && (!requires_passphrase || passphrase_sent)
                     && (!requires_password || password_sent)
                 {
+                    if let Some(data) = stdin_payload.take() {
+                        if debug_enabled {
+                            eprintln!(
+                                "run_openssh_exec_command streaming {} stdin bytes",
+                                data.len()
+                            );
+                        }
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(&data)?;
+                            writer.flush()?;
+                        }
+                    }
                     if debug_enabled {
                         eprintln!("run_openssh_exec_command closing stdin after credentials");
                     }
@@ -2564,7 +2805,7 @@ fn run_openssh_exec_command(
                         started_at.elapsed().as_secs()
                     );
                 }
-                if started_at.elapsed() > Duration::from_secs(20) {
+                if started_at.elapsed() > timeout {
                     shutdown_pty_process(
                         &mut *child,
                         &mut master,
@@ -2616,21 +2857,6 @@ fn run_openssh_exec_command(
     Err(message.to_string().into())
 }
 
-fn run_openssh_exec_command_noninteractive(
-    processes: &OpenSshProcesses,
-    session_id: Option<&str>,
-    config: &ConnectionConfig,
-    remote_command: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    run_openssh_exec_command_noninteractive_with_stdin(
-        processes,
-        session_id,
-        config,
-        remote_command,
-        None,
-    )
-}
-
 fn join_openssh_stdin_writer(
     writer: Option<thread::JoinHandle<std::io::Result<()>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -2643,12 +2869,13 @@ fn join_openssh_stdin_writer(
     }
 }
 
-fn run_openssh_exec_command_noninteractive_with_stdin(
+fn run_openssh_exec_command_noninteractive_with_stdin_and_timeout(
     processes: &OpenSshProcesses,
     session_id: Option<&str>,
     config: &ConnectionConfig,
     remote_command: &str,
     stdin_data: Option<&[u8]>,
+    timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let process_guard = register_openssh_process(processes, session_id);
     if process_guard.is_cancelled() {
@@ -2730,7 +2957,7 @@ fn run_openssh_exec_command_noninteractive_with_stdin(
             break;
         }
 
-        if started_at.elapsed() > Duration::from_secs(20) {
+        if started_at.elapsed() > timeout {
             child.kill().ok();
             child.wait().ok();
             stdout_reader.join().ok();
@@ -3224,9 +3451,10 @@ mod tests {
     use super::collect_descendants_from_entries;
     use super::{
         compare_release_versions, format_error_chain, merge_window_state,
-        output_looks_authenticated, parse_openssh_file_list, parse_system_usage_output,
-        remote_file_upload_shell_fragment, run_openssh_exec_command, run_remote_file_list,
-        run_remote_system_usage, should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
+        output_looks_authenticated, parse_github_releases_feed, parse_openssh_file_list,
+        parse_system_usage_output, release_asset_download_url, remote_file_upload_shell_fragment,
+        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
+        select_feed_release, should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
         PersistedWindowState,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
@@ -3339,6 +3567,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_github_release_feed_entries() {
+        let feed = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+            "<feed>",
+            "<entry>",
+            "<updated>2026-05-14T05:00:00Z</updated>",
+            "<link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/Y3y202/TerSterm/releases/tag/v0.1.4-beta.1\"/>",
+            "<title>TerSterm v0.1.4-beta.1</title>",
+            "</entry>",
+            "<entry>",
+            "<updated>2026-05-13T05:00:00Z</updated>",
+            "<link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/Y3y202/TerSterm/releases/tag/v0.1.3\"/>",
+            "<title>TerSterm v0.1.3</title>",
+            "</entry>",
+            "</feed>"
+        );
+
+        let releases = parse_github_releases_feed(feed);
+
+        assert_eq!(releases.len(), 2);
+        assert_eq!(releases[0].tag_name, "v0.1.4-beta.1");
+        assert!(releases[0].prerelease);
+        assert_eq!(releases[1].tag_name, "v0.1.3");
+        assert!(!releases[1].prerelease);
+    }
+
+    #[test]
+    fn selects_stable_or_prerelease_from_feed() {
+        let feed = concat!(
+            "<feed>",
+            "<entry>",
+            "<updated>2026-05-14T05:00:00Z</updated>",
+            "<link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/Y3y202/TerSterm/releases/tag/v0.1.4-beta.1\"/>",
+            "<title>TerSterm v0.1.4-beta.1</title>",
+            "</entry>",
+            "<entry>",
+            "<updated>2026-05-13T05:00:00Z</updated>",
+            "<link rel=\"alternate\" type=\"text/html\" href=\"https://github.com/Y3y202/TerSterm/releases/tag/v0.1.3\"/>",
+            "<title>TerSterm v0.1.3</title>",
+            "</entry>",
+            "</feed>"
+        );
+
+        let releases = parse_github_releases_feed(feed);
+        let prerelease =
+            select_feed_release(releases.clone(), true).expect("prerelease should exist");
+        let stable = select_feed_release(releases, false).expect("stable should exist");
+
+        assert_eq!(prerelease.tag_name, "v0.1.4-beta.1");
+        assert_eq!(stable.tag_name, "v0.1.3");
+    }
+
+    #[test]
+    fn builds_public_release_asset_download_url() {
+        let url = release_asset_download_url("v0.1.3", "TerSterm_0.1.3_x64-setup.exe");
+
+        assert_eq!(
+            url,
+            "https://github.com/Y3y202/TerSterm/releases/download/v0.1.3/TerSterm_0.1.3_x64-setup.exe"
+        );
+    }
+
+    #[test]
     fn parses_noisy_openssh_file_list_output() {
         let output = concat!(
             "Welcome to Ubuntu\r\n",
@@ -3372,6 +3663,7 @@ mod tests {
     fn parses_system_usage_output_with_login_noise() {
         let output = concat!(
             "Last login: Mon May 11 15:00:53 CST 2026\r\n",
+            "OS ubuntu\r\n",
             "CPU 12.5\r\n",
             "MEM 3.25 16.00\r\n",
             "DISK 84.00 256.00\r\n"
@@ -3384,6 +3676,8 @@ mod tests {
         assert_eq!(usage.memory_total_gb, 16.0);
         assert_eq!(usage.storage_used_gb, 84.0);
         assert_eq!(usage.storage_total_gb, 256.0);
+        assert_eq!(usage.host_platform.as_deref(), Some("linux"));
+        assert_eq!(usage.linux_distro.as_deref(), Some("ubuntu"));
     }
 
     #[test]

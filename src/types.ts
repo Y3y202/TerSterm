@@ -1,3 +1,5 @@
+export type HostPlatform = 'linux' | 'windows' | 'unknown'
+
 export interface ConnectionProfile {
   id: string
   name: string
@@ -10,6 +12,8 @@ export interface ConnectionProfile {
   private_key_passphrase?: string
   group_id?: string
   group?: string
+  host_platform?: HostPlatform
+  linux_distro?: string
 }
 
 export interface ConnectionGroup {
@@ -57,6 +61,8 @@ export interface SystemUsage {
   memory_total_gb: number
   storage_used_gb: number
   storage_total_gb: number
+  host_platform?: HostPlatform
+  linux_distro?: string
 }
 
 export type RemoteFileKind = 'file' | 'directory' | 'symlink'
