@@ -55,6 +55,9 @@ const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Y3y202/TerSterm/releases/download/";
+const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
+const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 820.0;
 
 #[derive(Debug, Deserialize, Clone)]
 struct ConnectionConfig {
@@ -294,6 +297,36 @@ impl AppLocaleState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+struct PersistedWindowState {
+    width: f64,
+    height: f64,
+    maximized: bool,
+}
+
+impl Default for PersistedWindowState {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_WINDOW_WIDTH,
+            height: DEFAULT_WINDOW_HEIGHT,
+            maximized: false,
+        }
+    }
+}
+
+impl PersistedWindowState {
+    fn sanitized(self) -> Self {
+        Self {
+            width: sanitize_window_dimension(self.width, DEFAULT_WINDOW_WIDTH),
+            height: sanitize_window_dimension(self.height, DEFAULT_WINDOW_HEIGHT),
+            maximized: self.maximized,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PersistedMainWindowState(Mutex<PersistedWindowState>);
+
 #[derive(Default)]
 struct TrayMenuState {
     show_item: Mutex<Option<MenuItem<tauri::Wry>>>,
@@ -348,6 +381,119 @@ fn cancel_all_openssh_processes(processes: &OpenSshProcesses) {
 
     for entry in entries {
         entry.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn sanitize_window_dimension(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+fn merge_window_state(
+    current: PersistedWindowState,
+    width: f64,
+    height: f64,
+    maximized: bool,
+) -> PersistedWindowState {
+    let mut next = current;
+    if !maximized {
+        next.width = sanitize_window_dimension(width, current.width);
+        next.height = sanitize_window_dimension(height, current.height);
+    }
+    next.maximized = maximized;
+    next.sanitized()
+}
+
+fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(WINDOW_STATE_FILE_NAME))
+}
+
+fn read_persisted_window_state(app: &AppHandle) -> Option<PersistedWindowState> {
+    let path = window_state_path(app)?;
+    let contents = fs::read_to_string(path).ok()?;
+    let state = serde_json::from_str::<PersistedWindowState>(&contents).ok()?;
+    Some(state.sanitized())
+}
+
+fn write_persisted_window_state(app: &AppHandle, state: PersistedWindowState) {
+    let Some(path) = window_state_path(app) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(contents) = serde_json::to_vec(&state.sanitized()) else {
+        return;
+    };
+
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    fs::write(path, contents).ok();
+}
+
+fn apply_persisted_window_state(window: &tauri::WebviewWindow, state: PersistedWindowState) {
+    window
+        .set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+            state.width,
+            state.height,
+        )))
+        .ok();
+
+    if state.maximized {
+        window.maximize().ok();
+    } else {
+        window.center().ok();
+    }
+}
+
+fn persist_main_window_state(window: &tauri::WebviewWindow) {
+    let Ok(scale_factor) = window.scale_factor() else {
+        return;
+    };
+    let Ok(size) = window.inner_size() else {
+        return;
+    };
+    let Ok(maximized) = window.is_maximized() else {
+        return;
+    };
+    let logical_size = size.to_logical::<f64>(scale_factor);
+    let app = window.app_handle();
+    let next_state = {
+        let state = app.state::<PersistedMainWindowState>();
+        let Ok(mut store) = state.0.lock() else {
+            return;
+        };
+        let next = merge_window_state(*store, logical_size.width, logical_size.height, maximized);
+        if *store == next {
+            return;
+        }
+        *store = next;
+        next
+    };
+
+    write_persisted_window_state(&app, next_state);
+}
+
+fn initialize_main_window_state(window: &tauri::WebviewWindow) {
+    let app = window.app_handle();
+    let state = read_persisted_window_state(&app).unwrap_or_default();
+
+    if let Ok(mut store) = app.state::<PersistedMainWindowState>().0.lock() {
+        *store = state;
+    }
+
+    apply_persisted_window_state(window, state);
+
+    if !state.maximized {
+        persist_main_window_state(window);
     }
 }
 
@@ -2942,6 +3088,7 @@ fn main() {
         .manage(AppClosing::default())
         .manage(WindowCloseBehaviorState::default())
         .manage(AppLocaleState::default())
+        .manage(PersistedMainWindowState::default())
         .manage(TrayMenuState::default())
         .invoke_handler(tauri::generate_handler![
             ssh_connect,
@@ -2961,6 +3108,17 @@ fn main() {
             set_app_locale
         ])
         .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if matches!(event, tauri::WindowEvent::Resized(_)) {
+                if let Some(main_window) = window.app_handle().get_webview_window(window.label()) {
+                    persist_main_window_state(&main_window);
+                }
+                return;
+            }
+
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle().clone();
                 if app.state::<AppClosing>().0.load(Ordering::Relaxed) {
@@ -3033,7 +3191,7 @@ fn main() {
                 .get_webview_window("main")
                 .expect("main window not found");
             window.set_title("TerSterm").ok();
-            window.center().ok();
+            initialize_main_window_state(&window);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -3045,10 +3203,10 @@ mod tests {
     #[cfg(windows)]
     use super::collect_descendants_from_entries;
     use super::{
-        compare_release_versions, output_looks_authenticated, parse_openssh_file_list,
-        parse_system_usage_output, remote_file_upload_shell_fragment, run_openssh_exec_command,
-        run_remote_file_list, run_remote_system_usage, should_fallback_to_openssh,
-        ConnectionConfig, OpenSshProcesses,
+        compare_release_versions, merge_window_state, output_looks_authenticated,
+        parse_openssh_file_list, parse_system_usage_output, remote_file_upload_shell_fragment,
+        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
+        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses, PersistedWindowState,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
 
@@ -3096,6 +3254,36 @@ mod tests {
             compare_release_versions("1.0.0", "1.0.0-beta.1"),
             CmpOrdering::Greater
         );
+    }
+
+    #[test]
+    fn updates_saved_window_size_while_not_maximized() {
+        let state = PersistedWindowState {
+            width: 1280.0,
+            height: 820.0,
+            maximized: false,
+        };
+
+        let next = merge_window_state(state, 1440.0, 900.0, false);
+
+        assert_eq!(next.width, 1440.0);
+        assert_eq!(next.height, 900.0);
+        assert!(!next.maximized);
+    }
+
+    #[test]
+    fn keeps_last_normal_window_size_when_maximized() {
+        let state = PersistedWindowState {
+            width: 1366.0,
+            height: 860.0,
+            maximized: false,
+        };
+
+        let next = merge_window_state(state, 1920.0, 1080.0, true);
+
+        assert_eq!(next.width, 1366.0);
+        assert_eq!(next.height, 860.0);
+        assert!(next.maximized);
     }
 
     #[test]
