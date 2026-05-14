@@ -16,7 +16,7 @@ tauri = { version = "2.9.5", features = ["tray-icon"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 base64 = "0.22"
 ssh2 = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "system-proxy"] }
 tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-single-instance = { version = "2.4.2", features = ["deep-link"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }

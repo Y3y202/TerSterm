@@ -699,7 +699,7 @@ async fn check_app_update(allow_prerelease: bool) -> Result<AppUpdateInfo, Strin
     tauri::async_runtime::spawn_blocking(move || run_check_app_update(allow_prerelease))
         .await
         .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
+        .map_err(|error| format_boxed_error(error))
 }
 
 #[tauri::command]
@@ -713,7 +713,7 @@ async fn download_app_update(
     })
     .await
     .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+    .map_err(|error| format_boxed_error(error))
 }
 
 #[tauri::command]
@@ -894,6 +894,26 @@ fn github_client(
     }
 
     Ok(builder.build()?)
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+
+    while let Some(next) = source {
+        let source_message = next.to_string();
+        if !source_message.is_empty() && !message.contains(&source_message) {
+            message.push_str(": ");
+            message.push_str(&source_message);
+        }
+        source = next.source();
+    }
+
+    message
+}
+
+fn format_boxed_error(error: Box<dyn std::error::Error + Send + Sync>) -> String {
+    format_error_chain(error.as_ref())
 }
 
 fn emit_app_update_download_progress(
@@ -3203,10 +3223,11 @@ mod tests {
     #[cfg(windows)]
     use super::collect_descendants_from_entries;
     use super::{
-        compare_release_versions, merge_window_state, output_looks_authenticated,
-        parse_openssh_file_list, parse_system_usage_output, remote_file_upload_shell_fragment,
-        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
-        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses, PersistedWindowState,
+        compare_release_versions, format_error_chain, merge_window_state,
+        output_looks_authenticated, parse_openssh_file_list, parse_system_usage_output,
+        remote_file_upload_shell_fragment, run_openssh_exec_command, run_remote_file_list,
+        run_remote_system_usage, should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
+        PersistedWindowState,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
 
@@ -3284,6 +3305,37 @@ mod tests {
         assert_eq!(next.width, 1366.0);
         assert_eq!(next.height, 860.0);
         assert!(next.maximized);
+    }
+
+    #[test]
+    fn formats_full_error_chain_for_update_failures() {
+        #[derive(Debug)]
+        struct WrappedError {
+            message: &'static str,
+            source: io::Error,
+        }
+
+        impl std::fmt::Display for WrappedError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.message)
+            }
+        }
+
+        impl std::error::Error for WrappedError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        let error = WrappedError {
+            message: "error sending request for url",
+            source: io::Error::new(io::ErrorKind::TimedOut, "operation timed out"),
+        };
+
+        let message = format_error_chain(&error);
+
+        assert!(message.contains("error sending request for url"));
+        assert!(message.contains("operation timed out"));
     }
 
     #[test]
