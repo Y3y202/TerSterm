@@ -1356,29 +1356,48 @@ fn run_check_app_update(
 }
 
 #[cfg(target_os = "windows")]
-fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
+fn escape_powershell_single_quoted_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
 
-    if extension == "msi" {
-        std::process::Command::new("msiexec")
-            .arg("/i")
-            .arg(path)
-            .spawn()?;
-        return Ok(());
-    }
+#[cfg(target_os = "windows")]
+fn build_windows_update_installer_wait_script(path: &Path, process_id: u32) -> String {
+    let installer_path = escape_powershell_single_quoted_string(&path.to_string_lossy());
+    let mut script = format!(
+        "$installerPath = '{installer_path}'; $terstermProcessId = {process_id}; ",
+        installer_path = installer_path,
+        process_id = process_id,
+    );
+    script.push_str(
+        "while (Get-Process -Id $terstermProcessId -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 400 }; ",
+    );
+    script.push_str("Start-Sleep -Milliseconds 250; ");
+    script.push_str("for ($attempt = 0; $attempt -lt 12; $attempt++) { ");
+    script.push_str("try { Start-Process -LiteralPath $installerPath | Out-Null; exit 0 } ");
+    script.push_str("catch { Start-Sleep -Milliseconds 500 } ");
+    script.push_str("}; exit 1");
+    script
+}
 
-    if extension == "exe" {
-        std::process::Command::new(path).spawn()?;
-        return Ok(());
-    }
-
-    let path_arg = path.to_string_lossy().to_string();
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", path_arg.as_str()])
+#[cfg(target_os = "windows")]
+fn schedule_update_installer_after_exit(
+    path: &Path,
+    process_id: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let script = build_windows_update_installer_wait_script(path, process_id);
+    let mut command = std::process::Command::new("powershell");
+    configure_subprocess(&mut command);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script.as_str(),
+        ])
         .spawn()?;
     Ok(())
 }
@@ -1395,34 +1414,10 @@ fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
-#[cfg(windows)]
-fn is_windows_file_sharing_violation(error: &(dyn std::error::Error + 'static)) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-        == Some(32)
-}
-
-#[cfg(windows)]
-fn launch_update_installer_with_retry(
+#[cfg(not(target_os = "windows"))]
+fn schedule_update_installer_after_exit(
     path: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    for attempt in 0..6 {
-        match launch_update_installer(path) {
-            Ok(()) => return Ok(()),
-            Err(error) if attempt < 5 && is_windows_file_sharing_violation(error.as_ref()) => {
-                thread::sleep(Duration::from_millis(400));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("update installer retry loop should always return")
-}
-
-#[cfg(not(windows))]
-fn launch_update_installer_with_retry(
-    path: &Path,
+    _process_id: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     launch_update_installer(path)
 }
@@ -1430,7 +1425,7 @@ fn launch_update_installer_with_retry(
 fn schedule_update_exit(app: AppHandle) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(900));
-        exit_application(app);
+        exit_application_for_update(app);
     });
 }
 
@@ -1496,7 +1491,7 @@ fn run_download_app_update(
         downloaded_bytes,
         total_bytes.or(Some(downloaded_bytes)),
     );
-    launch_update_installer_with_retry(&local_path)?;
+    schedule_update_installer_after_exit(&local_path, std::process::id())?;
     schedule_update_exit(app.clone());
 
     Ok(local_path.to_string_lossy().to_string())
@@ -3884,7 +3879,7 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn exit_application(app: AppHandle) {
+fn exit_application_with_cleanup(app: AppHandle, terminate_descendants: bool) {
     let closing = app.state::<AppClosing>();
     if closing.0.swap(true, Ordering::Relaxed) {
         return;
@@ -3900,9 +3895,19 @@ fn exit_application(app: AppHandle) {
         cancel_all_openssh_processes(&processes);
         disconnect_all_sessions(&sessions);
         #[cfg(windows)]
-        terminate_descendant_processes(std::process::id());
+        if terminate_descendants {
+            terminate_descendant_processes(std::process::id());
+        }
         app.exit(0);
     });
+}
+
+fn exit_application(app: AppHandle) {
+    exit_application_with_cleanup(app, true);
+}
+
+fn exit_application_for_update(app: AppHandle) {
+    exit_application_with_cleanup(app, false);
 }
 
 fn main() {
@@ -4030,7 +4035,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
-    use super::collect_descendants_from_entries;
+    use super::{build_windows_update_installer_wait_script, collect_descendants_from_entries};
     use super::{
         compare_release_versions, format_error_chain, merge_window_state,
         output_looks_authenticated, parse_github_releases_feed, parse_openssh_file_list,
@@ -4061,6 +4066,19 @@ mod tests {
             collect_descendants_from_entries(42, &entries),
             vec![10, 9, 8]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builds_update_wait_script_with_escaped_installer_path() {
+        let script = build_windows_update_installer_wait_script(
+            std::path::Path::new(r"C:\Users\O'Brien\Downloads\TerSterm Setup.exe"),
+            4242,
+        );
+
+        assert!(script.contains("$terstermProcessId = 4242"));
+        assert!(script.contains(r"C:\Users\O''Brien\Downloads\TerSterm Setup.exe"));
+        assert!(script.contains("Start-Process -LiteralPath $installerPath"));
     }
 
     #[test]
