@@ -917,8 +917,8 @@ fn save_local_file(
     let bytes = general_purpose::STANDARD
         .decode(content_base64)
         .map_err(|error| error.to_string())?;
-    let downloads =
-        resolve_local_download_directory(&app, local_dir.as_deref()).map_err(|error| error.to_string())?;
+    let downloads = resolve_local_download_directory(&app, local_dir.as_deref())
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
     let local_path = unique_local_path(&downloads, &filename);
     fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
@@ -1395,6 +1395,38 @@ fn launch_update_installer(path: &Path) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+#[cfg(windows)]
+fn is_windows_file_sharing_violation(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        == Some(32)
+}
+
+#[cfg(windows)]
+fn launch_update_installer_with_retry(
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for attempt in 0..6 {
+        match launch_update_installer(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < 5 && is_windows_file_sharing_violation(error.as_ref()) => {
+                thread::sleep(Duration::from_millis(400));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("update installer retry loop should always return")
+}
+
+#[cfg(not(windows))]
+fn launch_update_installer_with_retry(
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    launch_update_installer(path)
+}
+
 fn schedule_update_exit(app: AppHandle) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(900));
@@ -1455,6 +1487,8 @@ fn run_download_app_update(
     }
 
     file.flush()?;
+    file.sync_all()?;
+    drop(file);
     emit_app_update_download_progress(
         app,
         "installing",
@@ -1462,7 +1496,7 @@ fn run_download_app_update(
         downloaded_bytes,
         total_bytes.or(Some(downloaded_bytes)),
     );
-    launch_update_installer(&local_path)?;
+    launch_update_installer_with_retry(&local_path)?;
     schedule_update_exit(app.clone());
 
     Ok(local_path.to_string_lossy().to_string())
@@ -2544,9 +2578,11 @@ fn run_remote_file_download_ssh2(
         .unwrap_or("download");
     let (_session, sftp) = connect_sftp(config)?;
     let sftp_path = sftp_path(remote_path);
-    let total_bytes = expected_size
-        .filter(|value| *value > 0)
-        .or_else(|| sftp.stat(Path::new(&sftp_path)).ok().and_then(|stat| stat.size));
+    let total_bytes = expected_size.filter(|value| *value > 0).or_else(|| {
+        sftp.stat(Path::new(&sftp_path))
+            .ok()
+            .and_then(|stat| stat.size)
+    });
     let mut remote_file = sftp.open(Path::new(&sftp_path))?;
     let mut local_file = fs::File::create(local_path)?;
     let mut buffer = [0_u8; 65_536];

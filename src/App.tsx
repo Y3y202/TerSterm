@@ -1704,16 +1704,6 @@ export default function App() {
     <main className={cn('grid h-full min-h-0 gap-0 overflow-hidden bg-transparent p-2.5', resizingSidebar && 'select-none')} style={appShellStyle}>
       {!sidebarCollapsed && (
         <aside className="flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[24px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
-          <div className="rounded-[18px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-3.5 shadow-[inset_0_1px_0_var(--surface-highlight)]">
-            <div className="flex items-center gap-2.5">
-              <div className="grid h-10 w-10 place-items-center rounded-xl bg-[var(--accent)] text-xs font-bold text-white shadow-[0_10px_20px_var(--accent-soft)]">TS</div>
-              <div className="min-w-0">
-                <h1 className="text-base font-semibold text-[var(--text-strong)]">TerSterm</h1>
-                <span className="text-xs text-[var(--text-muted)]">{t('brandSubtitle')}</span>
-              </div>
-            </div>
-          </div>
-
           <div className="grid grid-cols-[minmax(0,1fr)_40px] gap-2 max-[640px]:grid-cols-1">
             <Button onClick={() => openConnectionModal()}>
               <Plus className="h-4 w-4" />
