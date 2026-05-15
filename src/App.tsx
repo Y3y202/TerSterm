@@ -386,6 +386,8 @@ const terminalOutputLines = (output: string) =>
     .map((line) => line.trim())
     .filter(Boolean)
 
+const OUTPUT_PROBE_LIMIT = 12_000
+
 const lineLooksLikeShellPrompt = (line: string) =>
   /[@][^\s:]+(?::|[~/]|\s+)[^\r\n]*[#>$%]$/.test(line) ||
   /^\[[^\]]+\][#>$%]$/.test(line) ||
@@ -481,6 +483,7 @@ export default function App() {
   const systemUsagePendingPaneIdsRef = useRef(new Map<string, number>())
   const pendingPaneCredentialsRef = useRef(new Map<string, PendingPaneCredential>())
   const pendingPaneCredentialBuffersRef = useRef(new Map<string, string>())
+  const paneOutputProbeBuffersRef = useRef(new Map<string, string>())
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     window.matchMedia('(prefers-color-scheme: dark)').matches,
   )
@@ -617,7 +620,12 @@ export default function App() {
   useEffect(() => {
     void syncDesktopLocale(appLocale)
     setPanes((current) =>
-      current.map((pane, index) => (pane.connection ? pane : { ...pane, title: getDefaultPaneTitle(index) })),
+      current.map((pane, index) => {
+        if (pane.connection) return pane
+
+        const nextTitle = getDefaultPaneTitle(index)
+        return pane.title === nextTitle ? pane : { ...pane, title: nextTitle }
+      }),
     )
   }, [appLocale, setPanes])
 
@@ -643,6 +651,19 @@ export default function App() {
 
   const getPaneById = (paneId: string) => panesRef.current.find((pane) => pane.id === paneId)
   const getPaneBySessionId = (sessionId: string) => panesRef.current.find((pane) => pane.session_id === sessionId)
+
+  const getPaneOutputProbe = (paneId: string) => paneOutputProbeBuffersRef.current.get(paneId) || ''
+
+  const appendPaneOutputProbe = (paneId: string, chunk: string) => {
+    const nextOutput = `${getPaneOutputProbe(paneId)}${chunk}`
+    const trimmed = nextOutput.length > OUTPUT_PROBE_LIMIT ? nextOutput.slice(-OUTPUT_PROBE_LIMIT) : nextOutput
+    paneOutputProbeBuffersRef.current.set(paneId, trimmed)
+    return trimmed
+  }
+
+  const clearPaneOutputProbe = (paneId: string) => {
+    paneOutputProbeBuffersRef.current.delete(paneId)
+  }
 
   const clearPendingPaneCredential = (paneId: string) => {
     pendingPaneCredentialsRef.current.delete(paneId)
@@ -741,6 +762,7 @@ export default function App() {
     systemUsageRequestIdsRef.current.delete(pane.id)
     systemUsagePendingPaneIdsRef.current.delete(pane.id)
     clearPendingPaneCredential(pane.id)
+    clearPaneOutputProbe(pane.id)
 
     try {
       await sshDisconnect(sessionId)
@@ -813,7 +835,13 @@ export default function App() {
     const selectableIds = new Set(getSelectableSyncPaneIds())
     const nextSelected = syncedPaneIdsRef.current.filter((paneId) => selectableIds.has(paneId))
 
-    setSyncedPaneIds(nextSelected)
+    if (
+      nextSelected.length !== syncedPaneIdsRef.current.length ||
+      nextSelected.some((paneId, index) => paneId !== syncedPaneIdsRef.current[index])
+    ) {
+      setSyncedPaneIds(nextSelected)
+    }
+
     if (nextSelected.length < 2) {
       setSyncInputEnabled(false)
     }
@@ -875,12 +903,14 @@ export default function App() {
   }
 
   const capturePendingPaneCredentialInput = (pane: SshPane, data: string) => {
+    const probeOutput = getPaneOutputProbe(pane.id)
+    const probePane = { ...pane, terminal_output: probeOutput }
     const shouldCapture =
       pendingPaneCredentialsRef.current.get(pane.id) === 'private_key_passphrase' ||
       (connectionUsesPrivateKey(pane.connection) &&
         !pane.connection?.private_key_passphrase &&
-        hasPrivateKeyPassphrasePrompt(pane.terminal_output || '') &&
-        !paneLooksAuthenticated(pane))
+        hasPrivateKeyPassphrasePrompt(probeOutput) &&
+        !paneLooksAuthenticated(probePane))
 
     if (!shouldCapture) return
 
@@ -1267,6 +1297,7 @@ export default function App() {
       system_usage_error: undefined,
     }))
     clearPendingPaneCredential(pane.id)
+    clearPaneOutputProbe(pane.id)
 
     const session_id = createId('session')
     try {
@@ -1515,6 +1546,7 @@ export default function App() {
       system_usage_error: undefined,
     }))
     clearPendingPaneCredential(pane_id)
+    clearPaneOutputProbe(pane_id)
   }
 
   const appendTerminalOutput = (session_id: string, data: string) => {
@@ -1522,14 +1554,7 @@ export default function App() {
     if (!pane || pane.zmodem_active) return
 
     const visibleData = pane.private_key_passphrase_origin === 'configured' ? stripConfiguredPassphrasePrompt(data) : data
-    const nextOutput = `${pane.terminal_output || ''}${visibleData}`
-
-    updatePaneById(pane.id, (current) => ({
-      ...current,
-      terminal_output: nextOutput.length > 200_000 ? nextOutput.slice(-200_000) : nextOutput,
-    }))
-
-    const nextPane = { ...pane, terminal_output: nextOutput }
+    const nextPane = { ...pane, terminal_output: appendPaneOutputProbe(pane.id, visibleData) }
     trackPendingPaneCredential(nextPane, visibleData)
 
     if (!nextPane.remote_features_ready && paneLooksAuthenticated(nextPane)) {
@@ -1663,6 +1688,7 @@ export default function App() {
       }
       systemUsageRequestIdsRef.current.clear()
       systemUsagePendingPaneIdsRef.current.clear()
+      paneOutputProbeBuffersRef.current.clear()
       unlistenSshDataRef.current?.()
       unlistenDeepLinkRef.current?.()
       unlistenAppUpdateProgressRef.current?.()

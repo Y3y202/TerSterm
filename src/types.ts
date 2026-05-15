@@ -105,3 +105,13 @@ export interface AppUpdateDownloadProgress {
   total_bytes?: number
   percent: number
 }
+
+export interface SshFileDownloadProgress {
+  session_id?: string
+  remote_path: string
+  local_path: string
+  filename: string
+  downloaded_bytes: number
+  total_bytes?: number
+  percent: number
+}

@@ -51,6 +51,7 @@ const MAIN_TRAY_ID: &str = "main-tray";
 const TRAY_SHOW_MENU_ID: &str = "tray-show";
 const TRAY_QUIT_MENU_ID: &str = "tray-quit";
 const APP_UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "app-update-download-progress";
+const SSH_FILE_DOWNLOAD_PROGRESS_EVENT: &str = "ssh-file-download-progress";
 const GITHUB_RELEASES_API: &str =
     "https://api.github.com/repos/Y3y202/TerSterm/releases?per_page=20";
 const GITHUB_RELEASES_ATOM: &str = "https://github.com/Y3y202/TerSterm/releases.atom";
@@ -143,6 +144,17 @@ struct AppUpdateInfo {
 struct AppUpdateDownloadProgress {
     status: String,
     filename: Option<String>,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    percent: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SshFileDownloadProgress {
+    session_id: Option<String>,
+    remote_path: String,
+    local_path: String,
+    filename: String,
     downloaded_bytes: u64,
     total_bytes: Option<u64>,
     percent: f32,
@@ -850,6 +862,8 @@ async fn ssh_download_file(
     mut config: ConnectionConfig,
     remote_path: String,
     session_id: Option<String>,
+    local_dir: Option<String>,
+    expected_size: Option<u64>,
 ) -> Result<String, String> {
     validate_connection_config(&config)?;
     let session_auth_secrets =
@@ -858,7 +872,15 @@ async fn ssh_download_file(
 
     tauri::async_runtime::spawn_blocking(move || {
         let processes = app.state::<OpenSshProcesses>();
-        run_remote_file_download(&app, &processes, session_id.as_deref(), config, remote_path)
+        run_remote_file_download(
+            &app,
+            &processes,
+            session_id.as_deref(),
+            config,
+            remote_path,
+            local_dir,
+            expected_size,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -890,14 +912,13 @@ fn save_local_file(
     app: AppHandle,
     filename: String,
     content_base64: String,
+    local_dir: Option<String>,
 ) -> Result<String, String> {
     let bytes = general_purpose::STANDARD
         .decode(content_base64)
         .map_err(|error| error.to_string())?;
-    let downloads = app
-        .path()
-        .download_dir()
-        .map_err(|error| error.to_string())?;
+    let downloads =
+        resolve_local_download_directory(&app, local_dir.as_deref()).map_err(|error| error.to_string())?;
     fs::create_dir_all(&downloads).map_err(|error| error.to_string())?;
     let local_path = unique_local_path(&downloads, &filename);
     fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
@@ -954,6 +975,35 @@ fn emit_app_update_download_progress(
         AppUpdateDownloadProgress {
             status: status.to_string(),
             filename: filename.map(|value| value.to_string()),
+            downloaded_bytes,
+            total_bytes,
+            percent,
+        },
+    )
+    .ok();
+}
+
+fn emit_ssh_file_download_progress(
+    app: &AppHandle,
+    session_id: Option<&str>,
+    remote_path: &str,
+    local_path: &Path,
+    filename: &str,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+) {
+    let total_bytes = total_bytes.filter(|value| *value > 0);
+    let percent = total_bytes
+        .map(|value| (downloaded_bytes as f32 / value as f32 * 100.0).clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+
+    app.emit(
+        SSH_FILE_DOWNLOAD_PROGRESS_EVENT,
+        SshFileDownloadProgress {
+            session_id: session_id.map(|value| value.to_string()),
+            remote_path: remote_path.to_string(),
+            local_path: local_path.to_string_lossy().to_string(),
+            filename: filename.to_string(),
             downloaded_bytes,
             total_bytes,
             percent,
@@ -1873,6 +1923,43 @@ fn build_ssh_command(
     command
 }
 
+fn openssh_remote_target(config: &ConnectionConfig, remote_path: &str) -> String {
+    format!(
+        "{}@{}:{}",
+        config.username,
+        config.host,
+        sftp_path(remote_path)
+    )
+}
+
+fn build_scp_command(
+    config: &ConnectionConfig,
+    private_key: Option<&PreparedPrivateKey>,
+    remote_path: &str,
+    local_path: &Path,
+) -> CommandBuilder {
+    let mut command = CommandBuilder::new("scp");
+    command.arg("-P");
+    command.arg(config.port.to_string());
+    command.arg("-o");
+    command.arg("ServerAliveInterval=30");
+    command.arg("-o");
+    command.arg("ConnectTimeout=15");
+    command.arg("-o");
+    command.arg("StrictHostKeyChecking=accept-new");
+    command.arg("-o");
+    command.arg("NumberOfPasswordPrompts=1");
+
+    if let Some(private_key) = private_key {
+        command.arg("-i");
+        command.arg(private_key.path.to_string_lossy().as_ref());
+    }
+
+    command.arg(openssh_remote_target(config, remote_path));
+    command.arg(local_path.to_string_lossy().as_ref());
+    command
+}
+
 fn normalize_remote_path(remote_path: &str) -> String {
     let trimmed = remote_path.trim();
     if trimmed.is_empty() {
@@ -1951,6 +2038,36 @@ fn unique_local_path(directory: &Path, filename: &str) -> PathBuf {
     }
 
     directory.join(format!("{stem}-{}{extension}", Uuid::new_v4()))
+}
+
+fn expand_local_directory_path(raw_path: &str) -> PathBuf {
+    let trimmed = raw_path.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+        if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+            let remainder = trimmed
+                .strip_prefix('~')
+                .unwrap_or_default()
+                .trim_start_matches(['/', '\\']);
+            return if remainder.is_empty() {
+                PathBuf::from(home)
+            } else {
+                PathBuf::from(home).join(remainder)
+            };
+        }
+    }
+
+    PathBuf::from(trimmed)
+}
+
+fn resolve_local_download_directory(
+    app: &AppHandle,
+    local_dir: Option<&str>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(local_dir) = local_dir.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(expand_local_directory_path(local_dir));
+    }
+
+    Ok(app.path().download_dir()?)
 }
 
 fn connect_sftp(
@@ -2225,10 +2342,6 @@ fn run_remote_file_list(
     config: ConnectionConfig,
     remote_path: String,
 ) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
-    if connection_uses_private_key(&config) {
-        return run_remote_file_list_openssh(processes, session_id, &config, &remote_path);
-    }
-
     match run_remote_file_list_ssh2(config.clone(), remote_path.clone()) {
         Ok(result) => Ok(result),
         Err(error) if should_fallback_to_openssh(&config, &*error) => {
@@ -2378,6 +2491,8 @@ fn run_remote_file_download(
     session_id: Option<&str>,
     config: ConnectionConfig,
     remote_path: String,
+    local_dir: Option<String>,
+    expected_size: Option<u64>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let remote_path = normalize_remote_path(&remote_path);
     let filename = Path::new(&remote_path)
@@ -2386,30 +2501,28 @@ fn run_remote_file_download(
         .map(sanitize_filename)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "download".to_string());
-    let downloads = app.path().download_dir()?;
+    let downloads = resolve_local_download_directory(app, local_dir.as_deref())?;
     fs::create_dir_all(&downloads)?;
     let local_path = unique_local_path(&downloads, &filename);
 
-    if connection_uses_private_key(&config) {
-        run_remote_file_download_openssh(
-            processes,
-            session_id,
-            &config,
-            &remote_path,
-            &local_path,
-        )?;
-        return Ok(local_path.to_string_lossy().to_string());
-    }
-
-    match run_remote_file_download_ssh2(&config, &remote_path, &local_path) {
+    match run_remote_file_download_ssh2(
+        app,
+        session_id,
+        &config,
+        &remote_path,
+        &local_path,
+        expected_size,
+    ) {
         Ok(()) => Ok(local_path.to_string_lossy().to_string()),
         Err(error) if should_fallback_to_openssh(&config, &*error) => {
             run_remote_file_download_openssh(
+                app,
                 processes,
                 session_id,
                 &config,
                 &remote_path,
                 &local_path,
+                expected_size,
             )?;
             Ok(local_path.to_string_lossy().to_string())
         }
@@ -2418,54 +2531,492 @@ fn run_remote_file_download(
 }
 
 fn run_remote_file_download_ssh2(
+    app: &AppHandle,
+    session_id: Option<&str>,
     config: &ConnectionConfig,
     remote_path: &str,
     local_path: &Path,
+    expected_size: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filename = local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
     let (_session, sftp) = connect_sftp(config)?;
-    let mut remote_file = sftp.open(Path::new(&sftp_path(remote_path)))?;
+    let sftp_path = sftp_path(remote_path);
+    let total_bytes = expected_size
+        .filter(|value| *value > 0)
+        .or_else(|| sftp.stat(Path::new(&sftp_path)).ok().and_then(|stat| stat.size));
+    let mut remote_file = sftp.open(Path::new(&sftp_path))?;
     let mut local_file = fs::File::create(local_path)?;
-    std::io::copy(&mut remote_file, &mut local_file)?;
+    let mut buffer = [0_u8; 65_536];
+    let mut downloaded_bytes = 0_u64;
+
+    emit_ssh_file_download_progress(
+        app,
+        session_id,
+        remote_path,
+        local_path,
+        filename,
+        downloaded_bytes,
+        total_bytes,
+    );
+
+    loop {
+        let read = remote_file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        local_file.write_all(&buffer[..read])?;
+        downloaded_bytes += read as u64;
+        emit_ssh_file_download_progress(
+            app,
+            session_id,
+            remote_path,
+            local_path,
+            filename,
+            downloaded_bytes,
+            total_bytes,
+        );
+    }
+
+    local_file.flush()?;
+    emit_ssh_file_download_progress(
+        app,
+        session_id,
+        remote_path,
+        local_path,
+        filename,
+        downloaded_bytes,
+        total_bytes.or(Some(downloaded_bytes)),
+    );
     Ok(())
 }
 
 fn run_remote_file_download_openssh(
+    app: &AppHandle,
     processes: &OpenSshProcesses,
     session_id: Option<&str>,
     config: &ConnectionConfig,
     remote_path: &str,
     local_path: &Path,
+    expected_size: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let start_marker = format!("TERSTERM_DOWNLOAD_BEGIN_{}", Uuid::new_v4().simple());
-    let end_marker = format!("TERSTERM_DOWNLOAD_END_{}", Uuid::new_v4().simple());
-    let fragment = format!(
-        "printf '%s\\n' {start}; base64 < {path}; printf '\\n%s\\n' {end}",
-        start = shell_quote(&start_marker),
-        end = shell_quote(&end_marker),
-        path = shell_quote(&sftp_path(remote_path)),
-    );
-    let command = format!("sh -lc {}", shell_quote(&fragment));
-    let output = run_openssh_exec_command_with_stdin_and_timeout(
+    let has_interactive_secret = config
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    if !has_interactive_secret {
+        return run_openssh_scp_download_noninteractive(
+            app,
+            processes,
+            session_id,
+            config,
+            remote_path,
+            local_path,
+            OPENSSH_FILE_TRANSFER_TIMEOUT,
+            expected_size,
+        );
+    }
+
+    run_openssh_scp_download_interactive(
+        app,
         processes,
         session_id,
         config,
-        &command,
-        None,
+        remote_path,
+        local_path,
         OPENSSH_FILE_TRANSFER_TIMEOUT,
-    )?;
-    let start = output
-        .find(&start_marker)
-        .ok_or("Unable to find download start marker")?;
-    let end = output
-        .find(&end_marker)
-        .ok_or("Unable to find download end marker")?;
-    let encoded = output[start + start_marker.len()..end]
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect::<String>();
-    let bytes = general_purpose::STANDARD.decode(encoded)?;
-    fs::write(local_path, bytes)?;
-    Ok(())
+        expected_size,
+    )
+}
+
+fn run_openssh_scp_download_noninteractive(
+    app: &AppHandle,
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_path: &str,
+    local_path: &Path,
+    timeout: Duration,
+    total_bytes: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let process_guard = register_openssh_process(processes, session_id);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let filename = local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let total_bytes = total_bytes.filter(|value| *value > 0);
+
+    let private_key = prepare_private_key_for_noninteractive_openssh(config)?;
+    let mut command = std::process::Command::new("scp");
+    configure_subprocess(&mut command);
+    command
+        .arg("-P")
+        .arg(config.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=0");
+
+    if let Some(private_key) = private_key.as_ref() {
+        command.arg("-i").arg(&private_key.path);
+    }
+
+    command
+        .arg(openssh_remote_target(config, remote_path))
+        .arg(local_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().ok_or("Unable to read OpenSSH stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Unable to read OpenSSH stderr")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).ok();
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).ok();
+        output
+    });
+    let started_at = Instant::now();
+    let mut last_reported_bytes = 0_u64;
+    let status;
+
+    emit_ssh_file_download_progress(
+        app,
+        session_id,
+        remote_path,
+        local_path,
+        filename,
+        last_reported_bytes,
+        total_bytes,
+    );
+
+    loop {
+        if process_guard.is_cancelled() {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command cancelled".into());
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            status = exit_status;
+            break;
+        }
+
+        if started_at.elapsed() > timeout {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command timed out".into());
+        }
+
+        let downloaded_bytes = fs::metadata(local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(last_reported_bytes);
+        if downloaded_bytes != last_reported_bytes {
+            last_reported_bytes = downloaded_bytes;
+            emit_ssh_file_download_progress(
+                app,
+                session_id,
+                remote_path,
+                local_path,
+                filename,
+                downloaded_bytes,
+                total_bytes,
+            );
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let combined = format!("{stdout}{stderr}");
+
+    if status.success() {
+        let downloaded_bytes = fs::metadata(local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(last_reported_bytes);
+        emit_ssh_file_download_progress(
+            app,
+            session_id,
+            remote_path,
+            local_path,
+            filename,
+            downloaded_bytes,
+            total_bytes.or(Some(downloaded_bytes)),
+        );
+        return Ok(());
+    }
+
+    let message = combined.trim();
+    if message.is_empty() {
+        return Err(format!("OpenSSH command failed with code {:?}", status.code()).into());
+    }
+
+    Err(message.to_string().into())
+}
+
+fn run_openssh_scp_download_interactive(
+    app: &AppHandle,
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_path: &str,
+    local_path: &Path,
+    timeout: Duration,
+    total_bytes: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let process_guard = register_openssh_process(processes, session_id);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let filename = local_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let total_bytes = total_bytes.filter(|value| *value > 0);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: 32,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let private_key = prepare_private_key(config)?;
+    let command = build_scp_command(config, private_key.as_ref(), remote_path, local_path);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let master = pair.master;
+    let slave = pair.slave;
+    let mut child = slave.spawn_command(command)?;
+    drop(slave);
+    if process_guard.is_cancelled() {
+        terminate_pty_child(&mut *child);
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let mut reader = master.try_clone_reader()?;
+    let mut writer = Some(master.take_writer()?);
+    let mut master = Some(master);
+    let (output_tx, output_rx) = mpsc::channel::<Option<String>>();
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+    let private_key_passphrase = config
+        .private_key_passphrase
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    let password = config
+        .password
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    if output_tx
+                        .send(Some(String::from_utf8_lossy(&buffer[..size]).to_string()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        output_tx.send(None).ok();
+        reader_done_tx.send(()).ok();
+    });
+
+    let started_at = Instant::now();
+    let mut output = String::new();
+    let mut prompt_buffer = String::new();
+    let mut password_sent = false;
+    let mut passphrase_sent = false;
+    let mut exit_status = None;
+    let mut last_reported_bytes = 0_u64;
+
+    emit_ssh_file_download_progress(
+        app,
+        session_id,
+        remote_path,
+        local_path,
+        filename,
+        last_reported_bytes,
+        total_bytes,
+    );
+
+    loop {
+        if process_guard.is_cancelled() {
+            shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
+            return Err("OpenSSH command cancelled".into());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            exit_status = Some(status);
+            break;
+        }
+
+        match output_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Some(data)) => {
+                output.push_str(&data);
+                prompt_buffer.push_str(&data);
+                if prompt_buffer.len() > 4096 {
+                    prompt_buffer = prompt_buffer
+                        .chars()
+                        .rev()
+                        .take(4096)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                }
+
+                let prompt = prompt_buffer.to_lowercase();
+                if !passphrase_sent && prompt.contains("passphrase") {
+                    if let Some(passphrase) = &private_key_passphrase {
+                        passphrase_sent = true;
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(format!("{passphrase}\n").as_bytes())?;
+                            writer.flush()?;
+                        }
+                    }
+                }
+
+                if !password_sent && prompt.contains("password:") {
+                    if let Some(password) = &password {
+                        password_sent = true;
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(format!("{password}\n").as_bytes())?;
+                            writer.flush()?;
+                        }
+                    }
+                }
+
+                let downloaded_bytes = fs::metadata(local_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(last_reported_bytes);
+                if downloaded_bytes != last_reported_bytes {
+                    last_reported_bytes = downloaded_bytes;
+                    emit_ssh_file_download_progress(
+                        app,
+                        session_id,
+                        remote_path,
+                        local_path,
+                        filename,
+                        downloaded_bytes,
+                        total_bytes,
+                    );
+                }
+            }
+            Ok(None) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if started_at.elapsed() > timeout {
+                    shutdown_pty_process(
+                        &mut *child,
+                        &mut master,
+                        &mut writer,
+                        Some(&reader_done_rx),
+                    );
+                    return Err("OpenSSH command timed out".into());
+                }
+
+                let downloaded_bytes = fs::metadata(local_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(last_reported_bytes);
+                if downloaded_bytes != last_reported_bytes {
+                    last_reported_bytes = downloaded_bytes;
+                    emit_ssh_file_download_progress(
+                        app,
+                        session_id,
+                        remote_path,
+                        local_path,
+                        filename,
+                        downloaded_bytes,
+                        total_bytes,
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if exit_status.is_some() {
+        drop(writer.take());
+        drop(master.take());
+        reader_done_rx.recv_timeout(Duration::from_millis(500)).ok();
+
+        loop {
+            match output_rx.try_recv() {
+                Ok(Some(data)) => output.push_str(&data),
+                Ok(None)
+                | Err(mpsc::TryRecvError::Empty)
+                | Err(mpsc::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    }
+
+    if process_guard.is_cancelled() {
+        shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let status = match exit_status {
+        Some(status) => status,
+        None => child.wait()?,
+    };
+    if status.success() {
+        let downloaded_bytes = fs::metadata(local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(last_reported_bytes);
+        emit_ssh_file_download_progress(
+            app,
+            session_id,
+            remote_path,
+            local_path,
+            filename,
+            downloaded_bytes,
+            total_bytes.or(Some(downloaded_bytes)),
+        );
+        return Ok(());
+    }
+
+    let message = output.trim();
+    if message.is_empty() {
+        return Err(format!("OpenSSH command failed with code {}", status.exit_code()).into());
+    }
+
+    Err(message.to_string().into())
 }
 
 fn parse_system_usage_output(
@@ -2531,11 +3082,6 @@ fn run_remote_system_usage(
     config: ConnectionConfig,
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
     let command = format!("sh -lc {}", shell_quote(system_usage_shell_fragment()));
-
-    if connection_uses_private_key(&config) {
-        let output = run_openssh_exec_command(processes, session_id, &config, &command)?;
-        return parse_system_usage_output(&output);
-    }
 
     match run_ssh2_exec_command(&config, &command) {
         Ok(output) => parse_system_usage_output(&output),

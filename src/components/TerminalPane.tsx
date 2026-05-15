@@ -28,6 +28,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  onSshFileDownloadProgress,
   onSshDataRaw,
   onSshDisconnected,
   saveLocalFile,
@@ -172,6 +173,13 @@ const formatBytes = (size?: number) => {
   return `${(size / 1024 / 1024).toFixed(1)} MB`
 }
 
+const DOWNLOAD_DIRECTORY_STORAGE_KEY = 'tersterm:download-directory'
+
+const readStoredDownloadDirectory = () => {
+  if (typeof localStorage === 'undefined') return ''
+  return localStorage.getItem(DOWNLOAD_DIRECTORY_STORAGE_KEY) || ''
+}
+
 const stripConfiguredPassphrasePrompt = (data: string) =>
   data.replace(/Enter passphrase for key[^\r\n]*:\s*/gi, '')
 
@@ -214,10 +222,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const resizeObserverRef = useRef<ResizeObserver>()
   const unlistenDataRef = useRef<(() => void)>()
   const unlistenDisconnectedRef = useRef<(() => void)>()
+  const unlistenDownloadProgressRef = useRef<(() => void)>()
   const inputBufferRef = useRef('')
   const refreshTimerRef = useRef<number>()
   const refreshRequestIdRef = useRef(0)
   const queuedRefreshPathRef = useRef<string>()
+  const activeFileDownloadRef = useRef<{
+    sessionId?: string
+    remotePath: string
+    fileName: string
+    totalBytes: number
+  } | null>(null)
   const authProbeBufferRef = useRef('')
   const authenticatedSessionIdRef = useRef<string>()
   const zmodemSentryRef = useRef<any>()
@@ -230,6 +245,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const [remoteFiles, setRemoteFiles, remoteFilesRef] = useStateRef<RemoteFileEntry[]>([])
   const [fileError, setFileError, fileErrorRef] = useStateRef('')
   const [fileLoading, setFileLoading, fileLoadingRef] = useStateRef(false)
+  const [downloadDirectory, setDownloadDirectory, downloadDirectoryRef] = useStateRef(readStoredDownloadDirectory())
   const [transferring, setTransferring] = useStateRef(false)
   const [dragActive, setDragActive] = useStateRef(false)
   const [, setZmodemActiveState, zmodemActiveRef] = useStateRef(false)
@@ -308,7 +324,9 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const zmodemProgressTitle = !zmodemProgress
     ? ''
     : zmodemProgress.source === 'file-manager'
-      ? t('fileUploading')
+      ? zmodemProgress.direction === 'download'
+        ? t('fileDownloading')
+        : t('fileUploading')
       : zmodemProgress.direction === 'upload'
         ? t('zmodemUploading')
         : t('zmodemDownloading')
@@ -447,6 +465,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       refreshTimerRef.current = undefined
     }
     queuedRefreshPathRef.current = undefined
+    activeFileDownloadRef.current = null
+    clearZmodemProgress('file-manager')
     setRemotePath('~')
     setRemoteFiles([])
     setFileError('')
@@ -584,6 +604,11 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const paneRemoteFeaturesReady = () => {
     const currentPane = getCurrentPane()
     return currentPane.status === 'connected' && Boolean(currentPane.session_id && currentPane.remote_features_ready)
+  }
+
+  const resolveDownloadDirectory = () => {
+    const trimmed = downloadDirectoryRef.current.trim()
+    return trimmed || undefined
   }
 
   const refreshFiles = async (path = remotePathRef.current) => {
@@ -767,12 +792,34 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     if (!currentPane.connection || !paneRemoteFeaturesReady() || entry.kind === 'directory') return
 
     setTransferring(true)
+    activeFileDownloadRef.current = {
+      sessionId: currentPane.session_id,
+      remotePath: entry.path,
+      fileName: entry.name,
+      totalBytes: entry.size || 0,
+    }
+    setZmodemProgress({
+      source: 'file-manager',
+      direction: 'download',
+      fileName: entry.name,
+      transferredBytes: 0,
+      totalBytes: entry.size || 0,
+    })
+
     try {
-      const localPath = await sshDownloadFile(currentPane.connection, entry.path, currentPane.session_id)
+      const localPath = await sshDownloadFile(
+        currentPane.connection,
+        entry.path,
+        currentPane.session_id,
+        resolveDownloadDirectory(),
+        entry.size,
+      )
       toast.success(i18n.t('downloadedTo', { path: localPath }))
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
     } finally {
+      activeFileDownloadRef.current = null
+      clearZmodemProgress('file-manager')
       setTransferring(false)
     }
   }
@@ -968,7 +1015,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             transferredBytes: details.size || zmodemProgressRef.current?.transferredBytes || 0,
             totalBytes: details.size || zmodemProgressRef.current?.totalBytes || 0,
           })
-          const localPath = await saveLocalFile(details.name, payloadsToBase64(payloads))
+          const localPath = await saveLocalFile(details.name, payloadsToBase64(payloads), resolveDownloadDirectory())
           toast.success(i18n.t('downloadedTo', { path: localPath }))
         })
         .catch((error: unknown) => {
@@ -992,6 +1039,18 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     authenticatedSessionIdRef.current = session_id
     latestPropsRef.current.onAuthenticated({ pane_id: getCurrentPane().id, session_id })
   }
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return
+
+    const trimmed = downloadDirectory.trim()
+    if (trimmed) {
+      localStorage.setItem(DOWNLOAD_DIRECTORY_STORAGE_KEY, trimmed)
+      return
+    }
+
+    localStorage.removeItem(DOWNLOAD_DIRECTORY_STORAGE_KEY)
+  }, [downloadDirectory])
 
   useEffect(() => {
     if (
@@ -1125,6 +1184,27 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       unlistenDisconnectedRef.current = unlisten
     })
 
+    void onSshFileDownloadProgress((progress) => {
+      const activeDownload = activeFileDownloadRef.current
+      if (!activeDownload) return
+      if (progress.remote_path !== activeDownload.remotePath) return
+      if (activeDownload.sessionId && progress.session_id && progress.session_id !== activeDownload.sessionId) return
+
+      setZmodemProgress({
+        source: 'file-manager',
+        direction: 'download',
+        fileName: progress.filename || activeDownload.fileName,
+        transferredBytes: progress.downloaded_bytes,
+        totalBytes: progress.total_bytes || activeDownload.totalBytes,
+      })
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten()
+        return
+      }
+      unlistenDownloadProgressRef.current = unlisten
+    })
+
     window.setTimeout(fitTerminal, 80)
 
     return () => {
@@ -1135,6 +1215,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       resizeObserverRef.current?.disconnect()
       unlistenDataRef.current?.()
       unlistenDisconnectedRef.current?.()
+      unlistenDownloadProgressRef.current?.()
       terminal.dispose()
     }
   }, [])
@@ -1317,6 +1398,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             </Tooltip>
             <input ref={fileInputRef} type="file" multiple hidden onChange={handleFileInput} />
             <input ref={zmodemInputRef} type="file" multiple hidden onChange={handleZmodemSendSelection} />
+          </div>
+
+          <div className="mt-2 grid gap-1.5">
+            <small className="text-[11px] text-[var(--text-muted)]">{t('downloadDirectoryHint')}</small>
+            <Input
+              value={downloadDirectory}
+              disabled={transferring}
+              onChange={(event) => setDownloadDirectory(event.target.value)}
+              placeholder={t('downloadDirectoryPlaceholder')}
+              className="h-8 rounded-lg px-2.5 text-xs"
+            />
           </div>
 
           <div className={cn('mt-2.5 max-h-56 overflow-auto rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-tab-strip)]', fileLoading && 'opacity-90')}>

@@ -8,6 +8,7 @@ import type {
   SshDataEvent,
   SshDataRawEvent,
   SshDisconnectedEvent,
+  SshFileDownloadProgress,
   SystemUsage,
 } from './types'
 
@@ -19,6 +20,16 @@ const mockSessions = new Map<string, { prompt: string; connected: boolean }>()
 const isTauriRuntime = () =>
   typeof window !== 'undefined' &&
   ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+
+const buildMockLocalPath = (filename: string, local_dir?: string) => {
+  const safeName = filename || 'download'
+  const trimmedDir = local_dir?.trim()
+  if (!trimmedDir) return `Downloads/${safeName}`
+
+  const baseDir = trimmedDir.replace(/[\\/]+$/, '')
+  const separator = baseDir.includes('\\') && !baseDir.includes('/') ? '\\' : '/'
+  return `${baseDir}${separator}${safeName}`
+}
 
 const emitMock = <T>(eventName: string, payload: T) => {
   mockBus.dispatchEvent(new CustomEvent(eventName, { detail: payload }))
@@ -201,20 +212,28 @@ export async function sshDownloadFile(
   config: ConnectionProfile,
   remote_path: string,
   session_id?: string,
+  local_dir?: string,
+  expected_size?: number,
 ) {
   if (isTauriRuntime()) {
-    return invoke<string>('ssh_download_file', { config, remotePath: remote_path, sessionId: session_id })
+    return invoke<string>('ssh_download_file', {
+      config,
+      remotePath: remote_path,
+      sessionId: session_id,
+      localDir: local_dir,
+      expectedSize: expected_size,
+    })
   }
 
-  return `Downloads/${remote_path.split('/').pop() || 'download'}`
+  return buildMockLocalPath(remote_path.split('/').pop() || 'download', local_dir)
 }
 
-export async function saveLocalFile(filename: string, content_base64: string) {
+export async function saveLocalFile(filename: string, content_base64: string, local_dir?: string) {
   if (isTauriRuntime()) {
-    return invoke<string>('save_local_file', { filename, contentBase64: content_base64 })
+    return invoke<string>('save_local_file', { filename, contentBase64: content_base64, localDir: local_dir })
   }
 
-  return `Downloads/${filename || 'download'}`
+  return buildMockLocalPath(filename || 'download', local_dir)
 }
 
 export async function setWindowCloseBehavior(behavior: 'tray' | 'exit') {
@@ -258,6 +277,16 @@ export async function onAppUpdateDownloadProgress(
 ): Promise<UnlistenFn> {
   if (isTauriRuntime()) {
     return listen<AppUpdateDownloadProgress>('app-update-download-progress', (event) => callback(event.payload))
+  }
+
+  return () => undefined
+}
+
+export async function onSshFileDownloadProgress(
+  callback: (payload: SshFileDownloadProgress) => void,
+): Promise<UnlistenFn> {
+  if (isTauriRuntime()) {
+    return listen<SshFileDownloadProgress>('ssh-file-download-progress', (event) => callback(event.payload))
   }
 
   return () => undefined
