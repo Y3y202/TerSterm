@@ -1,19 +1,23 @@
 import { useDeferredValue, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import { useTranslation } from 'react-i18next'
 import {
   Check,
   ChevronRight,
+  Copy,
   FolderOpen,
   FolderPlus,
   Globe,
   LayoutGrid,
   Monitor,
   Moon,
+  Minus,
   Plus,
   RefreshCcw,
-  Settings2,
+  Settings,
+  Square,
   Sun,
   X,
 } from 'lucide-react'
@@ -455,6 +459,8 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed, sidebarCollapsedRef] = useStateRef(readStoredSidebarCollapsed())
   const [updateChannel, setUpdateChannel, updateChannelRef] = useStateRef<UpdateChannel>(readStoredUpdateChannel())
   const [windowCloseBehavior, setWindowCloseBehavior] = useStateRef<WindowCloseBehavior>(readStoredWindowCloseBehavior())
+  const [desktopWindowReady, setDesktopWindowReady] = useState(false)
+  const [desktopWindowMaximized, setDesktopWindowMaximized] = useState(false)
   const [sidebarWidth, setSidebarWidth, sidebarWidthRef] = useStateRef(readStoredSidebarWidth())
   const [resizingSidebar, setResizingSidebar] = useState(false)
   const [selectedConnectionId, setSelectedConnectionId, selectedConnectionIdRef] = useStateRef<string | undefined>(undefined)
@@ -593,6 +599,39 @@ export default function App() {
     setSystemPrefersDark(mediaQuery.matches)
     mediaQuery.addEventListener('change', handleChange)
     return () => mediaQuery.removeEventListener('change', handleChange)
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    let unlistenResize: (() => void) | undefined
+
+    void (async () => {
+      try {
+        const appWindow = getCurrentWindow()
+        const maximized = await appWindow.isMaximized()
+        if (disposed) return
+
+        setDesktopWindowReady(true)
+        setDesktopWindowMaximized(maximized)
+        unlistenResize = await appWindow.onResized(async () => {
+          try {
+            const nextMaximized = await appWindow.isMaximized()
+            if (!disposed) {
+              setDesktopWindowMaximized(nextMaximized)
+            }
+          } catch {
+            // Ignore non-Tauri runtimes.
+          }
+        })
+      } catch {
+        // Window controls are only available in the Tauri runtime.
+      }
+    })()
+
+    return () => {
+      disposed = true
+      unlistenResize?.()
+    }
   }, [])
 
   useEffect(() => {
@@ -1700,8 +1739,91 @@ export default function App() {
     gridTemplateColumns: sidebarCollapsed ? 'minmax(0, 1fr)' : `${sidebarWidth}px 8px minmax(0, 1fr)`,
   }
 
+  const handleWindowMinimize = () => {
+    void getCurrentWindow().minimize().catch(() => {})
+  }
+
+  const handleWindowToggleMaximize = () => {
+    void getCurrentWindow().toggleMaximize().catch(() => {})
+  }
+
+  const handleWindowClose = () => {
+    void getCurrentWindow().close().catch(() => {})
+  }
+
+  const handleWindowDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    void getCurrentWindow().startDragging().catch(() => {})
+  }
+
   return (
-    <main className={cn('grid h-full min-h-0 gap-0 overflow-hidden bg-transparent p-2.5', resizingSidebar && 'select-none')} style={appShellStyle}>
+    <div className="flex h-full min-h-0 flex-col gap-1 overflow-hidden bg-transparent px-2.5 pb-2.5 pt-0">
+      <header className="flex h-9 items-center gap-3 bg-transparent px-1">
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-transparent text-[var(--text-primary)] transition hover:text-[var(--accent)]"
+              aria-label={sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}
+              onClick={() => setSidebarCollapsedState(!sidebarCollapsedRef.current)}
+            >
+              <SidebarToggleIcon collapsed={sidebarCollapsed} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}</TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-transparent text-[var(--text-primary)] transition hover:text-[var(--accent)]"
+              aria-label={t('interfaceSettings')}
+              onClick={() => setSettingsModalOpen(true)}
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>{t('interfaceSettings')}</TooltipContent>
+        </Tooltip>
+
+        <div
+          className="min-w-0 flex-1 self-stretch cursor-grab active:cursor-grabbing"
+          onMouseDown={handleWindowDragStart}
+          onDoubleClick={desktopWindowReady ? handleWindowToggleMaximize : undefined}
+        />
+        <div className={cn('flex items-center gap-1 transition-opacity', !desktopWindowReady && 'pointer-events-none opacity-0')}>
+            <button
+              type="button"
+              aria-label="Minimize window"
+              className="grid h-8 w-8 place-items-center bg-transparent text-[var(--text-muted)] transition hover:text-[var(--text-primary)]"
+              disabled={!desktopWindowReady}
+              onClick={handleWindowMinimize}
+            >
+              <Minus className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              aria-label={desktopWindowMaximized ? 'Restore window' : 'Maximize window'}
+              className="grid h-8 w-8 place-items-center bg-transparent text-[var(--text-muted)] transition hover:text-[var(--text-primary)]"
+              disabled={!desktopWindowReady}
+              onClick={handleWindowToggleMaximize}
+            >
+              {desktopWindowMaximized ? <Copy className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+            </button>
+            <button
+              type="button"
+              aria-label="Close window"
+              className="grid h-8 w-8 place-items-center bg-transparent text-[var(--text-muted)] transition hover:text-[#d45b5b]"
+              disabled={!desktopWindowReady}
+              onClick={handleWindowClose}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+      </header>
+
+      <main className={cn('grid min-h-0 flex-1 gap-0 overflow-hidden bg-transparent', resizingSidebar && 'select-none')} style={appShellStyle}>
       {!sidebarCollapsed && (
         <aside className="flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[24px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
           <div className="grid grid-cols-[minmax(0,1fr)_40px] gap-2 max-[640px]:grid-cols-1">
@@ -1806,16 +1928,6 @@ export default function App() {
             )}
           </div>
 
-          <div className="pt-0.5">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="secondary" size="icon" className="h-9 w-9 rounded-lg" aria-label={t('interfaceSettings')} onClick={() => setSettingsModalOpen(true)}>
-                  <Settings2 className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('interfaceSettings')}</TooltipContent>
-            </Tooltip>
-          </div>
         </aside>
       )}
 
@@ -1826,29 +1938,16 @@ export default function App() {
       )}
 
       <section className="flex min-h-0 min-w-0 flex-col gap-2.5 overflow-hidden rounded-[24px] border border-[rgba(255,255,255,0.18)] bg-[var(--surface-shell)] p-0.5">
-        <header className="flex min-h-[52px] flex-wrap items-center justify-between gap-3 rounded-[20px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-2 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
+        <header className="flex min-h-[42px] flex-wrap items-center justify-between gap-3 rounded-[20px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-1 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
           <div className="min-w-0 flex-1 max-md:w-full">
-            <div aria-label={t('sessionList')} className="relative flex min-w-0 items-end gap-1 overflow-x-auto pl-10 pr-0.5 pb-0 pt-0.5">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    className="absolute left-0 top-1 z-[2] inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] text-[var(--text-primary)] opacity-80 shadow-[inset_0_1px_0_var(--surface-highlight)] transition hover:bg-[var(--surface-panel-strong)] hover:text-[var(--accent)] hover:opacity-100"
-                    aria-label={sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}
-                    onClick={() => setSidebarCollapsedState(!sidebarCollapsedRef.current)}
-                  >
-                    <SidebarToggleIcon collapsed={sidebarCollapsed} />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}</TooltipContent>
-              </Tooltip>
-
+            <div aria-label={t('sessionList')} className="relative flex min-w-0 items-end gap-1 overflow-x-auto pr-0.5 pb-0 pt-0.5">
               {panes.map((pane) => (
                 <button
                   key={pane.id}
                   className={cn(
-                    'relative z-[1] inline-flex h-8 max-w-[172px] items-center gap-2 rounded-t-[10px] rounded-b-[4px] border border-transparent border-b-0 bg-[var(--surface-tab)] px-2.5 pb-2 pt-1 text-left text-[12px] text-[var(--text-muted)] transition hover:bg-[var(--surface-tab-active)] hover:text-[var(--text-primary)]',
+                    'relative z-[1] inline-flex h-8 max-w-[172px] items-center gap-2 bg-transparent px-2.5 pb-2 pt-1 text-left text-[12px] text-[var(--text-muted)] transition hover:text-[var(--text-primary)]',
                     pane.id === activePaneId &&
-                      'border-[var(--border-subtle)] bg-[var(--surface-tab-active)] text-[var(--text-primary)] shadow-[inset_0_1px_0_var(--surface-highlight)]',
+                      'text-[var(--text-primary)]',
                     pane.status === 'connecting' && 'text-amber-900',
                     pane.status === 'error' && 'text-rose-900',
                     pane.status === 'closed' && 'opacity-85',
@@ -1888,9 +1987,9 @@ export default function App() {
                 <TooltipTrigger asChild>
                   <ContextMenuTrigger asChild>
                     <Button
-                      variant="secondary"
+                      variant="ghost"
                       size="icon"
-                      className="text-[var(--text-primary)] hover:text-[var(--accent)]"
+                      className="bg-transparent text-[var(--text-primary)] hover:bg-transparent hover:text-[var(--accent)]"
                       aria-label={t('workspaceLayoutContextHint')}
                     >
                       <LayoutGrid className="h-4 w-4" />
@@ -1917,7 +2016,16 @@ export default function App() {
               <Tooltip>
                 <TooltipTrigger asChild>
                   <PopoverTrigger asChild>
-                    <Button variant={syncInputEnabled ? 'default' : 'secondary'} size="icon" className={cn(!syncInputEnabled && 'text-[var(--text-primary)] hover:text-[var(--accent)]')} aria-label={t('syncInput')} title={t('syncInput')}>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className={cn(
+                        'bg-transparent hover:bg-transparent',
+                        syncInputEnabled ? 'text-[var(--accent)]' : 'text-[var(--text-primary)] hover:text-[var(--accent)]',
+                      )}
+                      aria-label={t('syncInput')}
+                      title={t('syncInput')}
+                    >
                       <RefreshCcw className="h-4 w-4" />
                     </Button>
                   </PopoverTrigger>
@@ -2355,6 +2463,7 @@ export default function App() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </main>
+      </main>
+    </div>
   )
 }

@@ -59,8 +59,8 @@ const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Y3y202/TerSterm/releases/download/";
 const NO_MATCHING_RELEASE_ERROR: &str = "No matching release found";
 const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
-const DEFAULT_WINDOW_WIDTH: f64 = 1280.0;
-const DEFAULT_WINDOW_HEIGHT: f64 = 820.0;
+const DEFAULT_WINDOW_WIDTH: f64 = 1665.0;
+const DEFAULT_WINDOW_HEIGHT: f64 = 1039.0;
 const OPENSSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const OPENSSH_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -225,6 +225,9 @@ struct SessionAuthSecrets {
 
 #[derive(Default)]
 struct AppClosing(AtomicBool);
+
+#[derive(Default)]
+struct MainWindowStateReady(AtomicBool);
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum WindowCloseBehavior {
@@ -3920,6 +3923,7 @@ fn main() {
         .manage(OpenSshProcesses::default())
         .manage(SshSessionSecrets::default())
         .manage(AppClosing::default())
+        .manage(MainWindowStateReady::default())
         .manage(WindowCloseBehaviorState::default())
         .manage(AppLocaleState::default())
         .manage(PersistedMainWindowState::default())
@@ -3947,6 +3951,15 @@ fn main() {
             }
 
             if matches!(event, tauri::WindowEvent::Resized(_)) {
+                if !window
+                    .app_handle()
+                    .state::<MainWindowStateReady>()
+                    .0
+                    .load(Ordering::Relaxed)
+                {
+                    return;
+                }
+
                 if let Some(main_window) = window.app_handle().get_webview_window(window.label()) {
                     persist_main_window_state(&main_window);
                 }
@@ -4026,6 +4039,10 @@ fn main() {
                 .expect("main window not found");
             window.set_title("TerSterm").ok();
             initialize_main_window_state(&window);
+            app.state::<MainWindowStateReady>()
+                .0
+                .store(true, Ordering::Relaxed);
+            window.show().ok();
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -4108,8 +4125,8 @@ mod tests {
     #[test]
     fn updates_saved_window_size_while_not_maximized() {
         let state = PersistedWindowState {
-            width: 1280.0,
-            height: 820.0,
+            width: 1665.0,
+            height: 1039.0,
             maximized: false,
         };
 

@@ -254,10 +254,10 @@ export async function checkAppUpdate(allow_prerelease = false): Promise<AppUpdat
   }
 
   return {
-    current_version: '0.1.6',
-    latest_version: '0.1.6',
-    release_name: 'TerSterm 0.1.6',
-    release_tag: 'v0.1.6',
+    current_version: '0.1.7',
+    latest_version: '0.1.7',
+    release_name: 'TerSterm 0.1.7',
+    release_tag: 'v0.1.7',
     release_url: 'https://github.com/Y3y202/TerSterm/releases/latest',
     prerelease: false,
     update_available: false,

@@ -1268,15 +1268,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
           })} />
           <div className="flex min-w-0 items-center gap-2">
             <div className="truncate text-[13px] font-medium text-[var(--text-strong)]">{props.pane.title}</div>
-            <span className="rounded bg-[var(--surface-tab-strip)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">
-              {statusText}
-            </span>
+            {props.pane.status !== 'connected' && (
+              <span className="rounded bg-[var(--surface-tab-strip)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">
+                {statusText}
+              </span>
+            )}
           </div>
         </div>
 
         <div className="flex min-w-0 items-center gap-2">
           {isConnected && (
-            <div className="hidden flex-wrap items-center justify-end gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-[var(--text-muted)] xl:flex">
+            <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-[var(--text-muted)] max-sm:hidden">
               {props.pane.system_usage ? (
                 <>
                   <span className={resourceBadgeClass}>CPU {formatPercent(props.pane.system_usage.cpu_percent)}</span>
@@ -1293,7 +1295,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             </div>
           )}
 
-          <div className="flex items-center gap-0.5 rounded-md border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-0.5 shadow-[inset_0_1px_0_var(--surface-highlight)]">
+          <div className="flex items-center gap-0.5">
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
