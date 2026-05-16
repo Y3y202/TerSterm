@@ -5,6 +5,7 @@ import type {
   AppUpdateInfo,
   ConnectionProfile,
   RemoteFileList,
+  RemoteFilePermissions,
   SshDataEvent,
   SshDataRawEvent,
   SshDisconnectedEvent,
@@ -208,6 +209,40 @@ export async function sshUploadFile(
   return `${remote_path || '~'}/${filename}`
 }
 
+export async function sshCreateDirectory(
+  config: ConnectionProfile,
+  remote_path: string,
+  name: string,
+  session_id?: string,
+) {
+  if (isTauriRuntime()) {
+    return invoke<string>('ssh_create_directory', {
+      config,
+      remotePath: remote_path,
+      name,
+      sessionId: session_id,
+    })
+  }
+
+  return `${remote_path || '~'}/${name}`
+}
+
+export async function sshDeletePath(
+  config: ConnectionProfile,
+  remote_path: string,
+  recursive = true,
+  session_id?: string,
+) {
+  if (isTauriRuntime()) {
+    return invoke<void>('ssh_delete_path', {
+      config,
+      remotePath: remote_path,
+      recursive,
+      sessionId: session_id,
+    })
+  }
+}
+
 export async function sshDownloadFile(
   config: ConnectionProfile,
   remote_path: string,
@@ -228,12 +263,62 @@ export async function sshDownloadFile(
   return buildMockLocalPath(remote_path.split('/').pop() || 'download', local_dir)
 }
 
+export async function sshGetFilePermissions(
+  config: ConnectionProfile,
+  remote_path: string,
+  session_id?: string,
+): Promise<RemoteFilePermissions> {
+  if (isTauriRuntime()) {
+    return invoke<RemoteFilePermissions>('ssh_get_file_permissions', {
+      config,
+      remotePath: remote_path,
+      sessionId: session_id,
+    })
+  }
+
+  return {
+    path: remote_path,
+    name: remote_path.split('/').pop() || remote_path,
+    kind: remote_path.endsWith('/') ? 'directory' : 'file',
+    mode: '755',
+    owner: 'root',
+  }
+}
+
+export async function sshSetFilePermissions(
+  config: ConnectionProfile,
+  remote_path: string,
+  mode: string,
+  owner?: string,
+  recursive = false,
+  session_id?: string,
+) {
+  if (isTauriRuntime()) {
+    return invoke<void>('ssh_set_file_permissions', {
+      config,
+      remotePath: remote_path,
+      mode,
+      owner,
+      recursive,
+      sessionId: session_id,
+    })
+  }
+}
+
 export async function saveLocalFile(filename: string, content_base64: string, local_dir?: string) {
   if (isTauriRuntime()) {
     return invoke<string>('save_local_file', { filename, contentBase64: content_base64, localDir: local_dir })
   }
 
   return buildMockLocalPath(filename || 'download', local_dir)
+}
+
+export async function pickLocalDirectory(initial_dir?: string) {
+  if (isTauriRuntime()) {
+    return invoke<string | null>('pick_local_directory', { initialDir: initial_dir })
+  }
+
+  return initial_dir || 'Downloads'
 }
 
 export async function setWindowCloseBehavior(behavior: 'tray' | 'exit') {

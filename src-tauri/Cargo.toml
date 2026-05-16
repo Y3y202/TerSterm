@@ -1,6 +1,6 @@
 [package]
 name = "tersterm"
-version = "0.1.11"
+version = "0.1.12"
 description = "TerSterm SSH manager"
 authors = ["TerSterm"]
 edition = "2021"
@@ -20,3 +20,4 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tauri-plugin-deep-link = "2.4.9"
 tauri-plugin-single-instance = { version = "2.4.2", features = ["deep-link"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+rfd = "0.15"

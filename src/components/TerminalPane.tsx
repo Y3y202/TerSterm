@@ -1,4 +1,5 @@
 import {
+  type CSSProperties,
   forwardRef,
   useEffect,
   useImperativeHandle,
@@ -15,24 +16,26 @@ import '@xterm/xterm/css/xterm.css'
 import Zmodem from 'zmodem.js'
 import {
   ArrowUp,
-  Download,
   File as FileIcon,
   Folder,
   FolderOpen,
   Link2,
-  Power,
   RefreshCw,
   SquareTerminal,
   Upload,
-  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   onSshFileDownloadProgress,
   onSshDataRaw,
   onSshDisconnected,
+  pickLocalDirectory,
   saveLocalFile,
+  sshCreateDirectory,
+  sshDeletePath,
   sshDownloadFile,
+  sshGetFilePermissions,
+  sshSetFilePermissions,
   sshListFiles,
   sshResize,
   sshUploadFile,
@@ -41,7 +44,7 @@ import {
 import i18n from '../i18n'
 import { cn } from '../lib/utils'
 import { useStateRef } from '../lib/use-state-ref'
-import type { ConnectionProfile, RemoteFileEntry, SshPane } from '../types'
+import type { ConnectionProfile, RemoteFileEntry, RemoteFilePermissions, SshPane } from '../types'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -53,6 +56,15 @@ import {
   AlertDialogTitle,
 } from './ui/alert-dialog'
 import { Button } from './ui/button'
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from './ui/context-menu'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from './ui/dialog'
 import { Input } from './ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 
@@ -208,6 +220,27 @@ const outputLooksAuthenticated = (output: string) => {
   )
 }
 
+const normalizePermissionMode = (mode: string) => {
+  const digits = mode.replace(/[^0-7]/g, '')
+  if (!digits) return '755'
+  return digits.slice(-4)
+}
+
+const modeToTriples = (mode: string) => {
+  const normalized = normalizePermissionMode(mode)
+  const subjectDigits = normalized.padStart(3, '0').slice(-3).split('').map((digit) => Number.parseInt(digit, 10) || 0)
+  return subjectDigits.map((digit) => ({
+    read: Boolean(digit & 4),
+    write: Boolean(digit & 2),
+    execute: Boolean(digit & 1),
+  }))
+}
+
+const triplesToMode = (
+  triples: Array<{ read: boolean; write: boolean; execute: boolean }>,
+  prefix = '',
+) => `${prefix}${triples.map((triple) => (triple.read ? 4 : 0) + (triple.write ? 2 : 0) + (triple.execute ? 1 : 0)).join('')}`
+
 export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(function TerminalPane(
   props,
   ref,
@@ -270,6 +303,18 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     sessionId: string
     fileLabel: string
   } | null>(null)
+  const uploadTargetPathRef = useRef<string>()
+  const [newFolderDraft, setNewFolderDraft] = useState<{ parentPath: string; name: string } | null>(null)
+  const [deleteEntry, setDeleteEntry] = useState<RemoteFileEntry | null>(null)
+  const [permissionEntry, setPermissionEntry] = useState<RemoteFilePermissions | null>(null)
+  const [permissionDialogOpen, setPermissionDialogOpen] = useState(false)
+  const [permissionLoading, setPermissionLoading] = useState(false)
+  const [permissionSubmitting, setPermissionSubmitting] = useState(false)
+  const [permissionDraft, setPermissionDraft] = useState({
+    mode: '755',
+    owner: '',
+    recursive: false,
+  })
 
   useEffect(() => {
     latestPropsRef.current = props
@@ -279,17 +324,6 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
   const isConnected = props.pane.status === 'connected' && Boolean(props.pane.session_id)
   const remoteFeaturesReady = isConnected && Boolean(props.pane.remote_features_ready)
-  const statusText =
-    props.pane.status === 'connecting'
-      ? t('statusConnecting')
-      : props.pane.status === 'connected'
-        ? t('statusConnected')
-        : props.pane.status === 'error'
-          ? t('statusError')
-          : props.pane.status === 'closed'
-            ? t('statusClosed')
-            : t('statusDisconnected')
-
   const fileManagerStatusText = !remoteFeaturesReady
     ? t('waitAuthForFiles')
     : fileLoading
@@ -474,6 +508,14 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     setTransferring(false)
     setDragActive(false)
     setFileManagerOpen(false)
+    uploadTargetPathRef.current = undefined
+    setNewFolderDraft(null)
+    setDeleteEntry(null)
+    setPermissionEntry(null)
+    setPermissionDialogOpen(false)
+    setPermissionLoading(false)
+    setPermissionSubmitting(false)
+    setPermissionDraft({ mode: '755', owner: '', recursive: false })
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -683,6 +725,122 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     }
   }
 
+  const openNewFolderDialog = (parentPath = remotePathRef.current) => {
+    if (!paneRemoteFeaturesReady()) {
+      toast.warning(i18n.t('finishAuthBeforeTransfer'))
+      return
+    }
+
+    setNewFolderDraft({ parentPath, name: '' })
+  }
+
+  const createDirectory = async () => {
+    const currentPane = getCurrentPane()
+    const draft = newFolderDraft
+    if (!draft?.name.trim() || !currentPane.connection || !paneRemoteFeaturesReady()) return
+
+    setTransferring(true)
+    try {
+      await sshCreateDirectory(currentPane.connection, draft.parentPath, draft.name.trim(), currentPane.session_id)
+      toast.success(i18n.t('folderCreated'))
+      setNewFolderDraft(null)
+      await refreshFiles(draft.parentPath)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setTransferring(false)
+    }
+  }
+
+  const openDownloadDialog = async (entry: RemoteFileEntry) => {
+    if (entry.kind === 'directory') return
+    try {
+      const selectedPath = await pickLocalDirectory(resolveDownloadDirectory())
+      if (!selectedPath) return
+      setDownloadDirectory(selectedPath)
+      await downloadFile(entry, selectedPath)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  const openPermissionsDialog = async (entry: RemoteFileEntry) => {
+    const currentPane = getCurrentPane()
+    if (!currentPane.connection || !paneRemoteFeaturesReady()) return
+
+    setPermissionDialogOpen(true)
+    setPermissionLoading(true)
+    setPermissionEntry(null)
+
+    try {
+      const details = await sshGetFilePermissions(currentPane.connection, entry.path, currentPane.session_id)
+      setPermissionEntry(details)
+      setPermissionDraft({
+        mode: normalizePermissionMode(details.mode),
+        owner: details.owner || '',
+        recursive: false,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setPermissionDialogOpen(false)
+      toast.error(message)
+    } finally {
+      setPermissionLoading(false)
+    }
+  }
+
+  const applyPermissions = async () => {
+    const currentPane = getCurrentPane()
+    if (!currentPane.connection || !permissionEntry) return
+
+    setPermissionSubmitting(true)
+    try {
+      await sshSetFilePermissions(
+        currentPane.connection,
+        permissionEntry.path,
+        normalizePermissionMode(permissionDraft.mode),
+        permissionDraft.owner.trim() || undefined,
+        permissionDraft.recursive,
+        currentPane.session_id,
+      )
+      toast.success(i18n.t('permissionsSaved'))
+      setPermissionDialogOpen(false)
+      const refreshed = await sshGetFilePermissions(currentPane.connection, permissionEntry.path, currentPane.session_id)
+      setPermissionEntry(refreshed)
+      setPermissionDraft({
+        mode: normalizePermissionMode(refreshed.mode),
+        owner: refreshed.owner || '',
+        recursive: false,
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPermissionSubmitting(false)
+    }
+  }
+
+  const confirmDeleteEntry = (entry: RemoteFileEntry) => {
+    setDeleteEntry(entry)
+  }
+
+  const deleteRemoteEntry = async () => {
+    const currentPane = getCurrentPane()
+    const entry = deleteEntry
+    if (!entry || !currentPane.connection || !paneRemoteFeaturesReady()) return
+
+    setTransferring(true)
+    try {
+      await sshDeletePath(currentPane.connection, entry.path, true, currentPane.session_id)
+      toast.success(i18n.t('deleted'))
+      setDeleteEntry(null)
+      await refreshFiles(remotePathRef.current)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setTransferring(false)
+    }
+  }
+
   const enterDirectory = async (entry: RemoteFileEntry) => {
     if (entry.kind !== 'directory') return
     await refreshFiles(entry.path)
@@ -774,20 +932,23 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     }
   }
 
-  const chooseUploadFiles = () => {
+  const chooseUploadFiles = (targetPath = remotePathRef.current) => {
     if (!paneRemoteFeaturesReady()) {
       toast.warning(i18n.t('finishAuthBeforeUpload'))
       return
     }
 
+    uploadTargetPathRef.current = targetPath
     fileInputRef.current?.click()
   }
 
   const handleFileInput = (event: ChangeEvent<HTMLInputElement>) => {
-    void uploadFiles(Array.from(event.target.files || []))
+    const targetPath = uploadTargetPathRef.current || remotePathRef.current
+    uploadTargetPathRef.current = undefined
+    void uploadFiles(Array.from(event.target.files || []), targetPath)
   }
 
-  const downloadFile = async (entry: RemoteFileEntry) => {
+  const downloadFile = async (entry: RemoteFileEntry, localDirectory = resolveDownloadDirectory()) => {
     const currentPane = getCurrentPane()
     if (!currentPane.connection || !paneRemoteFeaturesReady() || entry.kind === 'directory') return
 
@@ -811,7 +972,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         currentPane.connection,
         entry.path,
         currentPane.session_id,
-        resolveDownloadDirectory(),
+        localDirectory,
         entry.size,
       )
       toast.success(i18n.t('downloadedTo', { path: localPath }))
@@ -1233,8 +1394,37 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     return `${Math.max(0, used).toFixed(1)}/${Math.max(0, total).toFixed(1)}G`
   }
 
-  const actionButtonClass = 'h-7 w-7 rounded-md text-[var(--text-primary)] opacity-80 transition hover:bg-[var(--surface-panel-strong)] hover:text-[var(--accent)] hover:opacity-100 disabled:text-[var(--text-muted)] disabled:opacity-70'
-  const resourceBadgeClass = 'rounded-full border border-[var(--accent-soft)] bg-[var(--accent-soft)] px-2 py-0.5 text-[var(--accent)]'
+  const actionButtonClass = 'h-7 w-7 rounded-md border border-white/10 text-slate-300 opacity-90 transition hover:bg-white/10 hover:text-white hover:opacity-100 disabled:border-white/5 disabled:text-slate-500 disabled:opacity-60'
+  const resourceBadgeClass = 'rounded-full border border-white/10 bg-white/[0.06] px-2 py-0.5 text-[rgba(232,240,246,0.88)] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
+  const resourceStatusContent = props.pane.system_usage ? (
+    <>
+      <span className={resourceBadgeClass}>CPU {formatPercent(props.pane.system_usage.cpu_percent)}</span>
+      <span className={resourceBadgeClass}>{t('resourceMemory')} {formatGbPair(props.pane.system_usage.memory_used_gb, props.pane.system_usage.memory_total_gb)}</span>
+      <span className={resourceBadgeClass}>{t('resourceStorage')} {formatGbPair(props.pane.system_usage.storage_used_gb, props.pane.system_usage.storage_total_gb)}</span>
+    </>
+  ) : props.pane.system_usage_loading ? (
+    <span className={resourceBadgeClass} title={t('resourceLoadingTitle')}>{t('resourceLoading')}</span>
+  ) : props.pane.system_usage_error ? (
+    <span className={resourceBadgeClass} title={props.pane.system_usage_error}>{t('resourceError')}</span>
+  ) : (
+    <span className={resourceBadgeClass}>{t('resourceUnknown')}</span>
+  )
+  const permissionTriples = modeToTriples(permissionDraft.mode)
+  const setPermissionTriple = (
+    subjectIndex: number,
+    field: 'read' | 'write' | 'execute',
+    checked: boolean,
+  ) => {
+    const nextTriples = modeToTriples(permissionDraft.mode)
+    nextTriples[subjectIndex] = {
+      ...nextTriples[subjectIndex],
+      [field]: checked,
+    }
+    setPermissionDraft((current) => ({
+      ...current,
+      mode: triplesToMode(nextTriples),
+    }))
+  }
 
   return (
     <section
@@ -1258,81 +1448,6 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         void handleDrop(event)
       }}
     >
-      <header className="flex min-h-[42px] items-center justify-between gap-3 border-b border-[var(--border-subtle)] px-3.5 py-2">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <span className={cn('mt-0.5 h-2.5 w-2.5 rounded-full bg-slate-300', {
-            'bg-[var(--accent)]': props.pane.status === 'connected',
-            'bg-amber-400': props.pane.status === 'connecting',
-            'bg-rose-400': props.pane.status === 'error',
-            'bg-slate-400': props.pane.status === 'closed',
-          })} />
-          <div className="flex min-w-0 items-center gap-2">
-            <div className="truncate text-[13px] font-medium text-[var(--text-strong)]">{props.pane.title}</div>
-            {props.pane.status !== 'connected' && (
-              <span className="rounded bg-[var(--surface-tab-strip)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">
-                {statusText}
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex min-w-0 items-center gap-2">
-          {isConnected && (
-            <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-[var(--text-muted)] max-sm:hidden">
-              {props.pane.system_usage ? (
-                <>
-                  <span className={resourceBadgeClass}>CPU {formatPercent(props.pane.system_usage.cpu_percent)}</span>
-                  <span className={resourceBadgeClass}>{t('resourceMemory')} {formatGbPair(props.pane.system_usage.memory_used_gb, props.pane.system_usage.memory_total_gb)}</span>
-                  <span className={resourceBadgeClass}>{t('resourceStorage')} {formatGbPair(props.pane.system_usage.storage_used_gb, props.pane.system_usage.storage_total_gb)}</span>
-                </>
-              ) : props.pane.system_usage_loading ? (
-                <span className={resourceBadgeClass} title={t('resourceLoadingTitle')}>{t('resourceLoading')}</span>
-              ) : props.pane.system_usage_error ? (
-                <span className={resourceBadgeClass} title={props.pane.system_usage_error}>{t('resourceError')}</span>
-              ) : (
-                <span className={resourceBadgeClass}>{t('resourceUnknown')}</span>
-              )}
-            </div>
-          )}
-
-          <div className="flex items-center gap-0.5">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
-                  event.stopPropagation()
-                  void openFileManager()
-                }}>
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('fileManager')}</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
-                  event.stopPropagation()
-                  props.onDisconnect(props.pane.id)
-                }}>
-                  <Power className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('disconnect')}</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="iconSm" className={actionButtonClass} onClick={(event) => {
-                  event.stopPropagation()
-                  props.onClose(props.pane.id)
-                }}>
-                  <X className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('close')}</TooltipContent>
-            </Tooltip>
-          </div>
-        </div>
-      </header>
-
       {zmodemProgress && (
         <div className="border-b border-[var(--border-subtle)] bg-[var(--surface-panel)] px-4 py-2.5">
           <div className="flex items-start justify-between gap-3">
@@ -1360,92 +1475,150 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         </div>
       )}
 
-      {fileManagerOpen && (
-        <div className="border-b border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-2.5" onMouseDown={(event) => event.stopPropagation()}>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              value={remotePath}
-              disabled={fileLoading || transferring}
-              onChange={(event) => setRemotePath(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  void refreshFiles()
-                }
-              }}
-              className="h-8 flex-1 rounded-lg px-2.5 text-xs"
-            />
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="secondary" size="iconSm" disabled={fileLoading || transferring} onClick={() => void refreshFiles(`${remotePath}/..`)}>
-                  <ArrowUp className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('parentDirectory')}</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="secondary" size="iconSm" disabled={transferring} onClick={() => void refreshFiles()}>
-                  <RefreshCw className={cn('h-4 w-4', fileLoading && 'animate-spin')} />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('refresh')}</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="secondary" size="iconSm" disabled={transferring} onClick={chooseUploadFiles}>
-                  <Upload className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('uploadFile')}</TooltipContent>
-            </Tooltip>
-            <input ref={fileInputRef} type="file" multiple hidden onChange={handleFileInput} />
-            <input ref={zmodemInputRef} type="file" multiple hidden onChange={handleZmodemSendSelection} />
-          </div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div
+          ref={terminalHostRef}
+          className="terminal-host h-full min-h-0"
+          style={{ '--terminal-bg': resolveTerminalTheme().background } as CSSProperties}
+        />
 
-          <div className="mt-2 grid gap-1.5">
-            <small className="text-[11px] text-[var(--text-muted)]">{t('downloadDirectoryHint')}</small>
-            <Input
-              value={downloadDirectory}
-              disabled={transferring}
-              onChange={(event) => setDownloadDirectory(event.target.value)}
-              placeholder={t('downloadDirectoryPlaceholder')}
-              className="h-8 rounded-lg px-2.5 text-xs"
-            />
-          </div>
-
-          <div className={cn('mt-2.5 max-h-56 overflow-auto rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-tab-strip)]', fileLoading && 'opacity-90')}>
-            {remoteFiles.map((entry) => (
-              <button
-                key={`${entry.path}-${entry.name}`}
-                type="button"
-                className="grid w-full grid-cols-[20px_minmax(0,1fr)_auto_auto_auto] items-center gap-3 border-b border-[var(--border-subtle)] px-3 py-2 text-left text-xs last:border-b-0 hover:bg-[var(--surface-tab-active)] max-md:grid-cols-[20px_minmax(0,1fr)_auto]"
-                onDoubleClick={() => void enterDirectory(entry)}
-              >
-                <span className="text-[var(--text-muted)]">{entry.kind === 'directory' ? <Folder className="h-4 w-4" /> : <FileIcon className="h-4 w-4" />}</span>
-                <span className="truncate text-[var(--text-primary)]">{entry.name}</span>
-                <span className="text-[var(--text-muted)] max-md:hidden">{entry.kind === 'directory' ? '' : formatBytes(entry.size)}</span>
-                <span className="text-[var(--text-muted)] max-md:hidden">{entry.modified}</span>
-                <span>
-                  {entry.kind !== 'directory' ? (
-                    <Button variant="ghost" size="iconSm" disabled={transferring} onClick={(event) => {
-                      event.stopPropagation()
-                      void downloadFile(entry)
-                    }}>
-                      <Download className="h-4 w-4" />
+        <div className="pointer-events-none absolute inset-0 z-[12] flex justify-end">
+          <aside
+            className={cn(
+              'pointer-events-auto relative z-[13] flex h-full w-[clamp(200px,23%,253px)] max-w-[92%] flex-col border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              fileManagerOpen ? 'translate-x-0' : 'translate-x-full',
+            )}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="border-b border-[var(--border-subtle)] px-3.5 py-2.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  value={remotePath}
+                  disabled={fileLoading || transferring}
+                  onChange={(event) => setRemotePath(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      void refreshFiles()
+                    }
+                  }}
+                  className="h-8 flex-1 rounded-lg px-2.5 text-xs"
+                />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="iconSm" disabled={fileLoading || transferring} onClick={() => void refreshFiles(`${remotePath}/..`)}>
+                      <ArrowUp className="h-4 w-4" />
                     </Button>
-                  ) : null}
-                </span>
-              </button>
-            ))}
+                  </TooltipTrigger>
+                  <TooltipContent>{t('parentDirectory')}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="iconSm" disabled={transferring} onClick={() => void refreshFiles()}>
+                      <RefreshCw className={cn('h-4 w-4', fileLoading && 'animate-spin')} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t('refresh')}</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="iconSm" disabled={transferring} onClick={() => chooseUploadFiles()}>
+                      <Upload className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t('uploadFile')}</TooltipContent>
+                </Tooltip>
+                <input ref={fileInputRef} type="file" multiple hidden onChange={handleFileInput} />
+                <input ref={zmodemInputRef} type="file" multiple hidden onChange={handleZmodemSendSelection} />
+              </div>
 
-            {(fileLoading && remoteFiles.length === 0) || (!fileLoading && fileErrorRef.current) || (!fileLoading && remoteFiles.length === 0) ? (
-              <div className="px-4 py-6 text-center text-xs text-[var(--text-muted)]">{fileManagerStatusText}</div>
-            ) : null}
+              <div className="mt-2 grid gap-1.5">
+                <small className="text-[11px] text-[var(--text-muted)]">{t('downloadDirectoryHint')}</small>
+                <Input
+                  value={downloadDirectory}
+                  disabled={transferring}
+                  onChange={(event) => setDownloadDirectory(event.target.value)}
+                  placeholder={t('downloadDirectoryPlaceholder')}
+                  className="h-8 rounded-lg px-2.5 text-xs"
+                />
+              </div>
+            </div>
+
+            <ContextMenu>
+              <ContextMenuTrigger asChild>
+                <div className={cn('min-h-0 flex-1 overflow-auto bg-[var(--surface-tab-strip)]', fileLoading && 'opacity-90')}>
+                  {remoteFiles.map((entry) => (
+                    <ContextMenu key={`${entry.path}-${entry.name}`}>
+                      <ContextMenuTrigger asChild>
+                        <button
+                          type="button"
+                          className="grid w-full grid-cols-[20px_minmax(0,1fr)_auto] items-center gap-3 border-b border-[var(--border-subtle)] px-3 py-2 text-left text-xs last:border-b-0 hover:bg-[var(--surface-tab-active)]"
+                          onDoubleClick={() => void enterDirectory(entry)}
+                        >
+                          <span className="text-[var(--text-muted)]">{entry.kind === 'directory' ? <Folder className="h-4 w-4" /> : <FileIcon className="h-4 w-4" />}</span>
+                          <span className="truncate text-[var(--text-primary)]">{entry.name}</span>
+                          <span className="text-[var(--text-muted)] max-md:hidden">{entry.kind === 'directory' ? '' : formatBytes(entry.size)}</span>
+                        </button>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        {entry.kind === 'directory' && entry.name !== '..' && (
+                          <ContextMenuItem onSelect={() => openNewFolderDialog(entry.path)}>{t('newFolder')}</ContextMenuItem>
+                        )}
+                        {entry.kind === 'directory' && entry.name !== '..' && (
+                          <ContextMenuItem onSelect={() => chooseUploadFiles(entry.kind === 'directory' ? entry.path : remotePathRef.current)}>
+                            {t('uploadFile')}
+                          </ContextMenuItem>
+                        )}
+                        {entry.kind !== 'directory' && (
+                          <ContextMenuItem onSelect={() => void openDownloadDialog(entry)}>{t('download')}</ContextMenuItem>
+                        )}
+                        {entry.name !== '..' && (
+                          <ContextMenuItem onSelect={() => void openPermissionsDialog(entry)}>{t('permissions')}</ContextMenuItem>
+                        )}
+                        {entry.name !== '..' && (
+                          <ContextMenuItem className="text-[#d45b5b] focus:text-[#d45b5b]" onSelect={() => confirmDeleteEntry(entry)}>
+                            {t('delete')}
+                          </ContextMenuItem>
+                        )}
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  ))}
+
+                  {(fileLoading && remoteFiles.length === 0) || (!fileLoading && fileErrorRef.current) || (!fileLoading && remoteFiles.length === 0) ? (
+                    <div className="px-4 py-6 text-center text-xs text-[var(--text-muted)]">{fileManagerStatusText}</div>
+                  ) : null}
+                </div>
+              </ContextMenuTrigger>
+              <ContextMenuContent>
+                <ContextMenuItem onSelect={() => chooseUploadFiles(remotePathRef.current)}>{t('uploadFile')}</ContextMenuItem>
+                <ContextMenuItem onSelect={() => openNewFolderDialog(remotePathRef.current)}>{t('newFolder')}</ContextMenuItem>
+                <ContextMenuItem onSelect={() => void refreshFiles()}>{t('refresh')}</ContextMenuItem>
+              </ContextMenuContent>
+            </ContextMenu>
+          </aside>
+        </div>
+
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[11] flex justify-start px-3 pb-2 pt-3">
+          <div className="pointer-events-auto flex items-center gap-2">
+            {isConnected && (
+              <div className="flex min-w-0 flex-wrap items-center justify-start gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-slate-400 max-sm:hidden">
+                {resourceStatusContent}
+              </div>
+            )}
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
+                  event.stopPropagation()
+                  void openFileManager()
+                }}>
+                  <FolderOpen className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('fileManager')}</TooltipContent>
+            </Tooltip>
           </div>
         </div>
-      )}
-
-      <div ref={terminalHostRef} className="terminal-host min-h-0 flex-1 bg-[#0f1418]" />
+      </div>
 
       {dragActive && (
         <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 rounded-[12px] bg-slate-950/56 text-white">
@@ -1472,6 +1645,153 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
           </div>
         </div>
       )}
+
+      <Dialog open={Boolean(newFolderDraft)} onOpenChange={(open) => {
+        if (!open) setNewFolderDraft(null)
+      }}>
+        <DialogContent className="w-[min(92vw,420px)]">
+          <DialogHeader>
+            <DialogTitle>{t('newFolder')}</DialogTitle>
+            <DialogDescription>{newFolderDraft?.parentPath || remotePath}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <span className="text-sm text-[var(--text-muted)]">{t('folderName')}</span>
+            <Input
+              value={newFolderDraft?.name || ''}
+              disabled={transferring}
+              placeholder={t('folderNamePlaceholder')}
+              onChange={(event) => setNewFolderDraft((current) => current ? { ...current, name: event.target.value } : current)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void createDirectory()
+                }
+              }}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setNewFolderDraft(null)}>{t('cancel')}</Button>
+            <Button onClick={() => void createDirectory()} disabled={transferring || !newFolderDraft?.name.trim()}>{t('confirm')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={permissionDialogOpen} onOpenChange={(open) => {
+        setPermissionDialogOpen(open)
+        if (!open) {
+          setPermissionEntry(null)
+          setPermissionLoading(false)
+        }
+      }}>
+        <DialogContent className="w-[min(92vw,680px)]">
+          <DialogHeader>
+            <DialogTitle>{t('permissions')}</DialogTitle>
+            <DialogDescription>{permissionEntry?.path || ''}</DialogDescription>
+          </DialogHeader>
+
+          {permissionLoading ? (
+            <div className="py-8 text-center text-sm text-[var(--text-muted)]">{t('loadingFiles')}</div>
+          ) : permissionEntry ? (
+            <div className="space-y-5">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Folder className="h-4 w-4 text-[var(--text-muted)]" />
+                <span className="truncate">{permissionEntry.name}</span>
+              </div>
+
+              <div className="space-y-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+                {[
+                  { label: t('permissionOwner'), index: 0 },
+                  { label: t('permissionGroup'), index: 1 },
+                  { label: t('permissionPublic'), index: 2 },
+                ].map((subject) => (
+                  <div key={subject.label} className="grid grid-cols-[88px_repeat(3,minmax(0,1fr))] items-center gap-3 max-sm:grid-cols-[76px_repeat(3,minmax(0,1fr))]">
+                    <span className="text-sm text-[var(--text-muted)]">{subject.label}</span>
+                    {([
+                      ['read', t('permissionRead')],
+                      ['write', t('permissionWrite')],
+                      ['execute', t('permissionExecute')],
+                    ] as const).map(([field, label]) => (
+                      <label key={field} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border border-[var(--border-subtle)] accent-[var(--accent)]"
+                          checked={permissionTriples[subject.index]?.[field] || false}
+                          onChange={(event) => setPermissionTriple(subject.index, field, event.target.checked)}
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <label className="space-y-2">
+                  <span className="text-sm text-[var(--text-muted)]">{t('permissionMode')}</span>
+                  <Input
+                    value={permissionDraft.mode}
+                    maxLength={4}
+                    onChange={(event) => {
+                      const nextValue = event.target.value.replace(/[^0-7]/g, '').slice(0, 4)
+                      setPermissionDraft((current) => ({
+                        ...current,
+                        mode: nextValue || current.mode,
+                      }))
+                    }}
+                  />
+                </label>
+                <label className="space-y-2">
+                  <span className="text-sm text-[var(--text-muted)]">{t('permissionOwnerField')}</span>
+                  <Input
+                    value={permissionDraft.owner}
+                    placeholder={t('permissionOwnerPlaceholder')}
+                    onChange={(event) => setPermissionDraft((current) => ({ ...current, owner: event.target.value }))}
+                  />
+                </label>
+              </div>
+
+              {permissionEntry.kind === 'directory' && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border border-[var(--border-subtle)] accent-[var(--accent)]"
+                    checked={permissionDraft.recursive}
+                    onChange={(event) => setPermissionDraft((current) => ({ ...current, recursive: event.target.checked }))}
+                  />
+                  <span>{t('applyToSubdirectories')}</span>
+                </label>
+              )}
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setPermissionDialogOpen(false)}>{t('cancel')}</Button>
+            <Button
+              onClick={() => void applyPermissions()}
+              disabled={permissionLoading || permissionSubmitting || !/^[0-7]{3,4}$/.test(permissionDraft.mode)}
+            >
+              {t('confirm')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={Boolean(deleteEntry)} onOpenChange={(open) => {
+        if (!open) setDeleteEntry(null)
+      }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('delete')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteEntry ? t('deleteRemoteEntryConfirm', { name: deleteEntry.name }) : ''}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void deleteRemoteEntry()}>{t('delete')}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={Boolean(pendingDropUpload)} onOpenChange={(open) => {
         if (!open) {

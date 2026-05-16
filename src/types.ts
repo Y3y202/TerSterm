@@ -80,6 +80,14 @@ export interface RemoteFileList {
   entries: RemoteFileEntry[]
 }
 
+export interface RemoteFilePermissions {
+  path: string
+  name: string
+  kind: RemoteFileKind
+  mode: string
+  owner: string
+}
+
 export interface AppUpdateAsset {
   name: string
   download_url: string

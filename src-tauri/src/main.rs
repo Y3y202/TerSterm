@@ -111,6 +111,15 @@ struct RemoteFileList {
 }
 
 #[derive(Debug, Serialize)]
+struct RemoteFilePermissions {
+    path: String,
+    name: String,
+    kind: String,
+    mode: String,
+    owner: String,
+}
+
+#[derive(Debug, Serialize)]
 struct SystemUsage {
     cpu_percent: f32,
     memory_used_gb: f32,
@@ -943,6 +952,28 @@ async fn ssh_list_files(
 }
 
 #[tauri::command]
+async fn ssh_create_directory(
+    app: AppHandle,
+    mut config: ConnectionConfig,
+    remote_path: String,
+    name: String,
+    session_id: Option<String>,
+) -> Result<String, String> {
+    validate_connection_config(&config)?;
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_create_directory(&processes, session_id.as_deref(), config, remote_path, name)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn ssh_upload_file(
     app: AppHandle,
     mut config: ConnectionConfig,
@@ -965,6 +996,34 @@ async fn ssh_upload_file(
             remote_path,
             filename,
             content_base64,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ssh_delete_path(
+    app: AppHandle,
+    mut config: ConnectionConfig,
+    remote_path: String,
+    recursive: Option<bool>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    validate_connection_config(&config)?;
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_delete_path(
+            &processes,
+            session_id.as_deref(),
+            config,
+            remote_path,
+            recursive.unwrap_or(true),
         )
     })
     .await
@@ -996,6 +1055,59 @@ async fn ssh_download_file(
             remote_path,
             local_dir,
             expected_size,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ssh_get_file_permissions(
+    app: AppHandle,
+    mut config: ConnectionConfig,
+    remote_path: String,
+    session_id: Option<String>,
+) -> Result<RemoteFilePermissions, String> {
+    validate_connection_config(&config)?;
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_get_file_permissions(&processes, session_id.as_deref(), config, remote_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn ssh_set_file_permissions(
+    app: AppHandle,
+    mut config: ConnectionConfig,
+    remote_path: String,
+    mode: String,
+    owner: Option<String>,
+    recursive: Option<bool>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    validate_connection_config(&config)?;
+    let session_auth_secrets =
+        get_session_auth_secrets(&app.state::<SshSessionSecrets>(), session_id.as_deref());
+    apply_session_auth_secrets(&mut config, session_auth_secrets);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let processes = app.state::<OpenSshProcesses>();
+        run_remote_set_file_permissions(
+            &processes,
+            session_id.as_deref(),
+            config,
+            remote_path,
+            mode,
+            owner,
+            recursive.unwrap_or(false),
         )
     })
     .await
@@ -1039,6 +1151,22 @@ fn save_local_file(
     let local_path = unique_local_path(&downloads, &filename);
     fs::write(&local_path, bytes).map_err(|error| error.to_string())?;
     Ok(local_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn pick_local_directory(initial_dir: Option<String>) -> Result<Option<String>, String> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(path) = initial_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        dialog = dialog.set_directory(expand_local_directory_path(path));
+    }
+
+    Ok(dialog
+        .pick_folder()
+        .map(|path| path.to_string_lossy().to_string()))
 }
 
 fn github_client(
@@ -2302,6 +2430,36 @@ fn file_list_shell_fragment(remote_path: &str) -> String {
     )
 }
 
+fn validate_remote_file_component(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Name is required".into());
+    }
+
+    if trimmed.contains('/') || trimmed.contains('\0') {
+        return Err("Name contains invalid characters".into());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn run_remote_shell_fragment(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    fragment: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let command = format!("sh -lc {}", shell_quote(&fragment));
+
+    match run_ssh2_exec_command(&config, &command) {
+        Ok(output) => Ok(output),
+        Err(error) if should_fallback_to_openssh(&config, &*error) => {
+            run_openssh_exec_command(processes, session_id, &config, &command)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn should_fallback_to_openssh(
     config: &ConnectionConfig,
     error: &(dyn std::error::Error + Send + Sync),
@@ -2563,6 +2721,167 @@ fn run_remote_file_list_ssh2(
         path: display_path,
         entries,
     })
+}
+
+fn create_directory_shell_fragment(parent_path: &str, name: &str) -> String {
+    let remote_target = sftp_path(&remote_join(parent_path, name));
+    format!(
+        r#"target={}; mkdir -- "$target"; real=$(cd -- "$target" 2>/dev/null && pwd -P) || real="$target"; printf "%s" "$real""#,
+        shell_quote(&remote_target)
+    )
+}
+
+fn run_remote_create_directory(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    remote_path: String,
+    name: String,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let safe_name = validate_remote_file_component(&name)?;
+    let output = run_remote_shell_fragment(
+        processes,
+        session_id,
+        config,
+        create_directory_shell_fragment(&remote_path, &safe_name),
+    )?;
+    Ok(output.trim().to_string())
+}
+
+fn delete_remote_path_shell_fragment(remote_path: &str, recursive: bool) -> String {
+    let target = sftp_path(remote_path);
+    let recursive_flag = if recursive { "1" } else { "0" };
+    format!(
+        r#"target={}; recursive={}; if [ -d "$target" ] && [ ! -L "$target" ]; then if [ "$recursive" = "1" ]; then rm -rf -- "$target"; else rmdir -- "$target"; fi; else rm -f -- "$target"; fi"#,
+        shell_quote(&target),
+        shell_quote(recursive_flag)
+    )
+}
+
+fn run_remote_delete_path(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    remote_path: String,
+    recursive: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_remote_shell_fragment(
+        processes,
+        session_id,
+        config,
+        delete_remote_path_shell_fragment(&remote_path, recursive),
+    )?;
+    Ok(())
+}
+
+fn file_permissions_shell_fragment(remote_path: &str) -> String {
+    let target = sftp_path(remote_path);
+    format!(
+        r#"target={}; [ -e "$target" ] || exit 1; mode=$(stat -c %a -- "$target" 2>/dev/null || stat -f %Lp -- "$target"); owner=$(stat -c %U -- "$target" 2>/dev/null || stat -f %Su -- "$target"); if [ -d "$target" ] && [ ! -L "$target" ]; then kind=directory; elif [ -L "$target" ]; then kind=symlink; else kind=file; fi; name=$(basename -- "$target"); parent=$(dirname -- "$target"); if real_parent=$(cd -- "$parent" 2>/dev/null && pwd -P); then if [ "$real_parent" = "/" ]; then real="/$name"; else real="$real_parent/$name"; fi; else real="$target"; fi; printf "PATH\t%s\nNAME\t%s\nKIND\t%s\nMODE\t%s\nOWNER\t%s\n" "$real" "$name" "$kind" "$mode" "$owner""#,
+        shell_quote(&target)
+    )
+}
+
+fn parse_file_permissions_output(
+    output: &str,
+) -> Result<RemoteFilePermissions, Box<dyn std::error::Error + Send + Sync>> {
+    let mut path = String::new();
+    let mut name = String::new();
+    let mut kind = "file".to_string();
+    let mut mode = String::new();
+    let mut owner = String::new();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
+
+        match key {
+            "PATH" => path = value.to_string(),
+            "NAME" => name = value.to_string(),
+            "KIND" => kind = value.to_string(),
+            "MODE" => mode = value.to_string(),
+            "OWNER" => owner = value.to_string(),
+            _ => {}
+        }
+    }
+
+    if path.is_empty() || name.is_empty() || mode.is_empty() {
+        return Err("Unable to read remote file permissions".into());
+    }
+
+    Ok(RemoteFilePermissions {
+        path,
+        name,
+        kind,
+        mode,
+        owner,
+    })
+}
+
+fn run_remote_get_file_permissions(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    remote_path: String,
+) -> Result<RemoteFilePermissions, Box<dyn std::error::Error + Send + Sync>> {
+    let output = run_remote_shell_fragment(
+        processes,
+        session_id,
+        config,
+        file_permissions_shell_fragment(&remote_path),
+    )?;
+    parse_file_permissions_output(&output)
+}
+
+fn validate_permission_mode(mode: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let trimmed = mode.trim();
+    let valid = matches!(trimmed.len(), 3 | 4) && trimmed.chars().all(|char| ('0'..='7').contains(&char));
+    if !valid {
+        return Err("Mode must be a 3 or 4 digit octal value".into());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn set_file_permissions_shell_fragment(
+    remote_path: &str,
+    mode: &str,
+    owner: Option<&str>,
+    recursive: bool,
+) -> String {
+    let target = sftp_path(remote_path);
+    let recursive_flag = if recursive { "1" } else { "0" };
+    let owner_value = owner.unwrap_or("").trim();
+    format!(
+        r#"target={}; mode={}; owner={}; recursive={}; if [ "$recursive" = "1" ] && [ -d "$target" ] && [ ! -L "$target" ]; then chmod -R -- "$mode" "$target"; if [ -n "$owner" ]; then chown -R -- "$owner" "$target"; fi; else chmod -- "$mode" "$target"; if [ -n "$owner" ]; then chown -- "$owner" "$target"; fi; fi"#,
+        shell_quote(&target),
+        shell_quote(mode),
+        shell_quote(owner_value),
+        shell_quote(recursive_flag)
+    )
+}
+
+fn run_remote_set_file_permissions(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: ConnectionConfig,
+    remote_path: String,
+    mode: String,
+    owner: Option<String>,
+    recursive: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let safe_mode = validate_permission_mode(&mode)?;
+    let owner = owner
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    run_remote_shell_fragment(
+        processes,
+        session_id,
+        config,
+        set_file_permissions_shell_fragment(&remote_path, &safe_mode, owner.as_deref(), recursive),
+    )?;
+    Ok(())
 }
 
 fn run_remote_file_upload(
@@ -4067,9 +4386,14 @@ fn main() {
             ssh_resize,
             ssh_disconnect,
             ssh_list_files,
+            ssh_create_directory,
             ssh_upload_file,
+            ssh_delete_path,
             ssh_download_file,
+            ssh_get_file_permissions,
+            ssh_set_file_permissions,
             save_local_file,
+            pick_local_directory,
             ssh_get_system_usage,
             check_app_update,
             download_app_update,
