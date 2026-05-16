@@ -58,6 +58,7 @@ const GITHUB_RELEASES_ATOM: &str = "https://github.com/Y3y202/TerSterm/releases.
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
     "https://github.com/Y3y202/TerSterm/releases/download/";
 const NO_MATCHING_RELEASE_ERROR: &str = "No matching release found";
+const APP_SETTINGS_FILE_NAME: &str = "app-settings.json";
 const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
 const DEFAULT_WINDOW_WIDTH: f64 = 1665.0;
 const DEFAULT_WINDOW_HEIGHT: f64 = 1039.0;
@@ -245,6 +246,13 @@ impl WindowCloseBehavior {
         }
     }
 
+    fn as_value(self) -> &'static str {
+        match self {
+            Self::Tray => "tray",
+            Self::Exit => "exit",
+        }
+    }
+
     fn as_u8(self) -> u8 {
         match self {
             Self::Tray => 1,
@@ -294,6 +302,13 @@ impl AppLocale {
         }
     }
 
+    fn as_value(self) -> &'static str {
+        match self {
+            Self::ZhCn => "zh-CN",
+            Self::EnUs => "en-US",
+        }
+    }
+
     fn as_u8(self) -> u8 {
         match self {
             Self::ZhCn => 0,
@@ -324,6 +339,40 @@ impl AppLocaleState {
 
     fn set(&self, locale: AppLocale) {
         self.0.store(locale.as_u8(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedAppSettings {
+    window_close_behavior: String,
+    locale: String,
+}
+
+impl Default for PersistedAppSettings {
+    fn default() -> Self {
+        Self {
+            window_close_behavior: WindowCloseBehavior::default().as_value().to_string(),
+            locale: AppLocale::default().as_value().to_string(),
+        }
+    }
+}
+
+impl PersistedAppSettings {
+    fn sanitized(self) -> Self {
+        Self {
+            window_close_behavior: WindowCloseBehavior::from_value(&self.window_close_behavior)
+                .as_value()
+                .to_string(),
+            locale: AppLocale::from_value(&self.locale).as_value().to_string(),
+        }
+    }
+
+    fn window_close_behavior(&self) -> WindowCloseBehavior {
+        WindowCloseBehavior::from_value(&self.window_close_behavior)
+    }
+
+    fn locale(&self) -> AppLocale {
+        AppLocale::from_value(&self.locale)
     }
 }
 
@@ -444,6 +493,38 @@ fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|dir| dir.join(WINDOW_STATE_FILE_NAME))
 }
 
+fn app_settings_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(APP_SETTINGS_FILE_NAME))
+}
+
+fn read_persisted_app_settings(app: &AppHandle) -> Option<PersistedAppSettings> {
+    let path = app_settings_path(app)?;
+    let contents = fs::read_to_string(path).ok()?;
+    let settings = serde_json::from_str::<PersistedAppSettings>(&contents).ok()?;
+    Some(settings.sanitized())
+}
+
+fn write_persisted_app_settings(app: &AppHandle, settings: PersistedAppSettings) {
+    let Some(path) = app_settings_path(app) else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Ok(contents) = serde_json::to_vec(&settings.sanitized()) else {
+        return;
+    };
+
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    fs::write(path, contents).ok();
+}
+
 fn read_persisted_window_state(app: &AppHandle) -> Option<PersistedWindowState> {
     let path = window_state_path(app)?;
     let contents = fs::read_to_string(path).ok()?;
@@ -525,6 +606,16 @@ fn initialize_main_window_state(window: &tauri::WebviewWindow) {
     if !state.maximized {
         persist_main_window_state(window);
     }
+}
+
+fn initialize_persisted_app_settings(app: &AppHandle) {
+    let settings = read_persisted_app_settings(app).unwrap_or_default().sanitized();
+    let close_behavior = settings.window_close_behavior();
+    let locale = settings.locale();
+
+    app.state::<WindowCloseBehaviorState>().set(close_behavior);
+    app.state::<AppLocaleState>().set(locale);
+    write_persisted_app_settings(app, settings);
 }
 
 fn cancel_session_openssh_processes(processes: &OpenSshProcesses, session_id: &str) {
@@ -717,17 +808,39 @@ fn ssh_connect(
 
 #[tauri::command]
 fn set_window_close_behavior(
+    app: AppHandle,
     close_behavior: State<'_, WindowCloseBehaviorState>,
+    locale_state: State<'_, AppLocaleState>,
     behavior: String,
 ) {
-    close_behavior.set(WindowCloseBehavior::from_value(&behavior));
+    let next_behavior = WindowCloseBehavior::from_value(&behavior);
+    close_behavior.set(next_behavior);
+    write_persisted_app_settings(
+        &app,
+        PersistedAppSettings {
+            window_close_behavior: next_behavior.as_value().to_string(),
+            locale: locale_state.get().as_value().to_string(),
+        },
+    );
 }
 
 #[tauri::command]
-fn set_app_locale(app: AppHandle, locale_state: State<'_, AppLocaleState>, locale: String) {
-    let locale = AppLocale::from_value(&locale);
-    locale_state.set(locale);
-    update_tray_menu_locale(&app, locale);
+fn set_app_locale(
+    app: AppHandle,
+    locale_state: State<'_, AppLocaleState>,
+    close_behavior: State<'_, WindowCloseBehaviorState>,
+    locale: String,
+) {
+    let next_locale = AppLocale::from_value(&locale);
+    locale_state.set(next_locale);
+    update_tray_menu_locale(&app, next_locale);
+    write_persisted_app_settings(
+        &app,
+        PersistedAppSettings {
+            window_close_behavior: close_behavior.get().as_value().to_string(),
+            locale: next_locale.as_value().to_string(),
+        },
+    );
 }
 
 #[tauri::command]
@@ -4002,6 +4115,8 @@ fn main() {
             }
         })
         .setup(|app| {
+            initialize_persisted_app_settings(app.handle());
+
             let locale = app.state::<AppLocaleState>().get();
             let (show_text, quit_text) = tray_menu_text(locale);
             let show_item =
@@ -4121,7 +4236,7 @@ mod tests {
     #[test]
     fn builds_update_wait_script_that_uses_msiexec_for_msi_packages() {
         let script = build_windows_update_installer_wait_script(
-            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.10_x64.msi"),
+            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.11_x64.msi"),
             4242,
         );
 
