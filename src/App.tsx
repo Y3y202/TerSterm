@@ -1877,7 +1877,7 @@ export default function App() {
 
       <main className={cn('grid min-h-0 flex-1 gap-0 overflow-hidden bg-transparent', resizingSidebar && 'select-none')} style={appShellStyle}>
       {!sidebarCollapsed && (
-        <aside className="flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[24px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
+        <aside className="flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
           <div className="grid grid-cols-[minmax(0,1fr)_40px] gap-2 max-[640px]:grid-cols-1">
             <Button onClick={() => openConnectionModal()}>
               <Plus className="h-4 w-4" />
@@ -1895,14 +1895,14 @@ export default function App() {
 
           <div className="min-h-0 flex-1 overflow-auto pr-1">
             {filteredConnections.length === 0 && hasSearchQuery ? (
-              <div className="flex min-h-[136px] flex-col items-center justify-center rounded-[18px] border border-dashed border-[var(--border-subtle)] bg-[var(--surface-chip)] px-4 py-8 text-center">
+              <div className="flex min-h-[136px] flex-col items-center justify-center rounded-[10px] border border-dashed border-[var(--border-subtle)] bg-[var(--surface-chip)] px-4 py-8 text-center">
                 <div className="mb-2 text-sm font-semibold text-[var(--text-primary)]">{t('noMatchingConnections')}</div>
                 <p className="max-w-[180px] text-xs leading-5 text-[var(--text-muted)]">{t('searchConnectionsOrGroups')}</p>
               </div>
             ) : (
               <div className="flex min-h-0 flex-col gap-1.5">
                 {groupedConnections.map((group) => (
-                  <section key={group.id} className="rounded-[14px] px-1 py-1">
+                  <section key={group.id} className="rounded-lg px-1 py-1">
                     <ContextMenu>
                       <ContextMenuTrigger asChild>
                         <div className="flex min-h-6 items-center justify-between gap-2">
@@ -1989,8 +1989,8 @@ export default function App() {
         </div>
       )}
 
-      <section className="flex min-h-0 min-w-0 flex-col gap-2.5 overflow-hidden rounded-[24px] border border-[rgba(255,255,255,0.18)] bg-[var(--surface-shell)] p-0.5">
-        <header className="flex min-h-[42px] flex-wrap items-center justify-between gap-3 rounded-[20px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-1 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
+      <section className="flex min-h-0 min-w-0 flex-col gap-2.5 overflow-hidden rounded-[12px] border border-[rgba(255,255,255,0.18)] bg-[var(--surface-shell)] p-0.5">
+        <header className="flex min-h-[42px] flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-1 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
           <div className="min-w-0 flex-1 max-md:w-full">
             <div aria-label={t('sessionList')} className="relative flex min-w-0 items-end gap-1 overflow-x-auto pr-0.5 pb-0 pt-0.5">
               {panes.map((pane) => (
@@ -2100,7 +2100,7 @@ export default function App() {
                   {visibleConnectedPanes.length > 0 ? (
                     <div className="max-h-60 space-y-2 overflow-auto" aria-label={t('syncInput')}>
                       {visibleConnectedPanes.map((pane) => (
-                        <button key={pane.id} className={cn('flex w-full items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 text-left text-sm transition hover:border-[var(--border-strong)]', syncedPaneIds.includes(pane.id) && 'border-[var(--border-strong)] bg-[var(--accent-soft)]/40')} onClick={() => toggleSyncPane(pane.id)}>
+                        <button key={pane.id} className={cn('flex w-full items-center gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 text-left text-sm transition hover:border-[var(--border-strong)]', syncedPaneIds.includes(pane.id) && 'border-[var(--border-strong)] bg-[var(--accent-soft)]/40')} onClick={() => toggleSyncPane(pane.id)}>
                           <span className={cn('grid h-5 w-5 place-items-center rounded-full border border-[var(--border-subtle)] text-[10px]', syncedPaneIds.includes(pane.id) && 'border-[var(--accent)] bg-[var(--accent)] text-white')}>{syncedPaneIds.includes(pane.id) ? 'on' : ''}</span>
                           <span className="min-w-0">
                             <strong className="block truncate text-sm text-[var(--text-strong)]">{pane.title}</strong>
@@ -2119,7 +2119,7 @@ export default function App() {
         </header>
 
         <div className={cn(
-          'grid min-h-0 flex-1 gap-2.5 overflow-hidden rounded-[20px]',
+          'grid min-h-0 flex-1 gap-2.5 overflow-hidden rounded-[10px]',
           visiblePanes.length === 1 && 'grid-cols-1',
           visiblePanes.length === 2 && 'grid-cols-1 xl:grid-cols-2',
           visiblePanes.length === 3 && 'grid-cols-1 xl:grid-cols-[1.25fr_.75fr] xl:grid-rows-2',
@@ -2153,7 +2153,7 @@ export default function App() {
           </DialogHeader>
 
           <div className="grid gap-4">
-            <section className="overflow-hidden rounded-[28px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+            <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
               <div className="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--border-subtle)] px-6 py-4">
                 <strong className="text-base text-[var(--text-strong)]">{t('appearanceSettings')}</strong>
                 <small className="text-xs text-[var(--text-muted)]">{t('applyImmediatelyAndPersist')}</small>
@@ -2256,7 +2256,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="rounded-[24px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div>
                   <strong className="block">{t('windowCloseSettings')}</strong>
@@ -2276,7 +2276,7 @@ export default function App() {
               <p className="mt-3 text-xs text-[var(--text-muted)]">{t('windowCloseBehaviorHint')}</p>
             </section>
 
-            <section className="rounded-[24px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <strong className="block">{t('updateSettings')}</strong>
@@ -2287,7 +2287,7 @@ export default function App() {
                 </Button>
               </div>
 
-              <div className="mt-4 rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-4">
+              <div className="mt-4 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <strong className="block">{t('updateChannelSettings')}</strong>
@@ -2303,11 +2303,11 @@ export default function App() {
                 </div>
 
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-2xl bg-[var(--surface-chip)] px-4 py-3">
+                  <div className="rounded-lg bg-[var(--surface-chip)] px-4 py-3">
                     <small className="block text-xs text-[var(--text-muted)]">{t('updateCurrentVersionLabel')}</small>
                     <strong>{appUpdateInfo?.current_version || '--'}</strong>
                   </div>
-                  <div className="rounded-2xl bg-[var(--surface-chip)] px-4 py-3">
+                  <div className="rounded-lg bg-[var(--surface-chip)] px-4 py-3">
                     <small className="block text-xs text-[var(--text-muted)]">{t('updateLatestVersionLabel')}</small>
                     <strong>{appUpdateInfo?.latest_version || '--'}</strong>
                   </div>
@@ -2366,10 +2366,10 @@ export default function App() {
                     <button
                       key={connection.id}
                       type="button"
-                      className="flex w-full items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-3 text-left transition hover:border-[var(--border-strong)] hover:bg-[var(--surface-tab-active)]"
+                      className="flex w-full items-center gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3.5 py-3 text-left transition hover:border-[var(--border-strong)] hover:bg-[var(--surface-tab-active)]"
                       onClick={() => void connectPaneToConnection(connection)}
                     >
-                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[var(--surface-chip)]">
+                      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--surface-chip)]">
                         <HostSystemIcon connection={connection} className="text-[var(--text-muted)]" />
                       </span>
                       <span className="min-w-0 flex-1">
@@ -2446,7 +2446,7 @@ export default function App() {
               </label>
             </div>
 
-            <div className="rounded-[22px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+            <div className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
               <div className="mb-3 text-sm font-semibold">{t('keyAuthTitle')}</div>
               <div className="grid gap-4 sm:grid-cols-2">
                 <label className="grid gap-2 text-sm">

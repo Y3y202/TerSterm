@@ -14,7 +14,7 @@ const SelectTrigger = React.forwardRef<
   <SelectPrimitive.Trigger
     ref={ref}
     className={cn(
-      'flex h-10 w-full items-center justify-between rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 text-sm text-[var(--text-primary)] shadow-[inset_0_1px_0_var(--surface-highlight)] transition focus:outline-none focus:ring-2 focus:ring-[var(--ring)] disabled:cursor-not-allowed disabled:opacity-50',
+      'flex h-10 w-full items-center justify-between rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 text-sm text-[var(--text-primary)] shadow-[inset_0_1px_0_var(--surface-highlight)] transition focus:outline-none focus:ring-2 focus:ring-[var(--ring)] disabled:cursor-not-allowed disabled:opacity-50',
       className,
     )}
     {...props}
@@ -58,7 +58,7 @@ const SelectContent = React.forwardRef<
     <SelectPrimitive.Content
       ref={ref}
       className={cn(
-        'relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] text-[var(--text-primary)] shadow-[0_24px_60px_rgba(15,23,42,0.18)]',
+        'relative z-50 max-h-96 min-w-[8rem] overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] text-[var(--text-primary)] shadow-[0_24px_60px_rgba(15,23,42,0.18)]',
         position === 'popper' && 'translate-y-1',
         className,
       )}
@@ -92,7 +92,7 @@ const SelectItem = React.forwardRef<
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex w-full cursor-default select-none items-center rounded-xl py-2 pl-8 pr-3 text-sm outline-none transition focus:bg-[var(--surface-chip)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+      'relative flex w-full cursor-default select-none items-center rounded-lg py-2 pl-8 pr-3 text-sm outline-none transition focus:bg-[var(--surface-chip)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       className,
     )}
     {...props}

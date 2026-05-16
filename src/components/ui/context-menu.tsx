@@ -14,7 +14,7 @@ const ContextMenuContent = React.forwardRef<
     <ContextMenuPrimitive.Content
       ref={ref}
       className={cn(
-        'z-50 min-w-44 overflow-hidden rounded-2xl border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-1.5 text-[var(--text-primary)] shadow-[0_24px_60px_rgba(15,23,42,0.18)]',
+        'z-50 min-w-44 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-1.5 text-[var(--text-primary)] shadow-[0_24px_60px_rgba(15,23,42,0.18)]',
         className,
       )}
       {...props}
@@ -31,7 +31,7 @@ const ContextMenuItem = React.forwardRef<
   <ContextMenuPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex cursor-default select-none items-center rounded-xl px-3 py-2 text-sm outline-none transition focus:bg-[var(--surface-chip)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
+      'relative flex cursor-default select-none items-center rounded-lg px-3 py-2 text-sm outline-none transition focus:bg-[var(--surface-chip)] data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       inset && 'pl-8',
       className,
     )}

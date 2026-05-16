@@ -4114,7 +4114,7 @@ mod tests {
     #[test]
     fn builds_update_wait_script_that_uses_msiexec_for_msi_packages() {
         let script = build_windows_update_installer_wait_script(
-            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.8_x64.msi"),
+            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.9_x64.msi"),
             4242,
         );
 

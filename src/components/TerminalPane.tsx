@@ -1239,7 +1239,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   return (
     <section
       className={cn(
-        'relative flex h-full min-h-0 flex-col overflow-hidden rounded-[22px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] shadow-[0_12px_28px_rgba(20,38,52,0.07)] transition',
+        'relative flex h-full min-h-0 flex-col overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] shadow-[0_12px_28px_rgba(20,38,52,0.07)] transition',
         props.active && 'border-[var(--border-strong)] shadow-[0_16px_34px_rgba(20,38,52,0.11)]',
         dragActive && 'ring-2 ring-[var(--ring)]',
       )}
@@ -1413,7 +1413,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             />
           </div>
 
-          <div className={cn('mt-2.5 max-h-56 overflow-auto rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-tab-strip)]', fileLoading && 'opacity-90')}>
+          <div className={cn('mt-2.5 max-h-56 overflow-auto rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-tab-strip)]', fileLoading && 'opacity-90')}>
             {remoteFiles.map((entry) => (
               <button
                 key={`${entry.path}-${entry.name}`}
@@ -1448,7 +1448,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       <div ref={terminalHostRef} className="terminal-host min-h-0 flex-1 bg-[#0f1418]" />
 
       {dragActive && (
-        <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 rounded-[22px] bg-slate-950/56 text-white">
+        <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 rounded-[12px] bg-slate-950/56 text-white">
           <Upload className="h-7 w-7" />
           <span className="text-sm">{t('dropToUpload', { path: remotePath })}</span>
         </div>
@@ -1456,8 +1456,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
       {props.pane.status === 'idle' && (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-[linear-gradient(180deg,rgba(227,233,236,0.72),rgba(222,229,233,0.58))] p-5 backdrop-blur-[1px]">
-          <div className="flex w-full max-w-sm flex-col items-center rounded-[22px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-6 py-8 text-center shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
-            <div className="mb-3 grid h-12 w-12 place-items-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)] shadow-[inset_0_1px_0_var(--surface-highlight)]">
+          <div className="flex w-full max-w-sm flex-col items-center rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-6 py-8 text-center shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
+            <div className="mb-3 grid h-12 w-12 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] shadow-[inset_0_1px_0_var(--surface-highlight)]">
               <SquareTerminal className="h-6 w-6" />
             </div>
             <strong className="text-base text-[var(--text-strong)]">{t('emptyWorkspaceTitle')}</strong>
