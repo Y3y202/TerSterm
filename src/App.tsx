@@ -688,20 +688,9 @@ export default function App() {
   }, [recordSettingsSaved, setAppUpdateProgress, updateChannel])
 
   useEffect(() => {
-    let disposed = false
-
     localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, windowCloseBehavior)
-    void syncWindowCloseBehavior(windowCloseBehavior)
-      .then(() => {
-        if (!disposed) {
-          recordSettingsSaved({ ...savedSettingsRef.current, windowCloseBehavior })
-        }
-      })
-      .catch(() => undefined)
-
-    return () => {
-      disposed = true
-    }
+    recordSettingsSaved({ ...savedSettingsRef.current, windowCloseBehavior })
+    void syncWindowCloseBehavior(windowCloseBehavior).catch(() => undefined)
   }, [recordSettingsSaved, windowCloseBehavior])
 
   useEffect(() => {
@@ -713,15 +702,8 @@ export default function App() {
   }, [groups])
 
   useEffect(() => {
-    let disposed = false
-
-    void syncDesktopLocale(appLocale)
-      .then(() => {
-        if (!disposed) {
-          recordSettingsSaved({ ...savedSettingsRef.current, locale: appLocale })
-        }
-      })
-      .catch(() => undefined)
+    recordSettingsSaved({ ...savedSettingsRef.current, locale: appLocale })
+    void syncDesktopLocale(appLocale).catch(() => undefined)
     setPanes((current) =>
       current.map((pane, index) => {
         if (pane.connection) return pane
@@ -730,9 +712,6 @@ export default function App() {
         return pane.title === nextTitle ? pane : { ...pane, title: nextTitle }
       }),
     )
-    return () => {
-      disposed = true
-    }
   }, [appLocale, recordSettingsSaved, setPanes])
 
   useEffect(() => () => {
