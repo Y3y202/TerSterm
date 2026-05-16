@@ -766,8 +766,8 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed))
-  }, [sidebarCollapsed])
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidth))
+  }, [sidebarWidth])
 
   useEffect(() => {
     localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, updateChannel)
@@ -1179,20 +1179,24 @@ export default function App() {
 
     const stop = () => {
       setResizingSidebar(false)
-      localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(sidebarWidthRef.current))
       window.removeEventListener('pointermove', resize)
       window.removeEventListener('pointerup', stop)
+      window.removeEventListener('pointercancel', stop)
+      window.removeEventListener('blur', stop)
       scheduleFitAllTerminals()
     }
 
     window.addEventListener('pointermove', resize)
     window.addEventListener('pointerup', stop, { once: true })
+    window.addEventListener('pointercancel', stop, { once: true })
+    window.addEventListener('blur', stop, { once: true })
   }
 
   const setSidebarCollapsedState = (collapsed: boolean) => {
     if (sidebarCollapsedRef.current === collapsed) return
 
     setSidebarCollapsed(collapsed)
+    localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(collapsed))
     setResizingSidebar(false)
     scheduleFitAllTerminals()
   }
