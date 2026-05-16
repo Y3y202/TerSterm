@@ -1366,9 +1366,15 @@ fn escape_powershell_single_quoted_string(value: &str) -> String {
 #[cfg(target_os = "windows")]
 fn build_windows_update_installer_wait_script(path: &Path, process_id: u32) -> String {
     let installer_path = escape_powershell_single_quoted_string(&path.to_string_lossy());
+    let installer_extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
     let mut script = format!(
-        "$installerPath = '{installer_path}'; $terstermProcessId = {process_id}; ",
+        "$ErrorActionPreference = 'Stop'; $installerPath = '{installer_path}'; $installerExtension = '{installer_extension}'; $terstermProcessId = {process_id}; ",
         installer_path = installer_path,
+        installer_extension = installer_extension,
         process_id = process_id,
     );
     script.push_str(
@@ -1376,7 +1382,12 @@ fn build_windows_update_installer_wait_script(path: &Path, process_id: u32) -> S
     );
     script.push_str("Start-Sleep -Milliseconds 250; ");
     script.push_str("for ($attempt = 0; $attempt -lt 12; $attempt++) { ");
-    script.push_str("try { Start-Process -LiteralPath $installerPath | Out-Null; exit 0 } ");
+    script.push_str("try { ");
+    script.push_str("if (-not (Test-Path -LiteralPath $installerPath)) { throw \"Installer not found: $installerPath\" }; ");
+    script.push_str("if ($installerExtension -eq 'msi') { Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $installerPath) -WindowStyle Normal | Out-Null } ");
+    script.push_str(
+        "else { Start-Process -FilePath $installerPath -WindowStyle Normal | Out-Null }; exit 0 } ",
+    );
     script.push_str("catch { Start-Sleep -Milliseconds 500 } ");
     script.push_str("}; exit 1");
     script
@@ -4095,7 +4106,21 @@ mod tests {
 
         assert!(script.contains("$terstermProcessId = 4242"));
         assert!(script.contains(r"C:\Users\O''Brien\Downloads\TerSterm Setup.exe"));
-        assert!(script.contains("Start-Process -LiteralPath $installerPath"));
+        assert!(script.contains("Start-Process -FilePath $installerPath -WindowStyle Normal"));
+        assert!(!script.contains("Start-Process -LiteralPath"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builds_update_wait_script_that_uses_msiexec_for_msi_packages() {
+        let script = build_windows_update_installer_wait_script(
+            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.8_x64.msi"),
+            4242,
+        );
+
+        assert!(script.contains("$installerExtension = 'msi'"));
+        assert!(script.contains("Start-Process -FilePath 'msiexec.exe'"));
+        assert!(script.contains("-ArgumentList @('/i', $installerPath)"));
     }
 
     #[test]
