@@ -3909,8 +3909,15 @@ fn exit_application_with_cleanup(app: AppHandle, terminate_descendants: bool) {
         cancel_all_openssh_processes(&processes);
         disconnect_all_sessions(&sessions);
         #[cfg(windows)]
-        if terminate_descendants {
-            terminate_descendant_processes(std::process::id());
+        {
+            if terminate_descendants {
+                terminate_descendant_processes(std::process::id());
+            }
+
+            // `tray-icon` always tries to remove the icon on drop.
+            // If the icon is currently hidden, Windows reports a removal error.
+            // Re-show it right before exit so shutdown removes a registered icon.
+            set_tray_visibility(&app, true);
         }
         app.exit(0);
     });
@@ -4114,7 +4121,7 @@ mod tests {
     #[test]
     fn builds_update_wait_script_that_uses_msiexec_for_msi_packages() {
         let script = build_windows_update_installer_wait_script(
-            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.9_x64.msi"),
+            std::path::Path::new(r"C:\Users\dev\Downloads\TerSterm_0.1.10_x64.msi"),
             4242,
         );
 

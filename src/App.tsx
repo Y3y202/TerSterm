@@ -466,7 +466,7 @@ export default function App() {
   const [analysisTheme] = useState<AnalysisThemeId>(readStoredAnalysisTheme())
   const [sidebarCollapsed, setSidebarCollapsed, sidebarCollapsedRef] = useStateRef(readStoredSidebarCollapsed())
   const [updateChannel, setUpdateChannel, updateChannelRef] = useStateRef<UpdateChannel>(readStoredUpdateChannel())
-  const [windowCloseBehavior, setWindowCloseBehavior] = useStateRef<WindowCloseBehavior>(readStoredWindowCloseBehavior())
+  const [windowCloseBehavior, setWindowCloseBehavior, windowCloseBehaviorRef] = useStateRef<WindowCloseBehavior>(readStoredWindowCloseBehavior())
   const [desktopWindowReady, setDesktopWindowReady] = useState(false)
   const [desktopWindowMaximized, setDesktopWindowMaximized] = useState(false)
   const [sidebarWidth, setSidebarWidth, sidebarWidthRef] = useStateRef(readStoredSidebarWidth())
@@ -535,11 +535,65 @@ export default function App() {
       notifySettingsSaved()
     }
   }, [notifySettingsSaved])
+  // Serialize async shell syncs so rapid setting toggles keep the latest value.
+  const pendingWindowCloseBehaviorSyncRef = useRef<WindowCloseBehavior>()
+  const syncingWindowCloseBehaviorRef = useRef(false)
+  const flushWindowCloseBehaviorSync = useCallback(() => {
+    if (syncingWindowCloseBehaviorRef.current) return
+
+    syncingWindowCloseBehaviorRef.current = true
+    void (async () => {
+      try {
+        while (pendingWindowCloseBehaviorSyncRef.current) {
+          const nextBehavior = pendingWindowCloseBehaviorSyncRef.current
+          pendingWindowCloseBehaviorSyncRef.current = undefined
+
+          await syncWindowCloseBehavior(nextBehavior).catch(() => undefined)
+
+          if (!pendingWindowCloseBehaviorSyncRef.current && windowCloseBehaviorRef.current !== nextBehavior) {
+            pendingWindowCloseBehaviorSyncRef.current = windowCloseBehaviorRef.current
+          }
+        }
+      } finally {
+        syncingWindowCloseBehaviorRef.current = false
+        if (pendingWindowCloseBehaviorSyncRef.current) {
+          flushWindowCloseBehaviorSync()
+        }
+      }
+    })()
+  }, [windowCloseBehaviorRef])
+  const pendingDesktopLocaleSyncRef = useRef<ReturnType<typeof getAppLocale>>()
+  const syncingDesktopLocaleRef = useRef(false)
+  const flushDesktopLocaleSync = useCallback(() => {
+    if (syncingDesktopLocaleRef.current) return
+
+    syncingDesktopLocaleRef.current = true
+    void (async () => {
+      try {
+        while (pendingDesktopLocaleSyncRef.current) {
+          const nextLocale = pendingDesktopLocaleSyncRef.current
+          pendingDesktopLocaleSyncRef.current = undefined
+
+          await syncDesktopLocale(nextLocale).catch(() => undefined)
+
+          const latestLocale = getAppLocale()
+          if (!pendingDesktopLocaleSyncRef.current && latestLocale !== nextLocale) {
+            pendingDesktopLocaleSyncRef.current = latestLocale
+          }
+        }
+      } finally {
+        syncingDesktopLocaleRef.current = false
+        if (pendingDesktopLocaleSyncRef.current) {
+          flushDesktopLocaleSync()
+        }
+      }
+    })()
+  }, [])
 
   const updateInfoQuery = useQuery({
     queryKey: ['app-update', updateChannel],
     queryFn: () => fetchAppUpdate(updateChannelRef.current === 'prerelease'),
-    enabled: settingsModalOpen,
+    enabled: false,
     staleTime: 60_000,
   })
 
@@ -626,6 +680,40 @@ export default function App() {
     { value: 'dark' as const, label: t('themeModeDark'), icon: Moon },
     { value: 'system' as const, label: t('themeModeSystem'), icon: Monitor },
   ]
+  const recordSettingsPatch = useCallback((patch: Partial<SavedSettingsSnapshot>) => {
+    recordSettingsSaved({ ...savedSettingsRef.current, ...patch })
+  }, [recordSettingsSaved])
+  const handleThemeModeChange = useCallback((nextThemeMode: ThemeMode) => {
+    if (themeMode === nextThemeMode) return
+
+    setThemeMode(nextThemeMode)
+    localStorage.setItem(THEME_MODE_STORAGE_KEY, nextThemeMode)
+    recordSettingsPatch({ themeMode: nextThemeMode })
+  }, [recordSettingsPatch, themeMode])
+  const handleAppThemeChange = useCallback((nextAppTheme: AppThemeId) => {
+    if (appTheme === nextAppTheme) return
+
+    setAppTheme(nextAppTheme)
+    localStorage.setItem(THEME_STORAGE_KEY, nextAppTheme)
+    recordSettingsPatch({ appTheme: nextAppTheme })
+  }, [appTheme, recordSettingsPatch, setAppTheme])
+  const handleUpdateChannelChange = useCallback((nextUpdateChannel: UpdateChannel) => {
+    if (updateChannel === nextUpdateChannel) return
+
+    setUpdateChannel(nextUpdateChannel)
+    localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, nextUpdateChannel)
+    setAppUpdateProgress(undefined)
+    recordSettingsPatch({ updateChannel: nextUpdateChannel })
+  }, [recordSettingsPatch, setAppUpdateProgress, setUpdateChannel, updateChannel])
+  const handleWindowCloseBehaviorChange = useCallback((nextBehavior: WindowCloseBehavior) => {
+    if (windowCloseBehavior === nextBehavior) return
+
+    setWindowCloseBehavior(nextBehavior)
+    localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, nextBehavior)
+    recordSettingsPatch({ windowCloseBehavior: nextBehavior })
+    pendingWindowCloseBehaviorSyncRef.current = nextBehavior
+    flushWindowCloseBehaviorSync()
+  }, [flushWindowCloseBehaviorSync, recordSettingsPatch, setWindowCloseBehavior, windowCloseBehavior])
 
   useEffect(() => {
     applyAppTheme(appTheme, resolvedThemeMode, analysisTheme)
@@ -690,8 +778,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, windowCloseBehavior)
     recordSettingsSaved({ ...savedSettingsRef.current, windowCloseBehavior })
-    void syncWindowCloseBehavior(windowCloseBehavior).catch(() => undefined)
-  }, [recordSettingsSaved, windowCloseBehavior])
+    pendingWindowCloseBehaviorSyncRef.current = windowCloseBehavior
+    flushWindowCloseBehaviorSync()
+  }, [flushWindowCloseBehaviorSync, recordSettingsSaved, windowCloseBehavior])
 
   useEffect(() => {
     localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(connections))
@@ -703,7 +792,8 @@ export default function App() {
 
   useEffect(() => {
     recordSettingsSaved({ ...savedSettingsRef.current, locale: appLocale })
-    void syncDesktopLocale(appLocale).catch(() => undefined)
+    pendingDesktopLocaleSyncRef.current = appLocale
+    flushDesktopLocaleSync()
     setPanes((current) =>
       current.map((pane, index) => {
         if (pane.connection) return pane
@@ -712,7 +802,7 @@ export default function App() {
         return pane.title === nextTitle ? pane : { ...pane, title: nextTitle }
       }),
     )
-  }, [appLocale, recordSettingsSaved, setPanes])
+  }, [appLocale, flushDesktopLocaleSync, recordSettingsSaved, setPanes])
 
   useEffect(() => () => {
     if (settingsSavedToastTimerRef.current) {
@@ -2147,183 +2237,180 @@ export default function App() {
       </section>
 
       <Dialog open={settingsModalOpen} onOpenChange={setSettingsModalOpen}>
-        <DialogContent className="w-[min(94vw,980px)] max-h-[min(88vh,760px)] overflow-auto">
-          <DialogHeader>
+        <DialogContent className="w-[min(92vw,620px)] max-h-[min(84vh,560px)] overflow-auto p-4">
+          <DialogHeader className="gap-1">
             <DialogTitle>{t('settingsTitle')}</DialogTitle>
+            <DialogDescription className="text-xs">{t('applyImmediatelyAndPersist')}</DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-4">
+          <div className="grid gap-2.5">
             <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
-              <div className="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--border-subtle)] px-6 py-4">
-                <strong className="text-base text-[var(--text-strong)]">{t('appearanceSettings')}</strong>
-                <small className="text-xs text-[var(--text-muted)]">{t('applyImmediatelyAndPersist')}</small>
+              <div className="border-b border-[var(--border-subtle)] px-3 py-2">
+                <strong className="text-sm text-[var(--text-strong)]">{t('appearanceSettings')}</strong>
               </div>
 
-              <div className="divide-y divide-[var(--border-subtle)]">
-                <div className="grid gap-4 px-6 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                  <div>
-                    <strong className="block text-sm text-[var(--text-strong)]">{t('themeSettings')}</strong>
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-start gap-2 sm:justify-end">
-                    <div className="inline-flex flex-wrap items-center gap-1 rounded-full bg-[var(--surface-chip)] p-1">
-                      {themeModeOptions.map((option) => {
-                        const Icon = option.icon
-                        const active = themeMode === option.value
-                        return (
-                          <button
-                            key={option.value}
-                            type="button"
-                            className={cn(
-                              'inline-flex h-9 items-center gap-2 rounded-full px-4 text-sm transition',
-                              active
-                                ? 'bg-[var(--surface-panel-strong)] text-[var(--text-strong)] shadow-[0_6px_14px_rgba(20,38,52,0.08)]'
-                                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]',
-                            )}
-                            onClick={() => setThemeMode(option.value)}
-                          >
-                            <Icon className="h-4 w-4" />
-                            <span>{option.label}</span>
-                          </button>
-                        )
-                      })}
-                    </div>
+              <div className="grid gap-0">
+                <div className="grid gap-2 px-3 py-2.5 sm:grid-cols-[76px_minmax(0,1fr)] sm:items-center">
+                  <strong className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('themeSettings')}</strong>
+                  <div className="flex flex-wrap items-center gap-1">
+                    {themeModeOptions.map((option) => {
+                      const Icon = option.icon
+                      const active = themeMode === option.value
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={cn(
+                            'inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs transition',
+                            active
+                              ? 'border-[var(--border-strong)] bg-[var(--surface-panel-strong)] text-[var(--text-strong)] shadow-[0_3px_8px_rgba(20,38,52,0.08)]'
+                              : 'border-transparent bg-[var(--surface-chip)] text-[var(--text-muted)] hover:text-[var(--text-primary)]',
+                          )}
+                          onClick={() => handleThemeModeChange(option.value)}
+                        >
+                          <Icon className="h-4 w-4" />
+                          <span>{option.label}</span>
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
 
-                <div className="grid gap-4 px-6 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                  <div>
-                    <strong className="block text-sm text-[var(--text-strong)]">{t('languageSettings')}</strong>
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-start gap-2 sm:justify-end">
-                    <div className="inline-flex flex-wrap items-center gap-1 rounded-full bg-[var(--surface-chip)] p-1">
-                      {languageOptions.map((option) => {
-                        const active = appLocale === option.value
-                        return (
-                          <button
-                            key={option.value}
-                            type="button"
-                            className={cn(
-                              'inline-flex h-9 items-center gap-2 rounded-full px-4 text-sm transition',
-                              active
-                                ? 'bg-[var(--surface-panel-strong)] text-[var(--text-strong)] shadow-[0_6px_14px_rgba(20,38,52,0.08)]'
-                                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]',
-                            )}
-                            onClick={() => void setAppLocale(option.value)}
-                          >
-                            <Globe className="h-4 w-4" />
-                            <span>{option.label}</span>
-                          </button>
-                        )
-                      })}
-                    </div>
+                <div className="grid gap-2 border-t border-[var(--border-subtle)] px-3 py-2.5 sm:grid-cols-[76px_minmax(0,1fr)] sm:items-center">
+                  <strong className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('languageSettings')}</strong>
+                  <div className="flex flex-wrap items-center gap-1">
+                    {languageOptions.map((option) => {
+                      const active = appLocale === option.value
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={cn(
+                            'inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs transition',
+                            active
+                              ? 'border-[var(--border-strong)] bg-[var(--surface-panel-strong)] text-[var(--text-strong)] shadow-[0_3px_8px_rgba(20,38,52,0.08)]'
+                              : 'border-transparent bg-[var(--surface-chip)] text-[var(--text-muted)] hover:text-[var(--text-primary)]',
+                          )}
+                          onClick={() => void setAppLocale(option.value)}
+                        >
+                          <Globe className="h-4 w-4" />
+                          <span>{option.label}</span>
+                        </button>
+                      )
+                    })}
                   </div>
                 </div>
 
-                <div className="grid gap-4 px-6 py-5 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                  <div>
-                    <strong className="block text-sm text-[var(--text-strong)]">{t('themeAccentSettings')}</strong>
-                    <p className="mt-1 text-sm text-[var(--text-muted)]">{t('themeAccentHint')}</p>
+                <div className="grid gap-1.5 border-t border-[var(--border-subtle)] px-3 py-2.5 sm:grid-cols-[76px_minmax(0,1fr)] sm:items-start">
+                  <strong className="pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('themeAccentSettings')}</strong>
+                  <div className="grid gap-1.5">
+                    <p className="text-xs leading-4 text-[var(--text-muted)]">{t('themeAccentHint')}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {appThemes.map((theme) => (
+                        <button
+                          key={theme.id}
+                          type="button"
+                          title={t(theme.titleKey)}
+                          aria-label={t(theme.titleKey)}
+                          aria-pressed={appTheme === theme.id}
+                          className={cn(
+                            'grid h-7 w-7 place-items-center rounded-full transition hover:scale-[1.02]',
+                            appTheme === theme.id
+                              ? 'ring-2 ring-[var(--text-strong)] ring-offset-1 ring-offset-[var(--surface-panel)]'
+                              : 'hover:ring-2 hover:ring-[var(--border-subtle)] hover:ring-offset-1 hover:ring-offset-[var(--surface-panel)]',
+                          )}
+                          onClick={() => handleAppThemeChange(theme.id)}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className="h-6 w-6 rounded-full border border-white/70 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                            style={{ backgroundColor: theme.color }}
+                          />
+                        </button>
+                      ))}
+                    </div>
                   </div>
+                </div>
+              </div>
+            </section>
 
-                  <div className="flex flex-wrap items-center justify-start gap-3 sm:justify-end">
-                    {appThemes.map((theme) => (
-                      <button
-                        key={theme.id}
-                        type="button"
-                        title={t(theme.titleKey)}
-                        aria-label={t(theme.titleKey)}
-                        aria-pressed={appTheme === theme.id}
-                        className={cn(
-                          'grid h-9 w-9 place-items-center rounded-full transition hover:scale-[1.04]',
-                          appTheme === theme.id
-                            ? 'ring-2 ring-[var(--text-strong)] ring-offset-2 ring-offset-[var(--surface-panel)]'
-                            : 'hover:ring-2 hover:ring-[var(--border-subtle)] hover:ring-offset-2 hover:ring-offset-[var(--surface-panel)]',
-                        )}
-                        onClick={() => setAppTheme(theme.id)}
-                      >
-                        <span
-                          aria-hidden="true"
-                          className="h-8 w-8 rounded-full border border-white/70 shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
-                          style={{ backgroundColor: theme.color }}
-                        />
-                      </button>
+            <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+              <div className="border-b border-[var(--border-subtle)] px-3 py-2">
+                <strong className="text-sm text-[var(--text-strong)]">{t('windowCloseSettings')}</strong>
+              </div>
+
+              <div className="grid gap-2 px-3 py-2.5 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                <div>
+                  <small className="block text-[11px] text-[var(--text-muted)]">{t('currentWindowCloseBehavior', { behavior: currentWindowCloseBehaviorLabel })}</small>
+                </div>
+                <div className="grid gap-2">
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {closeBehaviorOptions.map((option) => (
+                      <Button key={option.value} className="h-7 px-2.5 text-xs" variant={windowCloseBehavior === option.value ? 'default' : 'secondary'} onClick={() => handleWindowCloseBehaviorChange(option.value)}>
+                        {option.label}
+                      </Button>
                     ))}
                   </div>
+                  <p className="text-[11px] leading-4 text-[var(--text-muted)]">{t('windowCloseBehaviorHint')}</p>
                 </div>
-
               </div>
             </section>
 
-            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <div>
-                  <strong className="block">{t('windowCloseSettings')}</strong>
-                  <span className="text-sm text-[var(--text-muted)]">{t('currentWindowCloseBehavior', { behavior: currentWindowCloseBehaviorLabel })}</span>
-                </div>
-                <small className="text-xs text-[var(--text-muted)]">{t('applyImmediatelyAndPersist')}</small>
-              </div>
-
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                {closeBehaviorOptions.map((option) => (
-                  <Button key={option.value} variant={windowCloseBehavior === option.value ? 'default' : 'secondary'} onClick={() => setWindowCloseBehavior(option.value)}>
-                    {option.label}
-                  </Button>
-                ))}
-              </div>
-
-              <p className="mt-3 text-xs text-[var(--text-muted)]">{t('windowCloseBehaviorHint')}</p>
-            </section>
-
-            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <strong className="block">{t('updateSettings')}</strong>
-                  <span className="text-sm text-[var(--text-muted)]">{appUpdateStatusLabel}</span>
-                </div>
-                <Button variant="secondary" onClick={() => void checkForAppUpdate()} disabled={checkingAppUpdate}>
+            <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-subtle)] px-3 py-2">
+                <strong className="text-sm text-[var(--text-strong)]">{t('updateSettings')}</strong>
+                <Button className="h-7 px-2.5 text-xs" size="sm" variant="secondary" onClick={() => void checkForAppUpdate()} disabled={checkingAppUpdate}>
                   {t('checkUpdates')}
                 </Button>
               </div>
 
-              <div className="mt-4 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] p-4">
-                <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="grid gap-2 px-3 py-2.5">
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-center">
                   <div>
-                    <strong className="block">{t('updateChannelSettings')}</strong>
-                    <small className="text-xs text-[var(--text-muted)]">{t('currentUpdateChannel', { channel: currentUpdateChannelLabel })}</small>
+                    <strong className="block text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('updateChannelSettings')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('currentUpdateChannel', { channel: currentUpdateChannelLabel })}</small>
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     {updateChannelOptions.map((option) => (
-                      <Button key={option.value} size="sm" variant={updateChannel === option.value ? 'default' : 'secondary'} onClick={() => setUpdateChannel(option.value)}>
+                      <Button key={option.value} className="h-7 px-2.5 text-xs" size="sm" variant={updateChannel === option.value ? 'default' : 'secondary'} onClick={() => handleUpdateChannelChange(option.value)}>
                         {option.label}
                       </Button>
                     ))}
                   </div>
                 </div>
 
-                <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-lg bg-[var(--surface-chip)] px-4 py-3">
-                    <small className="block text-xs text-[var(--text-muted)]">{t('updateCurrentVersionLabel')}</small>
-                    <strong>{appUpdateInfo?.current_version || '--'}</strong>
-                  </div>
-                  <div className="rounded-lg bg-[var(--surface-chip)] px-4 py-3">
-                    <small className="block text-xs text-[var(--text-muted)]">{t('updateLatestVersionLabel')}</small>
-                    <strong>{appUpdateInfo?.latest_version || '--'}</strong>
-                  </div>
-                </div>
+                {appUpdateInfo ? (
+                  <>
+                    <div className="grid gap-1.5 grid-cols-2">
+                      <div className="rounded-lg bg-[var(--surface-chip)] px-2.5 py-2">
+                        <small className="block text-[11px] text-[var(--text-muted)]">{t('updateCurrentVersionLabel')}</small>
+                        <strong className="text-[13px]">{appUpdateInfo.current_version || '--'}</strong>
+                      </div>
+                      <div className="rounded-lg bg-[var(--surface-chip)] px-2.5 py-2">
+                        <small className="block text-[11px] text-[var(--text-muted)]">{t('updateLatestVersionLabel')}</small>
+                        <strong className="text-[13px]">{appUpdateInfo.latest_version || '--'}</strong>
+                      </div>
+                    </div>
 
-                {appUpdateInfo && (
-                  <div className="mt-4 space-y-2 text-sm text-[var(--text-primary)]">
-                    <div className="flex flex-wrap items-center justify-between gap-2"><span>{appUpdateInfo.release_name}</span><small className="text-xs text-[var(--text-muted)]">{appUpdateInfo.release_tag} · {appUpdateReleaseChannelLabel}</small></div>
-                    {appUpdateInfo.published_at && <div className="text-xs text-[var(--text-muted)]">{t('updatePublishedAt', { date: formatReleaseDate(appUpdateInfo.published_at) })}</div>}
-                    {appUpdateInfo.download_asset && <div className="text-xs text-[var(--text-muted)]">{t('updatePackageLabel', { name: appUpdateInfo.download_asset.name })} · {t('updatePackageSize', { size: Math.ceil(appUpdateInfo.download_asset.size_bytes / 1024 / 1024) })}</div>}
-                  </div>
+                    <div className="space-y-1 text-xs text-[var(--text-primary)]">
+                      <div className="flex flex-wrap items-center justify-between gap-2"><span>{appUpdateInfo.release_name}</span><small className="text-[11px] text-[var(--text-muted)]">{appUpdateInfo.release_tag} · {appUpdateReleaseChannelLabel}</small></div>
+                      {appUpdateInfo.published_at && <div className="text-[11px] text-[var(--text-muted)]">{t('updatePublishedAt', { date: formatReleaseDate(appUpdateInfo.published_at) })}</div>}
+                      {appUpdateInfo.download_asset && <div className="text-[11px] text-[var(--text-muted)]">{t('updatePackageLabel', { name: appUpdateInfo.download_asset.name })} · {t('updatePackageSize', { size: Math.ceil(appUpdateInfo.download_asset.size_bytes / 1024 / 1024) })}</div>}
+                    </div>
+
+                    {appUpdateInfo.update_available && appUpdateInfo.download_asset && (
+                      <div>
+                        <Button className="h-7 px-2.5 text-xs" onClick={() => void downloadLatestRelease()} disabled={downloadingAppUpdate}>{t('downloadAndInstallUpdate')}</Button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-[11px] leading-4 text-[var(--text-muted)]">{appUpdateStatusLabel}</p>
                 )}
 
                 {appUpdateProgress && (
-                  <div className="mt-4 space-y-2">
-                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--text-muted)]">
+                  <div className="space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--text-muted)]">
                       <span>{appUpdateProgress.status === 'installing' ? t('updateInstallingProgress', { name: appUpdateProgress.filename || '' }) : t('updateDownloadingProgress', { name: appUpdateProgress.filename || '', percent: appUpdateProgressPercent })}</span>
                       <small>{t('updateProgressBytes', { downloaded: formatUpdateBytes(appUpdateProgress.downloaded_bytes), total: formatUpdateBytes(appUpdateProgress.total_bytes) })}</small>
                     </div>
@@ -2333,14 +2420,8 @@ export default function App() {
                   </div>
                 )}
 
-                {appUpdateInfo?.update_available && appUpdateInfo.download_asset && (
-                  <div className="mt-4">
-                    <Button onClick={() => void downloadLatestRelease()} disabled={downloadingAppUpdate}>{t('downloadAndInstallUpdate')}</Button>
-                  </div>
-                )}
+                <p className="text-[11px] leading-4 text-[var(--text-muted)]">{t('updateHint')}</p>
               </div>
-
-              <p className="mt-3 text-xs text-[var(--text-muted)]">{t('updateHint')}</p>
             </section>
           </div>
         </DialogContent>

@@ -25,6 +25,41 @@ const applyDocumentLocale = (nextLocale: AppLocale) => {
   document.documentElement.lang = nextLocale === 'zh-CN' ? 'zh-CN' : 'en'
 }
 
+const resolveCurrentLocale = (): AppLocale => {
+  const language = i18n.resolvedLanguage || i18n.language
+  return isAppLocale(language) ? language : DEFAULT_LOCALE
+}
+
+let pendingLocaleChange: AppLocale | undefined
+let localeChangePromise: Promise<void> | null = null
+
+const flushPendingLocaleChange = () => {
+  if (localeChangePromise) return localeChangePromise
+
+  localeChangePromise = (async () => {
+    while (pendingLocaleChange) {
+      const nextLocale = pendingLocaleChange
+      pendingLocaleChange = undefined
+
+      applyDocumentLocale(nextLocale)
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(LOCALE_STORAGE_KEY, nextLocale)
+      }
+
+      if (resolveCurrentLocale() !== nextLocale) {
+        await i18n.changeLanguage(nextLocale)
+      }
+    }
+  })().finally(() => {
+    localeChangePromise = null
+    if (pendingLocaleChange) {
+      void flushPendingLocaleChange()
+    }
+  })
+
+  return localeChangePromise
+}
+
 const resources = {
   'zh-CN': {
     translation: {
@@ -435,17 +470,10 @@ i18n.on('languageChanged', (language) => {
 })
 
 export const setAppLocale = async (nextLocale: AppLocale) => {
-  applyDocumentLocale(nextLocale)
-  if (typeof localStorage !== 'undefined') {
-    localStorage.setItem(LOCALE_STORAGE_KEY, nextLocale)
-  }
-
-  await i18n.changeLanguage(nextLocale)
+  pendingLocaleChange = nextLocale
+  await flushPendingLocaleChange()
 }
 
-export const getAppLocale = (): AppLocale => {
-  const language = i18n.resolvedLanguage || i18n.language
-  return isAppLocale(language) ? language : DEFAULT_LOCALE
-}
+export const getAppLocale = resolveCurrentLocale
 
 export default i18n
