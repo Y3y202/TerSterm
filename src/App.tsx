@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useRef, useState } from 'react'
+import { useCallback, useDeferredValue, useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
@@ -100,6 +100,14 @@ type ThemeMode = 'light' | 'dark' | 'system'
 type ResolvedThemeMode = Exclude<ThemeMode, 'system'>
 type AnalysisThemeId = 'mint' | 'sky' | 'amber' | 'rose' | 'violet' | 'orange'
 type WindowCloseBehavior = 'tray' | 'exit'
+type SavedSettingsSnapshot = {
+  appTheme: AppThemeId
+  themeMode: ThemeMode
+  analysisTheme: AnalysisThemeId
+  updateChannel: UpdateChannel
+  windowCloseBehavior: WindowCloseBehavior
+  locale: ReturnType<typeof getAppLocale>
+}
 
 const appThemes = [
   {
@@ -493,6 +501,40 @@ export default function App() {
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     window.matchMedia('(prefers-color-scheme: dark)').matches,
   )
+  const savedSettingsRef = useRef<SavedSettingsSnapshot>({
+    appTheme,
+    themeMode,
+    analysisTheme,
+    updateChannel,
+    windowCloseBehavior,
+    locale: getAppLocale(),
+  })
+  const settingsSavedToastTimerRef = useRef<number>()
+  const notifySettingsSaved = useCallback(() => {
+    if (settingsSavedToastTimerRef.current) {
+      window.clearTimeout(settingsSavedToastTimerRef.current)
+    }
+
+    settingsSavedToastTimerRef.current = window.setTimeout(() => {
+      toast.success(i18n.t('settingsSaved'), { id: 'settings-saved' })
+    }, 120)
+  }, [])
+  const recordSettingsSaved = useCallback((nextSettings: SavedSettingsSnapshot) => {
+    const previousSettings = savedSettingsRef.current
+    const changed =
+      previousSettings.appTheme !== nextSettings.appTheme ||
+      previousSettings.themeMode !== nextSettings.themeMode ||
+      previousSettings.analysisTheme !== nextSettings.analysisTheme ||
+      previousSettings.updateChannel !== nextSettings.updateChannel ||
+      previousSettings.windowCloseBehavior !== nextSettings.windowCloseBehavior ||
+      previousSettings.locale !== nextSettings.locale
+
+    savedSettingsRef.current = nextSettings
+
+    if (changed) {
+      notifySettingsSaved()
+    }
+  }, [notifySettingsSaved])
 
   const updateInfoQuery = useQuery({
     queryKey: ['app-update', updateChannel],
@@ -590,7 +632,8 @@ export default function App() {
     localStorage.setItem(THEME_STORAGE_KEY, appTheme)
     localStorage.setItem(THEME_MODE_STORAGE_KEY, themeMode)
     localStorage.setItem(ANALYSIS_THEME_STORAGE_KEY, analysisTheme)
-  }, [analysisTheme, appTheme, resolvedThemeMode, themeMode])
+    recordSettingsSaved({ ...savedSettingsRef.current, appTheme, themeMode, analysisTheme })
+  }, [analysisTheme, appTheme, recordSettingsSaved, resolvedThemeMode, themeMode])
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
@@ -641,12 +684,25 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, updateChannel)
     setAppUpdateProgress(undefined)
-  }, [setAppUpdateProgress, updateChannel])
+    recordSettingsSaved({ ...savedSettingsRef.current, updateChannel })
+  }, [recordSettingsSaved, setAppUpdateProgress, updateChannel])
 
   useEffect(() => {
+    let disposed = false
+
     localStorage.setItem(WINDOW_CLOSE_BEHAVIOR_STORAGE_KEY, windowCloseBehavior)
     void syncWindowCloseBehavior(windowCloseBehavior)
-  }, [windowCloseBehavior])
+      .then(() => {
+        if (!disposed) {
+          recordSettingsSaved({ ...savedSettingsRef.current, windowCloseBehavior })
+        }
+      })
+      .catch(() => undefined)
+
+    return () => {
+      disposed = true
+    }
+  }, [recordSettingsSaved, windowCloseBehavior])
 
   useEffect(() => {
     localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(connections))
@@ -657,7 +713,15 @@ export default function App() {
   }, [groups])
 
   useEffect(() => {
+    let disposed = false
+
     void syncDesktopLocale(appLocale)
+      .then(() => {
+        if (!disposed) {
+          recordSettingsSaved({ ...savedSettingsRef.current, locale: appLocale })
+        }
+      })
+      .catch(() => undefined)
     setPanes((current) =>
       current.map((pane, index) => {
         if (pane.connection) return pane
@@ -666,7 +730,16 @@ export default function App() {
         return pane.title === nextTitle ? pane : { ...pane, title: nextTitle }
       }),
     )
-  }, [appLocale, setPanes])
+    return () => {
+      disposed = true
+    }
+  }, [appLocale, recordSettingsSaved, setPanes])
+
+  useEffect(() => () => {
+    if (settingsSavedToastTimerRef.current) {
+      window.clearTimeout(settingsSavedToastTimerRef.current)
+    }
+  }, [])
 
   useEffect(() => {
     pruneSyncTargets()
