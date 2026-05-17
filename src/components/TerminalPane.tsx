@@ -211,6 +211,7 @@ const formatBytes = (size?: number) => {
 }
 
 const DOWNLOAD_DIRECTORY_STORAGE_KEY = 'tersterm:download-directory'
+const AI_CONVERSATION_STORAGE_KEY_PREFIX = 'tersterm:ai-conversations:'
 const AI_TERMINAL_COMMAND_TAG_PATTERN = /<tersterm-command\b([^>]*)>([\s\S]*?)<\/tersterm-command>/gi
 const AI_TERMINAL_COMMAND_DELAY_MS = 35
 const AI_TERMINAL_COMMAND_DELAY_MIN_MS = 10
@@ -268,6 +269,115 @@ const createAiConversation = (): AiConversation => {
     messages: [],
     createdAt: now,
     updatedAt: now,
+  }
+}
+
+interface StoredAiConversationState {
+  conversations: AiConversation[]
+  activeConversationId: string
+}
+
+const createDefaultAiConversationState = (): StoredAiConversationState => {
+  const conversation = createAiConversation()
+  return {
+    conversations: [conversation],
+    activeConversationId: conversation.id,
+  }
+}
+
+const buildAiConversationStorageKey = (connection?: ConnectionProfile) => {
+  const host = connection?.host?.trim().toLowerCase()
+  const username = connection?.username?.trim().toLowerCase()
+  const port = Number(connection?.port || 22)
+
+  if (!host || !username || !Number.isFinite(port) || port <= 0) return undefined
+  return `${AI_CONVERSATION_STORAGE_KEY_PREFIX}${username}@${host}:${port}`
+}
+
+const sanitizeAiConversationMessage = (value: unknown): AiAssistantMessage | null => {
+  if (!value || typeof value !== 'object') return null
+
+  const role = 'role' in value ? value.role : undefined
+  const content = 'content' in value ? value.content : undefined
+  if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string') return null
+
+  const normalizedContent = content.trim()
+  if (!normalizedContent) return null
+
+  return {
+    role,
+    content: normalizedContent,
+  }
+}
+
+const sanitizeAiConversationState = (value: unknown): StoredAiConversationState => {
+  if (!value || typeof value !== 'object') return createDefaultAiConversationState()
+
+  const record = value as Record<string, unknown>
+  const rawConversations = Array.isArray(record.conversations)
+    ? record.conversations
+    : []
+  const conversations = rawConversations.flatMap((conversation: unknown) => {
+    if (!conversation || typeof conversation !== 'object') return []
+    const conversationRecord = conversation as Record<string, unknown>
+
+    const id = typeof conversationRecord.id === 'string' && conversationRecord.id.trim()
+      ? conversationRecord.id.trim()
+      : createAiConversationId()
+    const title = typeof conversationRecord.title === 'string'
+      ? conversationRecord.title
+      : ''
+    const createdAt = Number.isFinite(conversationRecord.createdAt)
+      ? Number(conversationRecord.createdAt)
+      : Date.now()
+    const updatedAt = Number.isFinite(conversationRecord.updatedAt)
+      ? Number(conversationRecord.updatedAt)
+      : createdAt
+    const messages = Array.isArray(conversationRecord.messages)
+      ? conversationRecord.messages
+        .map(sanitizeAiConversationMessage)
+        .filter((message: AiAssistantMessage | null): message is AiAssistantMessage => Boolean(message))
+      : []
+
+    return [{
+      id,
+      title,
+      messages,
+      createdAt,
+      updatedAt,
+    }]
+  })
+
+  if (conversations.length === 0) {
+    return createDefaultAiConversationState()
+  }
+
+  const requestedActiveId =
+    typeof record.activeConversationId === 'string'
+      ? record.activeConversationId
+      : ''
+  const activeConversationId = conversations.some((conversation) => conversation.id === requestedActiveId)
+    ? requestedActiveId
+    : conversations[0].id
+
+  return {
+    conversations,
+    activeConversationId,
+  }
+}
+
+const readStoredAiConversationState = (storageKey?: string): StoredAiConversationState => {
+  if (typeof localStorage === 'undefined' || !storageKey) {
+    return createDefaultAiConversationState()
+  }
+
+  const raw = localStorage.getItem(storageKey)
+  if (!raw) return createDefaultAiConversationState()
+
+  try {
+    return sanitizeAiConversationState(JSON.parse(raw))
+  } catch {
+    return createDefaultAiConversationState()
   }
 }
 
@@ -397,7 +507,9 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const terminalTextDecoderRef = useRef(new TextDecoder())
   const terminalEventTextDecoderRef = useRef(new TextDecoder())
   const latestPropsRef = useRef(props)
-  const initialAiConversationRef = useRef<AiConversation>(createAiConversation())
+  const initialAiConversationStorageKeyRef = useRef(buildAiConversationStorageKey(props.pane.connection))
+  const initialAiConversationStateRef = useRef(readStoredAiConversationState(initialAiConversationStorageKeyRef.current))
+  const skipNextAiConversationPersistKeyRef = useRef<string>()
   const [fileManagerOpen, setFileManagerOpen, fileManagerOpenRef] = useStateRef(false)
   const [aiAssistantOpen, setAiAssistantOpen, aiAssistantOpenRef] = useStateRef(false)
   const [aiHistoryOpen, setAiHistoryOpen] = useState(false)
@@ -430,8 +542,8 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     sessionId: string
     fileLabel: string
   } | null>(null)
-  const [aiConversations, setAiConversations] = useStateRef<AiConversation[]>([initialAiConversationRef.current])
-  const [activeAiConversationId, setActiveAiConversationId, activeAiConversationIdRef] = useStateRef(initialAiConversationRef.current.id)
+  const [aiConversations, setAiConversations] = useStateRef<AiConversation[]>(initialAiConversationStateRef.current.conversations)
+  const [activeAiConversationId, setActiveAiConversationId, activeAiConversationIdRef] = useStateRef(initialAiConversationStateRef.current.activeConversationId)
   const [aiAssistantDraft, setAiAssistantDraft] = useState('')
   const [aiAssistantSending, setAiAssistantSending] = useState(false)
   const [pendingAiCommandApproval, setPendingAiCommandApproval] = useState<{ text: string } | null>(null)
@@ -453,6 +565,34 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   useEffect(() => {
     latestPropsRef.current = props
   }, [props])
+
+  const aiConversationStorageKey = buildAiConversationStorageKey(props.pane.connection)
+
+  useEffect(() => {
+    const nextState = readStoredAiConversationState(aiConversationStorageKey)
+    skipNextAiConversationPersistKeyRef.current = aiConversationStorageKey
+    setAiConversations(nextState.conversations)
+    setActiveAiConversationId(nextState.activeConversationId)
+    setAiAssistantDraft('')
+    setAiHistoryOpen(false)
+  }, [aiConversationStorageKey, setActiveAiConversationId, setAiConversations])
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined' || !aiConversationStorageKey) return
+    if (skipNextAiConversationPersistKeyRef.current === aiConversationStorageKey) {
+      skipNextAiConversationPersistKeyRef.current = undefined
+      return
+    }
+
+    const activeConversationId = aiConversations.some((conversation) => conversation.id === activeAiConversationId)
+      ? activeAiConversationId
+      : aiConversations[0]?.id || createAiConversation().id
+
+    localStorage.setItem(aiConversationStorageKey, JSON.stringify({
+      conversations: aiConversations,
+      activeConversationId,
+    }))
+  }, [activeAiConversationId, aiConversationStorageKey, aiConversations])
 
   useEffect(() => () => {
     pendingAiCommandApprovalResolverRef.current?.(false)
@@ -476,7 +616,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const activeAiConversation =
     aiConversations.find((conversation) => conversation.id === activeAiConversationId) ||
     aiConversations[0] ||
-    initialAiConversationRef.current
+    initialAiConversationStateRef.current.conversations[0]
   const aiAssistantMessages = activeAiConversation.messages
   const aiConversationHistory = [...aiConversations]
     .filter((conversation) => conversation.messages.length > 0 || conversation.id === activeAiConversation.id)
@@ -754,13 +894,9 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   }
 
   const resetAiAssistantState = () => {
-    const nextConversation = createAiConversation()
-    initialAiConversationRef.current = nextConversation
     setAiAssistantOpen(false)
     setAiHistoryOpen(false)
     setAiAssistantDraft('')
-    setAiConversations([nextConversation])
-    setActiveAiConversationId(nextConversation.id)
     setAiAssistantSending(false)
   }
 
