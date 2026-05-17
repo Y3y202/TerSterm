@@ -4,6 +4,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link'
 import { useTranslation } from 'react-i18next'
 import {
+  Bot,
   Check,
   ChevronRight,
   Copy,
@@ -14,6 +15,7 @@ import {
   Monitor,
   Moon,
   Minus,
+  Play,
   Plus,
   RefreshCcw,
   Settings,
@@ -60,6 +62,7 @@ import {
   downloadAppUpdate as fetchAppUpdatePackage,
   onAppUpdateDownloadProgress,
   onSshData,
+  requestAiAssistantReply,
   setDesktopLocale as syncDesktopLocale,
   setWindowCloseBehavior as syncWindowCloseBehavior,
   sshConnect,
@@ -69,6 +72,12 @@ import {
   sshWrite,
 } from './bridge'
 import i18n, { getAppLocale, setAppLocale } from './i18n'
+import {
+  buildMultiHostSystemPrompt,
+  parseMultiHostPlanReply,
+  substituteMultiHostPlanVariables,
+  type MultiHostPlan,
+} from './lib/multi-host-ai'
 import { useStateRef } from './lib/use-state-ref'
 import { cn } from './lib/utils'
 import type { AiAssistantPermission, AiAssistantSettings, AiProvider, AppUpdateDownloadProgress, ConnectionGroup, ConnectionProfile, SshPane, SystemUsage } from './types'
@@ -114,6 +123,27 @@ type SavedSettingsSnapshot = {
   aiModel: string
   aiSystemPrompt: string
   aiTerminalPermission: AiAssistantPermission
+}
+
+type MultiHostExecutionStepStatus = 'pending' | 'running' | 'success' | 'error'
+
+type MultiHostExecutionState = {
+  status: 'idle' | 'running' | 'success' | 'error'
+  message?: string
+  activeStepId?: string
+  stepStatuses: Record<string, { status: MultiHostExecutionStepStatus; message?: string }>
+  variables: Record<string, string>
+}
+
+type MultiHostTarget = {
+  paneId: string
+  sessionId: string
+  title: string
+  host?: string
+  username?: string
+  hostPlatform?: string
+  linuxDistro?: string
+  role?: string
 }
 
 const appThemes = [
@@ -166,6 +196,7 @@ const DEFAULT_ANALYSIS_THEME_ID: AnalysisThemeId = 'rose'
 const DEFAULT_AI_PROVIDER: AiProvider = 'openai-compatible'
 const DEFAULT_AI_TERMINAL_PERMISSION: AiAssistantPermission = 'type-only'
 const DEFAULT_AI_SYSTEM_PROMPT = 'You are the TerSterm AI assistant. Help with Linux and Windows server operations, SSH troubleshooting, deployment, logs, file management, permissions, networking, and shell usage. Keep answers concise, practical, and accurate.'
+const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
 
 const isAppThemeId = (value: string | null): value is AppThemeId =>
   Boolean(value && appThemes.some((theme) => theme.id === value))
@@ -516,6 +547,14 @@ export default function App() {
   const [analysisTheme] = useState<AnalysisThemeId>(readStoredAnalysisTheme())
   const [aiAssistantSettings, setAiAssistantSettings, aiAssistantSettingsRef] = useStateRef<AiAssistantSettings>(initialAiAssistantSettingsRef.current)
   const [aiAssistantDraftSettings, setAiAssistantDraftSettings] = useState<AiAssistantSettings>(initialAiAssistantSettingsRef.current)
+  const [multiHostAiOpen, setMultiHostAiOpen] = useState(false)
+  const [multiHostSelectedPaneIds, setMultiHostSelectedPaneIds] = useState<string[]>([])
+  const [multiHostRoles, setMultiHostRoles] = useState<Record<string, string>>({})
+  const [multiHostMessages, setMultiHostMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([])
+  const [multiHostDraft, setMultiHostDraft] = useState('')
+  const [multiHostSending, setMultiHostSending] = useState(false)
+  const [multiHostPlan, setMultiHostPlan] = useState<MultiHostPlan | null>(null)
+  const [multiHostExecution, setMultiHostExecution] = useState<MultiHostExecutionState | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed, sidebarCollapsedRef] = useStateRef(readStoredSidebarCollapsed())
   const [updateChannel, setUpdateChannel, updateChannelRef] = useStateRef<UpdateChannel>(readStoredUpdateChannel())
   const [windowCloseBehavior, setWindowCloseBehavior, windowCloseBehaviorRef] = useStateRef<WindowCloseBehavior>(readStoredWindowCloseBehavior())
@@ -726,6 +765,18 @@ export default function App() {
     .map((paneId) => panes.find((pane) => pane.id === paneId))
     .filter((pane): pane is SshPane => Boolean(pane))
   const visibleConnectedPanes = visiblePanes.filter((pane) => pane.status === 'connected' && pane.session_id)
+  const connectedPanes = panes.filter((pane) => pane.status === 'connected' && pane.session_id)
+  const multiHostTargets: MultiHostTarget[] = connectedPanes.map((pane) => ({
+    paneId: pane.id,
+    sessionId: pane.session_id!,
+    title: pane.title,
+    host: pane.connection?.host,
+    username: pane.connection?.username,
+    hostPlatform: pane.connection?.host_platform,
+    linuxDistro: pane.connection?.linux_distro,
+    role: multiHostRoles[pane.id]?.trim() || undefined,
+  }))
+  const selectedMultiHostTargets = multiHostTargets.filter((target) => multiHostSelectedPaneIds.includes(target.paneId))
   const syncTargetPanes = visibleConnectedPanes.filter((pane) => syncedPaneIds.includes(pane.id))
   const canBroadcastInput = syncInputEnabled && syncTargetPanes.length >= 2
   const syncStatusSummary = visibleConnectedPanes.length < 2
@@ -909,6 +960,11 @@ export default function App() {
   useEffect(() => {
     pruneSyncTargets()
   }, [setSyncedPaneIds, setSyncInputEnabled, syncedPaneIdsRef, visibleConnectedPanes.map((pane) => `${pane.id}:${pane.session_id}`).join('|')])
+
+  useEffect(() => {
+    const availablePaneIds = new Set(connectedPanes.map((pane) => pane.id))
+    setMultiHostSelectedPaneIds((current) => current.filter((paneId) => availablePaneIds.has(paneId)))
+  }, [connectedPanes.map((pane) => `${pane.id}:${pane.session_id}`).join('|')])
 
   const scheduleFitAllTerminals = () => {
     requestAnimationFrame(() => {
@@ -1161,6 +1217,276 @@ export default function App() {
 
     setSyncedPaneIds(nextSelected)
     setSyncInputEnabled(nextSelected.length >= 2)
+  }
+
+  const openMultiHostAiDialog = () => {
+    if (connectedPanes.length === 0) {
+      toast.warning(t('noConnectedSessions'))
+      return
+    }
+
+    const preferredPaneIds = syncedPaneIdsRef.current.filter((paneId) =>
+      connectedPanes.some((pane) => pane.id === paneId),
+    )
+    const nextSelectedPaneIds = preferredPaneIds.length > 0
+      ? preferredPaneIds
+      : connectedPanes.map((pane) => pane.id)
+
+    setMultiHostSelectedPaneIds(nextSelectedPaneIds)
+    setMultiHostRoles((current) => {
+      const next = { ...current }
+      nextSelectedPaneIds.forEach((paneId) => {
+        if (!(paneId in next)) {
+          next[paneId] = ''
+        }
+      })
+      return next
+    })
+    setMultiHostAiOpen(true)
+  }
+
+  const toggleMultiHostTarget = (paneId: string) => {
+    setMultiHostSelectedPaneIds((current) =>
+      current.includes(paneId)
+        ? current.filter((value) => value !== paneId)
+        : [...current, paneId],
+    )
+  }
+
+  const setMultiHostRole = (paneId: string, role: string) => {
+    setMultiHostRoles((current) => ({ ...current, [paneId]: role }))
+  }
+
+  const waitForPaneOutputQuiet = async (
+    paneId: string,
+    startLength: number,
+    idleMs = 1200,
+    timeoutMs = 90000,
+  ) => {
+    let lastOutput = getPaneOutputProbe(paneId)
+    let lastLength = lastOutput.length
+    let lastChangeAt = Date.now()
+    const deadline = Date.now() + timeoutMs
+
+    while (Date.now() < deadline) {
+      await sleep(150)
+      const currentOutput = getPaneOutputProbe(paneId)
+      const currentLength = currentOutput.length
+
+      if (currentLength !== lastLength) {
+        lastLength = currentLength
+        lastOutput = currentOutput
+        lastChangeAt = Date.now()
+        continue
+      }
+
+      if (currentLength > startLength && Date.now() - lastChangeAt >= idleMs) {
+        return currentOutput.slice(startLength)
+      }
+    }
+
+    return lastOutput.slice(startLength)
+  }
+
+  const submitMultiHostAiPrompt = async () => {
+    const content = multiHostDraft.trim()
+    if (!content || multiHostSending) return
+
+    if (!aiAssistantSettings.api_key.trim() || !aiAssistantSettings.model.trim()) {
+      toast.warning(t('aiAssistantMissingConfig'))
+      handleSettingsModalOpenChange(true)
+      return
+    }
+
+    if (selectedMultiHostTargets.length === 0) {
+      toast.warning(t('multiHostAiNeedTarget'))
+      return
+    }
+
+    const nextMessages = [...multiHostMessages, { role: 'user' as const, content }]
+    setMultiHostMessages(nextMessages)
+    setMultiHostDraft('')
+    setMultiHostSending(true)
+
+    try {
+      const reply = await requestAiAssistantReply(
+        {
+          ...aiAssistantSettings,
+          system_prompt: buildMultiHostSystemPrompt(
+            aiAssistantSettings.system_prompt,
+            selectedMultiHostTargets.map((target) => ({
+              pane_id: target.paneId,
+              title: target.title,
+              host: target.host,
+              username: target.username,
+              host_platform: target.hostPlatform,
+              linux_distro: target.linuxDistro,
+              role: target.role,
+            })),
+            aiAssistantSettings.terminal_permission,
+          ),
+        },
+        nextMessages,
+      )
+
+      const parsedReply = parseMultiHostPlanReply(reply)
+      setMultiHostMessages((current) => [
+        ...current,
+        { role: 'assistant', content: parsedReply.content || parsedReply.plan?.summary || t('multiHostAiPlanReady') },
+      ])
+      setMultiHostPlan(parsedReply.plan || null)
+      setMultiHostExecution(null)
+
+      if (!parsedReply.plan) {
+        toast.message(t('multiHostAiNoPlan'))
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+      setMultiHostMessages((current) => [
+        ...current,
+        { role: 'assistant', content: t('aiAssistantErrorReply') },
+      ])
+    } finally {
+      setMultiHostSending(false)
+    }
+  }
+
+  const runMultiHostPlan = async () => {
+    if (!multiHostPlan) return
+
+    if (aiAssistantSettingsRef.current.terminal_permission === 'reply-only') {
+      toast.warning(t('multiHostAiPermissionBlocked'))
+      return
+    }
+
+    const selectedTargetMap = new Map(selectedMultiHostTargets.map((target) => [target.paneId, target]))
+    if (selectedTargetMap.size === 0) {
+      toast.warning(t('multiHostAiNeedTarget'))
+      return
+    }
+
+    const initialStepStatuses = Object.fromEntries(
+      multiHostPlan.steps.map((step) => [step.id, { status: 'pending' as MultiHostExecutionStepStatus }]),
+    )
+    const variables: Record<string, string> = {}
+
+    const setStepStatus = (
+      stepId: string,
+      status: MultiHostExecutionStepStatus,
+      message?: string,
+      nextVariables?: Record<string, string>,
+    ) => {
+      setMultiHostExecution((current) => ({
+        status: current?.status === 'error' ? 'error' : 'running',
+        activeStepId: status === 'running' ? stepId : current?.activeStepId,
+        stepStatuses: {
+          ...(current?.stepStatuses || initialStepStatuses),
+          [stepId]: { status, message },
+        },
+        variables: nextVariables || current?.variables || {},
+      }))
+    }
+
+    setMultiHostExecution({
+      status: 'running',
+      activeStepId: undefined,
+      stepStatuses: initialStepStatuses,
+      variables: {},
+    })
+
+    try {
+      for (const step of multiHostPlan.steps) {
+        const resolvedTargetIds =
+          step.targets.length === 1 && step.targets[0] === 'all'
+            ? [...selectedTargetMap.keys()]
+            : step.targets
+
+        if (resolvedTargetIds.length === 0) {
+          throw new Error(`Plan step has no runnable targets: ${step.title}`)
+        }
+
+        const resolvedTargets = resolvedTargetIds.map((paneId) => {
+          const target = selectedTargetMap.get(paneId)
+          if (!target) {
+            throw new Error(`Plan step references an unavailable target: ${paneId}`)
+          }
+          return target
+        })
+
+        setStepStatus(step.id, 'running', t('multiHostAiStepRunning', { title: step.title }), { ...variables })
+
+        const runStepOnTarget = async (target: MultiHostTarget) => {
+          const pane = getPaneById(target.paneId)
+          if (!pane?.session_id || pane.status !== 'connected') {
+            throw new Error(`${target.title} is not connected`)
+          }
+
+          const command = substituteMultiHostPlanVariables(step.command, variables)
+          const shouldExecute = step.execute && aiAssistantSettingsRef.current.terminal_permission === 'execute'
+          const outputStartLength = getPaneOutputProbe(target.paneId).length
+
+          await sshWrite(pane.session_id, command)
+          if (shouldExecute) {
+            await sshWrite(pane.session_id, '\r')
+          }
+
+          if (!step.capture) {
+            return
+          }
+
+          if (!shouldExecute) {
+            throw new Error(`Step "${step.title}" needs execute permission to capture output`)
+          }
+
+          const output = await waitForPaneOutputQuiet(target.paneId, outputStartLength)
+          const pattern = new RegExp(step.capture.pattern, 'ms')
+          const match = pattern.exec(output)
+
+          if (!match) {
+            throw new Error(`Step "${step.title}" did not produce capture "${step.capture.name}"`)
+          }
+
+          variables[step.capture.name] = (match[1] || match[0] || '').trim()
+        }
+
+        if (step.parallel) {
+          await Promise.all(resolvedTargets.map(runStepOnTarget))
+        } else {
+          for (const target of resolvedTargets) {
+            await runStepOnTarget(target)
+          }
+        }
+
+        setStepStatus(
+          step.id,
+          'success',
+          step.capture
+            ? t('multiHostAiStepCaptured', { name: step.capture.name })
+            : step.execute && aiAssistantSettingsRef.current.terminal_permission === 'execute'
+              ? t('multiHostAiStepExecuted')
+              : t('multiHostAiStepTyped'),
+          { ...variables },
+        )
+      }
+
+      setMultiHostExecution((current) => ({
+        status: 'success',
+        message: t('multiHostAiExecutionSuccess'),
+        activeStepId: current?.activeStepId,
+        stepStatuses: current?.stepStatuses || initialStepStatuses,
+        variables: { ...variables },
+      }))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setMultiHostExecution((current) => ({
+        status: 'error',
+        message,
+        activeStepId: current?.activeStepId,
+        stepStatuses: current?.stepStatuses || initialStepStatuses,
+        variables: { ...variables },
+      }))
+      toast.error(message)
+    }
   }
 
   const trackPendingPaneCredential = (pane: SshPane, output: string) => {
@@ -2305,6 +2631,23 @@ export default function App() {
                 </div>
               </PopoverContent>
             </Popover>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="bg-transparent text-[var(--text-primary)] hover:bg-transparent hover:text-[var(--accent)]"
+                  aria-label={t('multiHostAi')}
+                  title={t('multiHostAi')}
+                  disabled={connectedPanes.length === 0}
+                  onClick={openMultiHostAiDialog}
+                >
+                  <Bot className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('multiHostAi')}</TooltipContent>
+            </Tooltip>
           </div>
         </header>
 
@@ -2337,6 +2680,253 @@ export default function App() {
           ))}
         </div>
       </section>
+
+      <Dialog open={multiHostAiOpen} onOpenChange={setMultiHostAiOpen}>
+        <DialogContent className="w-[min(94vw,960px)] max-h-[min(88vh,820px)] overflow-auto">
+          <DialogHeader>
+            <DialogTitle>{t('multiHostAi')}</DialogTitle>
+            <DialogDescription>{t('multiHostAiHint')}</DialogDescription>
+          </DialogHeader>
+
+          <div className="grid gap-4">
+            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <strong className="block text-sm text-[var(--text-strong)]">{t('multiHostAiTargets')}</strong>
+                  <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{t('multiHostAiTargetsHint')}</p>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setMultiHostSelectedPaneIds(multiHostTargets.map((target) => target.paneId))}
+                  disabled={multiHostTargets.length === 0}
+                >
+                  {t('multiHostAiSelectAll')}
+                </Button>
+              </div>
+
+              {multiHostTargets.length > 0 ? (
+                <div className="mt-3 grid gap-2">
+                  {multiHostTargets.map((target) => {
+                    const selected = multiHostSelectedPaneIds.includes(target.paneId)
+                    return (
+                      <div
+                        key={target.paneId}
+                        className={cn(
+                          'grid gap-3 rounded-xl border px-3 py-3 transition sm:grid-cols-[minmax(0,1fr)_180px]',
+                          selected
+                            ? 'border-[var(--border-strong)] bg-[var(--accent-soft)]/30'
+                            : 'border-[var(--border-subtle)] bg-[var(--surface-shell)]',
+                        )}
+                      >
+                        <button
+                          type="button"
+                          className="flex min-w-0 items-center gap-3 text-left"
+                          onClick={() => toggleMultiHostTarget(target.paneId)}
+                        >
+                          <span className={cn(
+                            'grid h-5 w-5 shrink-0 place-items-center rounded-full border text-[10px]',
+                            selected
+                              ? 'border-[var(--accent)] bg-[var(--accent)] text-white'
+                              : 'border-[var(--border-subtle)] text-transparent',
+                          )}>
+                            on
+                          </span>
+                          <span className="min-w-0">
+                            <strong className="block truncate text-sm text-[var(--text-strong)]">{target.title}</strong>
+                            <small className="block truncate text-xs text-[var(--text-muted)]">
+                              {(target.username && target.host) ? `${target.username}@${target.host}` : target.host || target.title}
+                            </small>
+                          </span>
+                        </button>
+
+                        <label className="grid gap-1 text-xs text-[var(--text-muted)]">
+                          <span>{t('multiHostAiRole')}</span>
+                          <Input
+                            value={multiHostRoles[target.paneId] || ''}
+                            placeholder={t('multiHostAiRolePlaceholder')}
+                            onChange={(event) => setMultiHostRole(target.paneId, event.target.value)}
+                          />
+                        </label>
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm text-[var(--text-muted)]">{t('noConnectedSessions')}</p>
+              )}
+            </section>
+
+            <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <strong className="block text-sm text-[var(--text-strong)]">{t('multiHostAiRunbook')}</strong>
+                  <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">{t('multiHostAiPromptHint')}</p>
+                </div>
+                {multiHostPlan && (
+                  <Button
+                    size="sm"
+                    onClick={() => void runMultiHostPlan()}
+                    disabled={multiHostSending || multiHostExecution?.status === 'running'}
+                  >
+                    <Play className="h-3.5 w-3.5" />
+                    {t('multiHostAiRunPlan')}
+                  </Button>
+                )}
+              </div>
+
+              <div className="mt-4 space-y-3">
+                {multiHostMessages.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-[var(--border-subtle)] bg-[var(--surface-shell)] px-3.5 py-3 text-sm text-[var(--text-muted)]">
+                    {t('multiHostAiEmptyHint')}
+                  </div>
+                ) : (
+                  multiHostMessages.map((message, index) => (
+                    <div key={`${message.role}-${index}-${message.content.slice(0, 20)}`} className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
+                      <div
+                        className={cn(
+                          'max-w-[92%] whitespace-pre-wrap rounded-2xl border px-3.5 py-3 text-sm leading-6',
+                          message.role === 'user'
+                            ? 'rounded-br-md border-[var(--accent)] bg-[var(--accent)] text-white'
+                            : 'rounded-tl-md border-[var(--border-subtle)] bg-[var(--surface-shell)] text-[var(--text-primary)]',
+                        )}
+                      >
+                        {message.content}
+                      </div>
+                    </div>
+                  ))
+                )}
+
+                {multiHostSending && (
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-shell)] px-3.5 py-3 text-sm text-[var(--text-muted)]">
+                    {t('aiAssistantThinking')}
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 rounded-[16px] border border-[var(--border-strong)] bg-[var(--surface-shell)] p-2">
+                <div className="relative">
+                  <Textarea
+                    value={multiHostDraft}
+                    rows={4}
+                    disabled={multiHostSending}
+                    placeholder={t('multiHostAiPromptPlaceholder')}
+                    className="min-h-[108px] resize-none border-0 bg-transparent pr-12 text-sm shadow-none focus-visible:ring-0"
+                    onChange={(event) => setMultiHostDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.shiftKey) {
+                        event.preventDefault()
+                        void submitMultiHostAiPrompt()
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="absolute bottom-2 right-2 grid h-9 w-9 place-items-center rounded-xl bg-[var(--accent)] text-white shadow-[0_8px_18px_var(--accent-soft)] transition hover:brightness-[1.03] disabled:cursor-not-allowed disabled:opacity-55"
+                    disabled={multiHostSending || !multiHostDraft.trim()}
+                    onClick={() => void submitMultiHostAiPrompt()}
+                  >
+                    <Bot className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            {multiHostPlan && (
+              <section className="rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)] p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <strong className="block text-sm text-[var(--text-strong)]">{t('multiHostAiPlan')}</strong>
+                    <p className="mt-1 text-xs leading-5 text-[var(--text-muted)]">
+                      {multiHostPlan.summary || t('multiHostAiPlanReady')}
+                    </p>
+                  </div>
+                  {multiHostExecution?.message && (
+                    <span className={cn(
+                      'rounded-full px-2.5 py-1 text-xs',
+                      multiHostExecution.status === 'error'
+                        ? 'bg-[#ffe3e3] text-[#b42318]'
+                        : multiHostExecution.status === 'success'
+                          ? 'bg-[#dcfce7] text-[#166534]'
+                          : 'bg-[var(--accent-soft)] text-[var(--text-primary)]',
+                    )}>
+                      {multiHostExecution.message}
+                    </span>
+                  )}
+                </div>
+
+                <div className="mt-4 space-y-2">
+                  {multiHostPlan.steps.map((step, index) => {
+                    const stepState = multiHostExecution?.stepStatuses[step.id]
+                    return (
+                      <div key={step.id} className="rounded-xl border border-[var(--border-subtle)] bg-[var(--surface-shell)] px-3.5 py-3">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <strong className="block text-sm text-[var(--text-strong)]">
+                              {index + 1}. {step.title}
+                            </strong>
+                            <small className="mt-1 block text-xs text-[var(--text-muted)]">
+                              {t('multiHostAiStepTargets', { targets: step.targets.join(', ') })}
+                            </small>
+                          </div>
+                          <span className={cn(
+                            'rounded-full px-2 py-0.5 text-[11px]',
+                            stepState?.status === 'error'
+                              ? 'bg-[#ffe3e3] text-[#b42318]'
+                              : stepState?.status === 'success'
+                                ? 'bg-[#dcfce7] text-[#166534]'
+                                : stepState?.status === 'running'
+                                  ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]'
+                                  : 'bg-[var(--surface-chip)] text-[var(--text-muted)]',
+                          )}>
+                            {stepState?.status || 'pending'}
+                          </span>
+                        </div>
+
+                        <div className="mt-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 font-mono text-xs leading-5 text-[var(--text-primary)] whitespace-pre-wrap break-all">
+                          {step.command}
+                        </div>
+
+                        <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-[var(--text-muted)]">
+                          <span>{step.execute ? t('multiHostAiExecuteMode') : t('multiHostAiTypeMode')}</span>
+                          <span>{step.parallel ? t('multiHostAiParallel') : t('multiHostAiSequential')}</span>
+                          {step.capture && <span>{t('multiHostAiCapture', { name: step.capture.name })}</span>}
+                        </div>
+
+                        {stepState?.message && (
+                          <p className="mt-2 text-xs text-[var(--text-muted)]">{stepState.message}</p>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+
+                {multiHostExecution && Object.keys(multiHostExecution.variables).length > 0 && (
+                  <div className="mt-4">
+                    <strong className="block text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">
+                      {t('multiHostAiVariables')}
+                    </strong>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {Object.entries(multiHostExecution.variables).map(([name, value]) => (
+                        <div key={name} className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-shell)] px-2.5 py-2">
+                          <strong className="block text-[11px] text-[var(--text-strong)]">{name}</strong>
+                          <span className="mt-1 block max-w-[680px] truncate font-mono text-[11px] text-[var(--text-muted)]" title={value}>
+                            {value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setMultiHostAiOpen(false)}>{t('cancel')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={settingsModalOpen} onOpenChange={handleSettingsModalOpenChange}>
         <DialogContent className="w-[min(92vw,620px)] max-h-[min(84vh,560px)] overflow-auto p-4">
