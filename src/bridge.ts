@@ -1,6 +1,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
+  AiAssistantContext,
+  AiAssistantMessage,
+  AiAssistantSettings,
   AppUpdateDownloadProgress,
   AppUpdateInfo,
   ConnectionProfile,
@@ -331,6 +334,20 @@ export async function setDesktopLocale(locale: 'zh-CN' | 'en-US') {
   if (isTauriRuntime()) {
     return invoke<void>('set_app_locale', { locale })
   }
+}
+
+export async function requestAiAssistantReply(
+  settings: AiAssistantSettings,
+  messages: AiAssistantMessage[],
+  context?: AiAssistantContext,
+) {
+  if (isTauriRuntime()) {
+    return invoke<string>('ai_chat', { settings, messages, context })
+  }
+
+  const latestUserMessage = [...messages].reverse().find((message) => message.role === 'user')?.content || ''
+  const target = context?.connection_name || (context?.username && context?.host ? `${context.username}@${context.host}` : context?.host) || 'current host'
+  return `Mock ${settings.provider} reply for ${target}: ${latestUserMessage}`
 }
 
 export async function checkAppUpdate(allow_prerelease = false): Promise<AppUpdateInfo> {

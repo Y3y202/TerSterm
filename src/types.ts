@@ -1,4 +1,6 @@
 export type HostPlatform = 'linux' | 'windows' | 'unknown'
+export type AiProvider = 'openai-compatible' | 'anthropic'
+export type AiAssistantPermission = 'reply-only' | 'type-only' | 'execute'
 
 export interface ConnectionProfile {
   id: string
@@ -122,4 +124,30 @@ export interface SshFileDownloadProgress {
   downloaded_bytes: number
   total_bytes?: number
   percent: number
+}
+
+export interface AiAssistantSettings {
+  provider: AiProvider
+  base_url: string
+  api_key: string
+  model: string
+  system_prompt: string
+  terminal_permission: AiAssistantPermission
+}
+
+export interface AiAssistantMessage {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface AiAssistantContext {
+  connection_name?: string
+  host?: string
+  username?: string
+  host_platform?: HostPlatform
+  linux_distro?: string
+  current_directory?: string
+  visible_terminal_output?: string
+  recent_terminal_output?: string
+  pending_terminal_input?: string
 }

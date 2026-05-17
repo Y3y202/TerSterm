@@ -71,7 +71,7 @@ import {
 import i18n, { getAppLocale, setAppLocale } from './i18n'
 import { useStateRef } from './lib/use-state-ref'
 import { cn } from './lib/utils'
-import type { AppUpdateDownloadProgress, ConnectionGroup, ConnectionProfile, SshPane, SystemUsage } from './types'
+import type { AiAssistantPermission, AiAssistantSettings, AiProvider, AppUpdateDownloadProgress, ConnectionGroup, ConnectionProfile, SshPane, SystemUsage } from './types'
 
 const CONNECTION_STORAGE_KEY = 'tersterm.connections'
 const GROUP_STORAGE_KEY = 'tersterm.groups'
@@ -82,6 +82,7 @@ const UPDATE_CHANNEL_STORAGE_KEY = 'tersterm.updateChannel'
 const THEME_STORAGE_KEY = 'tersterm.theme'
 const THEME_MODE_STORAGE_KEY = 'tersterm.themeMode'
 const ANALYSIS_THEME_STORAGE_KEY = 'tersterm.analysisTheme'
+const AI_ASSISTANT_SETTINGS_STORAGE_KEY = 'tersterm.aiAssistantSettings'
 const DEFAULT_GROUP_ID = 'default'
 const DEFAULT_GROUP_NAME = '默认'
 const DEFAULT_GROUP_ALIASES = new Set(['默认', 'Default'])
@@ -107,6 +108,12 @@ type SavedSettingsSnapshot = {
   updateChannel: UpdateChannel
   windowCloseBehavior: WindowCloseBehavior
   locale: ReturnType<typeof getAppLocale>
+  aiProvider: AiProvider
+  aiBaseUrl: string
+  aiApiKey: string
+  aiModel: string
+  aiSystemPrompt: string
+  aiTerminalPermission: AiAssistantPermission
 }
 
 const appThemes = [
@@ -156,6 +163,9 @@ const splitLayouts = [
 const DEFAULT_THEME_ID: AppThemeId = 'sage'
 const DEFAULT_THEME_MODE: ThemeMode = 'light'
 const DEFAULT_ANALYSIS_THEME_ID: AnalysisThemeId = 'rose'
+const DEFAULT_AI_PROVIDER: AiProvider = 'openai-compatible'
+const DEFAULT_AI_TERMINAL_PERMISSION: AiAssistantPermission = 'type-only'
+const DEFAULT_AI_SYSTEM_PROMPT = 'You are the TerSterm AI assistant. Help with Linux and Windows server operations, SSH troubleshooting, deployment, logs, file management, permissions, networking, and shell usage. Keep answers concise, practical, and accurate.'
 
 const isAppThemeId = (value: string | null): value is AppThemeId =>
   Boolean(value && appThemes.some((theme) => theme.id === value))
@@ -231,6 +241,45 @@ const isUpdateChannel = (value: string | null): value is UpdateChannel => value 
 const readStoredUpdateChannel = (): UpdateChannel => {
   const storedChannel = localStorage.getItem(UPDATE_CHANNEL_STORAGE_KEY)
   return isUpdateChannel(storedChannel) ? storedChannel : 'stable'
+}
+
+const normalizeAiProvider = (value: string | null | undefined): AiProvider | undefined => {
+  if (value === 'openai-compatible' || value === 'open-ai-compatible') return 'openai-compatible'
+  if (value === 'anthropic') return 'anthropic'
+  return undefined
+}
+
+const isAiAssistantPermission = (value: string | null): value is AiAssistantPermission =>
+  value === 'reply-only' || value === 'type-only' || value === 'execute'
+
+const sanitizeAiAssistantSettings = (value?: Partial<AiAssistantSettings> | null): AiAssistantSettings => ({
+  provider: normalizeAiProvider(value?.provider) ?? DEFAULT_AI_PROVIDER,
+  base_url: typeof value?.base_url === 'string' ? value.base_url : '',
+  api_key: typeof value?.api_key === 'string' ? value.api_key : '',
+  model: typeof value?.model === 'string' ? value.model : '',
+  system_prompt: typeof value?.system_prompt === 'string' && value.system_prompt.trim()
+    ? value.system_prompt
+    : DEFAULT_AI_SYSTEM_PROMPT,
+  terminal_permission: isAiAssistantPermission(value?.terminal_permission ?? null) ? value!.terminal_permission! : DEFAULT_AI_TERMINAL_PERMISSION,
+})
+
+const areAiAssistantSettingsEqual = (left: AiAssistantSettings, right: AiAssistantSettings) =>
+  left.provider === right.provider &&
+  left.base_url === right.base_url &&
+  left.api_key === right.api_key &&
+  left.model === right.model &&
+  left.system_prompt === right.system_prompt &&
+  left.terminal_permission === right.terminal_permission
+
+const readStoredAiAssistantSettings = (): AiAssistantSettings => {
+  const raw = localStorage.getItem(AI_ASSISTANT_SETTINGS_STORAGE_KEY)
+  if (!raw) return sanitizeAiAssistantSettings()
+
+  try {
+    return sanitizeAiAssistantSettings(JSON.parse(raw) as Partial<AiAssistantSettings>)
+  } catch {
+    return sanitizeAiAssistantSettings()
+  }
 }
 
 const resolveThemeMode = (mode: ThemeMode, prefersDark: boolean): ResolvedThemeMode =>
@@ -447,6 +496,7 @@ const formatReleaseDate = (value?: string) => {
 export default function App() {
   const { t } = useTranslation()
   const initialState = useRef(createInitialState()).current
+  const initialAiAssistantSettingsRef = useRef(readStoredAiAssistantSettings())
   const [groups, setGroups, groupsRef] = useStateRef<ConnectionGroup[]>(initialState.groups)
   const [connections, setConnections, connectionsRef] = useStateRef<ConnectionProfile[]>(initialState.connections)
   const [panes, setPanes, panesRef] = useStateRef<SshPane[]>(initialState.panes)
@@ -464,6 +514,8 @@ export default function App() {
   const [appTheme, setAppTheme] = useStateRef<AppThemeId>(readStoredTheme())
   const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredThemeMode())
   const [analysisTheme] = useState<AnalysisThemeId>(readStoredAnalysisTheme())
+  const [aiAssistantSettings, setAiAssistantSettings, aiAssistantSettingsRef] = useStateRef<AiAssistantSettings>(initialAiAssistantSettingsRef.current)
+  const [aiAssistantDraftSettings, setAiAssistantDraftSettings] = useState<AiAssistantSettings>(initialAiAssistantSettingsRef.current)
   const [sidebarCollapsed, setSidebarCollapsed, sidebarCollapsedRef] = useStateRef(readStoredSidebarCollapsed())
   const [updateChannel, setUpdateChannel, updateChannelRef] = useStateRef<UpdateChannel>(readStoredUpdateChannel())
   const [windowCloseBehavior, setWindowCloseBehavior, windowCloseBehaviorRef] = useStateRef<WindowCloseBehavior>(readStoredWindowCloseBehavior())
@@ -508,6 +560,12 @@ export default function App() {
     updateChannel,
     windowCloseBehavior,
     locale: getAppLocale(),
+    aiProvider: aiAssistantSettings.provider,
+    aiBaseUrl: aiAssistantSettings.base_url,
+    aiApiKey: aiAssistantSettings.api_key,
+    aiModel: aiAssistantSettings.model,
+    aiSystemPrompt: aiAssistantSettings.system_prompt,
+    aiTerminalPermission: aiAssistantSettings.terminal_permission,
   })
   const settingsSavedToastTimerRef = useRef<number>()
   const notifySettingsSaved = useCallback(() => {
@@ -527,7 +585,13 @@ export default function App() {
       previousSettings.analysisTheme !== nextSettings.analysisTheme ||
       previousSettings.updateChannel !== nextSettings.updateChannel ||
       previousSettings.windowCloseBehavior !== nextSettings.windowCloseBehavior ||
-      previousSettings.locale !== nextSettings.locale
+      previousSettings.locale !== nextSettings.locale ||
+      previousSettings.aiProvider !== nextSettings.aiProvider ||
+      previousSettings.aiBaseUrl !== nextSettings.aiBaseUrl ||
+      previousSettings.aiApiKey !== nextSettings.aiApiKey ||
+      previousSettings.aiModel !== nextSettings.aiModel ||
+      previousSettings.aiSystemPrompt !== nextSettings.aiSystemPrompt ||
+      previousSettings.aiTerminalPermission !== nextSettings.aiTerminalPermission
 
     savedSettingsRef.current = nextSettings
 
@@ -680,9 +744,41 @@ export default function App() {
     { value: 'dark' as const, label: t('themeModeDark'), icon: Moon },
     { value: 'system' as const, label: t('themeModeSystem'), icon: Monitor },
   ]
+  const aiProviderOptions = [
+    { value: 'openai-compatible' as const, label: t('aiProviderOpenAICompatible') },
+    { value: 'anthropic' as const, label: t('aiProviderAnthropic') },
+  ]
+  const aiTerminalPermissionOptions = [
+    { value: 'reply-only' as const, label: t('aiPermissionReplyOnly'), hint: t('aiPermissionReplyOnlyHint') },
+    { value: 'type-only' as const, label: t('aiPermissionTypeOnly'), hint: t('aiPermissionTypeOnlyHint') },
+    { value: 'execute' as const, label: t('aiPermissionExecute'), hint: t('aiPermissionExecuteHint') },
+  ]
+  const aiDefaultEndpoint = aiAssistantDraftSettings.provider === 'anthropic'
+    ? 'https://api.anthropic.com/v1/messages'
+    : 'https://api.openai.com/v1/chat/completions'
+  const hasPendingAiAssistantSettingsChanges = !areAiAssistantSettingsEqual(aiAssistantDraftSettings, aiAssistantSettings)
   const recordSettingsPatch = useCallback((patch: Partial<SavedSettingsSnapshot>) => {
     recordSettingsSaved({ ...savedSettingsRef.current, ...patch })
   }, [recordSettingsSaved])
+  const handleSettingsModalOpenChange = useCallback((nextOpen: boolean) => {
+    setSettingsModalOpen(nextOpen)
+    setAiAssistantDraftSettings({ ...aiAssistantSettingsRef.current })
+  }, [aiAssistantSettingsRef])
+  const saveAiAssistantSettings = useCallback(() => {
+    const nextSettings = sanitizeAiAssistantSettings(aiAssistantDraftSettings)
+    localStorage.setItem(AI_ASSISTANT_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings))
+    setAiAssistantSettings(nextSettings)
+    setAiAssistantDraftSettings(nextSettings)
+    recordSettingsSaved({
+      ...savedSettingsRef.current,
+      aiProvider: nextSettings.provider,
+      aiBaseUrl: nextSettings.base_url,
+      aiApiKey: nextSettings.api_key,
+      aiModel: nextSettings.model,
+      aiSystemPrompt: nextSettings.system_prompt,
+      aiTerminalPermission: nextSettings.terminal_permission,
+    })
+  }, [aiAssistantDraftSettings, recordSettingsSaved, setAiAssistantSettings])
   const handleThemeModeChange = useCallback((nextThemeMode: ThemeMode) => {
     if (themeMode === nextThemeMode) return
 
@@ -1925,7 +2021,7 @@ export default function App() {
               type="button"
               className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-transparent text-[var(--text-primary)] transition hover:text-[var(--accent)]"
               aria-label={t('interfaceSettings')}
-              onClick={() => setSettingsModalOpen(true)}
+              onClick={() => handleSettingsModalOpenChange(true)}
             >
               <Settings className="h-4 w-4" />
             </button>
@@ -2226,10 +2322,12 @@ export default function App() {
                 pane={pane}
                 active={pane.id === activePaneId}
                 appTheme={appTheme}
+                aiAssistantSettings={aiAssistantSettings}
                 onFocus={setActivePaneId}
                 onDisconnect={(paneId) => void disconnectPaneById(paneId)}
                 onClose={(paneId) => void closePane(paneId)}
                 onConnect={(paneId) => void connectFromPane(paneId)}
+                onOpenSettings={() => handleSettingsModalOpenChange(true)}
                 onInput={handleTerminalInput}
                 onZmodem={handlePaneZmodemState}
                 onAuthenticated={handlePaneAuthenticated}
@@ -2240,7 +2338,7 @@ export default function App() {
         </div>
       </section>
 
-      <Dialog open={settingsModalOpen} onOpenChange={setSettingsModalOpen}>
+      <Dialog open={settingsModalOpen} onOpenChange={handleSettingsModalOpenChange}>
         <DialogContent className="w-[min(92vw,620px)] max-h-[min(84vh,560px)] overflow-auto p-4">
           <DialogHeader className="gap-1">
             <DialogTitle>{t('settingsTitle')}</DialogTitle>
@@ -2361,6 +2459,110 @@ export default function App() {
             </section>
 
             <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
+              <div className="border-b border-[var(--border-subtle)] px-3 py-2">
+                <strong className="text-sm text-[var(--text-strong)]">{t('aiAssistantSettings')}</strong>
+              </div>
+
+              <div className="grid gap-3 px-3 py-2.5">
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiProviderLabel')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('aiProviderHint')}</small>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {aiProviderOptions.map((option) => (
+                      <Button
+                        key={option.value}
+                        className="h-7 px-2.5 text-xs"
+                        size="sm"
+                        variant={aiAssistantDraftSettings.provider === option.value ? 'default' : 'secondary'}
+                        onClick={() => setAiAssistantDraftSettings((current) => ({ ...current, provider: option.value }))}
+                      >
+                        {option.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiPermissionLabel')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('aiPermissionHint')}</small>
+                  </div>
+                  <div className="grid gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {aiTerminalPermissionOptions.map((option) => (
+                        <Button
+                          key={option.value}
+                          className="h-7 px-2.5 text-xs"
+                          size="sm"
+                          variant={aiAssistantDraftSettings.terminal_permission === option.value ? 'default' : 'secondary'}
+                          onClick={() => setAiAssistantDraftSettings((current) => ({ ...current, terminal_permission: option.value }))}
+                        >
+                          {option.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <p className="text-[11px] leading-4 text-[var(--text-muted)]">
+                      {aiTerminalPermissionOptions.find((option) => option.value === aiAssistantDraftSettings.terminal_permission)?.hint}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiBaseUrlLabel')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('aiBaseUrlHint', { endpoint: aiDefaultEndpoint })}</small>
+                  </div>
+                  <Input
+                    value={aiAssistantDraftSettings.base_url}
+                    placeholder={aiDefaultEndpoint}
+                    onChange={(event) => setAiAssistantDraftSettings((current) => ({ ...current, base_url: event.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiModelLabel')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('aiModelHint')}</small>
+                  </div>
+                  <Input
+                    value={aiAssistantDraftSettings.model}
+                    placeholder={aiAssistantDraftSettings.provider === 'anthropic' ? 'claude-3-5-sonnet-latest' : 'gpt-4.1-mini'}
+                    onChange={(event) => setAiAssistantDraftSettings((current) => ({ ...current, model: event.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiApiKeyLabel')}</strong>
+                    <small className="text-[11px] text-[var(--text-muted)]">{t('aiApiKeyHint')}</small>
+                  </div>
+                  <Input
+                    type="password"
+                    value={aiAssistantDraftSettings.api_key}
+                    placeholder={t('aiApiKeyPlaceholder')}
+                    onChange={(event) => setAiAssistantDraftSettings((current) => ({ ...current, api_key: event.target.value }))}
+                  />
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-[120px_minmax(0,1fr)] sm:items-start">
+                  <div>
+                    <strong className="block pt-0.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">{t('aiSystemPromptLabel')}</strong>
+                    <small className="text-[11px] leading-4 text-[var(--text-muted)]">{t('aiSystemPromptHint')}</small>
+                  </div>
+                  <Textarea
+                    value={aiAssistantDraftSettings.system_prompt}
+                    rows={4}
+                    className="min-h-[108px] resize-y"
+                    placeholder={DEFAULT_AI_SYSTEM_PROMPT}
+                    onChange={(event) => setAiAssistantDraftSettings((current) => ({ ...current, system_prompt: event.target.value }))}
+                  />
+                </div>
+              </div>
+            </section>
+
+            <section className="overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel)]">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-subtle)] px-3 py-2">
                 <strong className="text-sm text-[var(--text-strong)]">{t('updateSettings')}</strong>
                 <Button className="h-7 px-2.5 text-xs" size="sm" variant="secondary" onClick={() => void checkForAppUpdate()} disabled={checkingAppUpdate}>
@@ -2428,6 +2630,15 @@ export default function App() {
               </div>
             </section>
           </div>
+
+          <DialogFooter className="mt-3 border-t border-[var(--border-subtle)] pt-3">
+            <div className="mr-auto text-[11px] leading-4 text-[var(--text-muted)]">
+              {t('aiAssistantSaveHint')}
+            </div>
+            <Button className="h-8 px-3 text-xs" onClick={saveAiAssistantSettings} disabled={!hasPendingAiAssistantSettingsChanges}>
+              {t('saveSettings')}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

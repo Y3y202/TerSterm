@@ -16,16 +16,23 @@ import '@xterm/xterm/css/xterm.css'
 import Zmodem from 'zmodem.js'
 import {
   ArrowUp,
+  Bot,
   File as FileIcon,
   Folder,
   FolderOpen,
+  History,
   Link2,
+  MessageSquarePlus,
   RefreshCw,
+  SendHorizontal,
+  Sparkles,
   SquareTerminal,
   Upload,
+  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  requestAiAssistantReply,
   onSshFileDownloadProgress,
   onSshDataRaw,
   onSshDisconnected,
@@ -39,12 +46,13 @@ import {
   sshListFiles,
   sshResize,
   sshUploadFile,
+  sshWrite,
   sshWriteBinary,
 } from '../bridge'
 import i18n from '../i18n'
 import { cn } from '../lib/utils'
 import { useStateRef } from '../lib/use-state-ref'
-import type { ConnectionProfile, RemoteFileEntry, RemoteFilePermissions, SshPane } from '../types'
+import type { AiAssistantMessage, AiAssistantPermission, AiAssistantSettings, ConnectionProfile, RemoteFileEntry, RemoteFilePermissions, SshPane } from '../types'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -66,6 +74,7 @@ import {
   DialogTitle,
 } from './ui/dialog'
 import { Input } from './ui/input'
+import { Textarea } from './ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 
 type AppThemeId = 'sage' | 'ocean' | 'dawn' | 'violet' | 'slate'
@@ -75,18 +84,34 @@ export interface TerminalPaneHandle {
   focusTerminal: () => void
 }
 
+interface ParsedTerminalCommandAction {
+  text: string
+  execute: boolean
+  delayMs: number
+}
+
 interface TerminalPaneProps {
   pane: SshPane
   active: boolean
   appTheme: AppThemeId
+  aiAssistantSettings: AiAssistantSettings
   onFocus: (paneId: string) => void
   onDisconnect: (paneId: string) => void
   onClose: (paneId: string) => void
   onConnect: (paneId: string) => void
+  onOpenSettings: () => void
   onInput: (payload: { pane_id: string; data: string }) => void
   onZmodem: (payload: { pane_id: string; active: boolean }) => void
   onAuthenticated: (payload: { pane_id: string; session_id: string }) => void
   onDisconnected: (payload: { pane_id: string; session_id: string; reason?: string }) => void
+}
+
+interface AiConversation {
+  id: string
+  title: string
+  messages: AiAssistantMessage[]
+  createdAt: number
+  updatedAt: number
 }
 
 const terminalThemes = {
@@ -186,6 +211,10 @@ const formatBytes = (size?: number) => {
 }
 
 const DOWNLOAD_DIRECTORY_STORAGE_KEY = 'tersterm:download-directory'
+const AI_TERMINAL_COMMAND_TAG_PATTERN = /<tersterm-command\b([^>]*)>([\s\S]*?)<\/tersterm-command>/gi
+const AI_TERMINAL_COMMAND_DELAY_MS = 35
+const AI_TERMINAL_COMMAND_DELAY_MIN_MS = 10
+const AI_TERMINAL_COMMAND_DELAY_MAX_MS = 250
 
 const readStoredDownloadDirectory = () => {
   if (typeof localStorage === 'undefined') return ''
@@ -219,6 +248,101 @@ const outputLooksAuthenticated = (output: string) => {
     trailingLines.some(lineLooksLikeShellPrompt)
   )
 }
+
+const buildAiTargetLabel = (connection?: ConnectionProfile) =>
+  connection?.name || (connection?.username && connection?.host ? `${connection.username}@${connection.host}` : connection?.host) || i18n.t('aiAssistantGenericTarget')
+
+const createAiConversationId = () => {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+
+  return `ai-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+const createAiConversation = (): AiConversation => {
+  const now = Date.now()
+  return {
+    id: createAiConversationId(),
+    title: '',
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
+
+const normalizeAiTerminalCommandDelay = (value?: number) => {
+  if (!Number.isFinite(value)) return AI_TERMINAL_COMMAND_DELAY_MS
+  return Math.min(
+    AI_TERMINAL_COMMAND_DELAY_MAX_MS,
+    Math.max(AI_TERMINAL_COMMAND_DELAY_MIN_MS, Math.round(value as number)),
+  )
+}
+
+const parseAiTerminalCommandActions = (reply: string) => {
+  const actions: ParsedTerminalCommandAction[] = []
+
+  const content = reply.replace(AI_TERMINAL_COMMAND_TAG_PATTERN, (_, rawAttributes = '', rawBody = '') => {
+    const text = String(rawBody).replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
+    if (!text) return ''
+
+    const executeMatch = /execute\s*=\s*"([^"]+)"/i.exec(String(rawAttributes))
+    const delayMatch = /delay_ms\s*=\s*"(\d+)"/i.exec(String(rawAttributes))
+    const execute = executeMatch ? executeMatch[1].trim().toLowerCase() === 'true' : false
+    const delayMs = normalizeAiTerminalCommandDelay(delayMatch ? Number(delayMatch[1]) : undefined)
+
+    actions.push({
+      text,
+      execute,
+      delayMs,
+    })
+
+    return text
+  })
+
+  const normalizedContent = content.replace(/\n{3,}/g, '\n\n').trim()
+  return {
+    actions,
+    content: normalizedContent || actions.map((action) => action.text).join('\n\n'),
+  }
+}
+
+const normalizeAiTerminalActionsForPermission = (
+  actions: ParsedTerminalCommandAction[],
+  permission: AiAssistantPermission,
+) => {
+  if (permission === 'reply-only') return { actions: [], mode: 'blocked' as const }
+  if (permission === 'type-only') return { actions, mode: 'type-only' as const }
+
+  return { actions, mode: 'execute' as const }
+}
+
+const shouldRequestApprovalBeforeExecute = (
+  permission: AiAssistantPermission,
+  action: ParsedTerminalCommandAction,
+) => permission === 'type-only' && action.execute
+
+const summarizeAiConversationTitle = (content: string, fallback: string) => {
+  const normalized = content.replace(/\s+/g, ' ').trim()
+  if (!normalized) return fallback
+  return normalized.length > 24 ? `${normalized.slice(0, 24)}...` : normalized
+}
+
+const summarizeAiConversationPreview = (content: string) => {
+  const normalized = content.replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+  return normalized.length > 56 ? `${normalized.slice(0, 56)}...` : normalized
+}
+
+const formatAiConversationTime = (timestamp: number) =>
+  new Intl.DateTimeFormat(undefined, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(timestamp)
 
 const normalizePermissionMode = (mode: string) => {
   const digits = mode.replace(/[^0-7]/g, '')
@@ -273,7 +397,10 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   const terminalTextDecoderRef = useRef(new TextDecoder())
   const terminalEventTextDecoderRef = useRef(new TextDecoder())
   const latestPropsRef = useRef(props)
+  const initialAiConversationRef = useRef<AiConversation>(createAiConversation())
   const [fileManagerOpen, setFileManagerOpen, fileManagerOpenRef] = useStateRef(false)
+  const [aiAssistantOpen, setAiAssistantOpen, aiAssistantOpenRef] = useStateRef(false)
+  const [aiHistoryOpen, setAiHistoryOpen] = useState(false)
   const [remotePath, setRemotePath, remotePathRef] = useStateRef('~')
   const [remoteFiles, setRemoteFiles, remoteFilesRef] = useStateRef<RemoteFileEntry[]>([])
   const [fileError, setFileError, fileErrorRef] = useStateRef('')
@@ -303,6 +430,13 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     sessionId: string
     fileLabel: string
   } | null>(null)
+  const [aiConversations, setAiConversations] = useStateRef<AiConversation[]>([initialAiConversationRef.current])
+  const [activeAiConversationId, setActiveAiConversationId, activeAiConversationIdRef] = useStateRef(initialAiConversationRef.current.id)
+  const [aiAssistantDraft, setAiAssistantDraft] = useState('')
+  const [aiAssistantSending, setAiAssistantSending] = useState(false)
+  const [pendingAiCommandApproval, setPendingAiCommandApproval] = useState<{ text: string } | null>(null)
+  const aiMessagesViewportRef = useRef<HTMLDivElement | null>(null)
+  const pendingAiCommandApprovalResolverRef = useRef<((approved: boolean) => void) | null>(null)
   const uploadTargetPathRef = useRef<string>()
   const [newFolderDraft, setNewFolderDraft] = useState<{ parentPath: string; name: string } | null>(null)
   const [deleteEntry, setDeleteEntry] = useState<RemoteFileEntry | null>(null)
@@ -320,7 +454,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     latestPropsRef.current = props
   }, [props])
 
+  useEffect(() => () => {
+    pendingAiCommandApprovalResolverRef.current?.(false)
+    pendingAiCommandApprovalResolverRef.current = null
+  }, [])
+
   const getCurrentPane = () => latestPropsRef.current.pane
+  const resolvePendingAiCommandApproval = (approved: boolean) => {
+    pendingAiCommandApprovalResolverRef.current?.(approved)
+    pendingAiCommandApprovalResolverRef.current = null
+    setPendingAiCommandApproval(null)
+  }
 
   const isConnected = props.pane.status === 'connected' && Boolean(props.pane.session_id)
   const remoteFeaturesReady = isConnected && Boolean(props.pane.remote_features_ready)
@@ -329,6 +473,14 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     : fileLoading
       ? t('loadingFiles')
       : fileError || t('emptyDirectory')
+  const activeAiConversation =
+    aiConversations.find((conversation) => conversation.id === activeAiConversationId) ||
+    aiConversations[0] ||
+    initialAiConversationRef.current
+  const aiAssistantMessages = activeAiConversation.messages
+  const aiConversationHistory = [...aiConversations]
+    .filter((conversation) => conversation.messages.length > 0 || conversation.id === activeAiConversation.id)
+    .sort((left, right) => right.updatedAt - left.updatedAt)
 
   const zmodemProgressPercent =
     zmodemProgress && zmodemProgress.totalBytes > 0
@@ -484,6 +636,88 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     focusTerminal,
   }))
 
+  const getVisibleTerminalOutput = () => {
+    const terminal = terminalRef.current
+    if (!terminal) return ''
+
+    const buffer = terminal.buffer.active
+    const start = buffer.viewportY
+    const end = Math.min(buffer.length, start + terminal.rows)
+    const lines: string[] = []
+
+    for (let index = start; index < end; index += 1) {
+      const line = buffer.getLine(index)
+      if (!line) continue
+      lines.push(line.translateToString(true))
+    }
+
+    return lines.join('\n').trim()
+  }
+
+  const progressivelyTypeTerminalCommand = async (action: ParsedTerminalCommandAction) => {
+    const initialPane = getCurrentPane()
+    const initialSessionId = initialPane.session_id
+    if (!initialSessionId || initialPane.status !== 'connected') {
+      toast.error(t('statusDisconnected'))
+      return false
+    }
+
+    focusTerminal()
+
+    const normalizedText = action.execute ? action.text.replace(/[\r\n]+$/, '') : action.text
+    for (const char of normalizedText) {
+      const currentPane = getCurrentPane()
+      if (currentPane.session_id !== initialSessionId || currentPane.status !== 'connected') {
+        toast.error(t('statusDisconnected'))
+        return false
+      }
+
+      const nextChunk = char === '\n' ? '\r' : char
+      trackShellInput(nextChunk)
+      await sshWrite(initialSessionId, nextChunk)
+      await wait(action.delayMs)
+    }
+
+    if (!action.execute) return true
+
+    const currentPane = getCurrentPane()
+    if (currentPane.session_id !== initialSessionId || currentPane.status !== 'connected') {
+      toast.error(t('statusDisconnected'))
+      return false
+    }
+
+    trackShellInput('\r')
+    await sshWrite(initialSessionId, '\r')
+    return true
+  }
+
+  const requestAiCommandExecutionApproval = (action: ParsedTerminalCommandAction) =>
+    new Promise<boolean>((resolve) => {
+      pendingAiCommandApprovalResolverRef.current = resolve
+      setPendingAiCommandApproval({ text: action.text })
+    })
+
+  const runAiTerminalCommandActions = async (
+    actions: ParsedTerminalCommandAction[],
+    permission: AiAssistantPermission,
+  ) => {
+    for (const action of actions) {
+      if (!action.text) continue
+      const requiresApproval = shouldRequestApprovalBeforeExecute(permission, action)
+      const nextAction = requiresApproval ? { ...action, execute: false } : action
+      const completed = await progressivelyTypeTerminalCommand(nextAction)
+      if (!completed) break
+
+      if (requiresApproval) {
+        const approved = await requestAiCommandExecutionApproval(action)
+        if (!approved) continue
+
+        const executed = await progressivelyTypeTerminalCommand({ ...action, text: '', execute: true })
+        if (!executed) break
+      }
+    }
+  }
+
   const resetTerminal = (notice?: string) => {
     resetTerminalTextDecoder()
     terminalRef.current?.reset()
@@ -517,6 +751,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     setPermissionSubmitting(false)
     setPermissionDraft({ mode: '755', owner: '', recursive: false })
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const resetAiAssistantState = () => {
+    const nextConversation = createAiConversation()
+    initialAiConversationRef.current = nextConversation
+    setAiAssistantOpen(false)
+    setAiHistoryOpen(false)
+    setAiAssistantDraft('')
+    setAiConversations([nextConversation])
+    setActiveAiConversationId(nextConversation.id)
+    setAiAssistantSending(false)
   }
 
   const normalizePath = (path: string) => {
@@ -712,6 +957,9 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     }
 
     const nextOpen = !fileManagerOpenRef.current
+    if (nextOpen) {
+      setAiAssistantOpen(false)
+    }
     setFileManagerOpen(nextOpen)
     if (!nextOpen) return
 
@@ -722,6 +970,121 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
     if (remoteFilesRef.current.length === 0) {
       await refreshFiles()
+    }
+  }
+
+  const openAiAssistant = () => {
+    const nextOpen = !aiAssistantOpenRef.current
+    if (nextOpen) {
+      setFileManagerOpen(false)
+    }
+    setAiAssistantOpen(nextOpen)
+  }
+
+  const toggleAiHistory = () => {
+    setAiHistoryOpen((current) => !current)
+  }
+
+  const openAiConversation = (conversationId: string) => {
+    setActiveAiConversationId(conversationId)
+    setAiHistoryOpen(false)
+    setAiAssistantDraft('')
+  }
+
+  const startNewAiConversation = () => {
+    if (activeAiConversation.messages.length === 0) {
+      setAiHistoryOpen(false)
+      setAiAssistantDraft('')
+      return
+    }
+
+    const nextConversation = createAiConversation()
+    setAiConversations((current) => [nextConversation, ...current])
+    setActiveAiConversationId(nextConversation.id)
+    setAiHistoryOpen(false)
+    setAiAssistantDraft('')
+  }
+
+  const submitAiAssistantPrompt = async () => {
+    const content = aiAssistantDraft.trim()
+    if (!content || aiAssistantSending) return
+
+    const { aiAssistantSettings } = latestPropsRef.current
+    if (!aiAssistantSettings.api_key.trim() || !aiAssistantSettings.model.trim()) {
+      toast.warning(t('aiAssistantMissingConfig'))
+      latestPropsRef.current.onOpenSettings()
+      return
+    }
+
+    const activeConversationId = activeAiConversationIdRef.current
+    const nextMessages: AiAssistantMessage[] = [...aiAssistantMessages, { role: 'user', content }]
+    setAiConversations((current) => current.map((conversation) => (
+      conversation.id === activeConversationId
+        ? {
+            ...conversation,
+            title: conversation.title || summarizeAiConversationTitle(content, t('aiAssistantUntitledConversation')),
+            messages: nextMessages,
+            updatedAt: Date.now(),
+          }
+        : conversation
+    )))
+    setAiAssistantDraft('')
+    setAiHistoryOpen(false)
+    setAiAssistantSending(true)
+
+    try {
+      const reply = await requestAiAssistantReply(
+        aiAssistantSettings,
+        nextMessages,
+        {
+          connection_name: props.pane.connection?.name,
+          host: props.pane.connection?.host,
+          username: props.pane.connection?.username,
+          host_platform: props.pane.connection?.host_platform,
+          linux_distro: props.pane.connection?.linux_distro,
+          current_directory: remotePathRef.current,
+          visible_terminal_output: getVisibleTerminalOutput(),
+          recent_terminal_output: props.pane.terminal_output?.slice(-4000),
+          pending_terminal_input: inputBufferRef.current,
+        },
+      )
+      const parsedReply = parseAiTerminalCommandActions(reply)
+
+      setAiConversations((current) => current.map((conversation) => (
+        conversation.id === activeConversationId
+          ? {
+              ...conversation,
+              messages: [...conversation.messages, { role: 'assistant', content: parsedReply.content }],
+              updatedAt: Date.now(),
+            }
+          : conversation
+      )))
+
+      if (parsedReply.actions.length > 0) {
+        const permissionResult = normalizeAiTerminalActionsForPermission(
+          parsedReply.actions,
+          aiAssistantSettings.terminal_permission,
+        )
+
+        if (permissionResult.mode === 'blocked') {
+          toast.warning(t('aiAssistantPermissionBlocked'))
+        } else {
+          await runAiTerminalCommandActions(permissionResult.actions, aiAssistantSettings.terminal_permission)
+        }
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+      setAiConversations((current) => current.map((conversation) => (
+        conversation.id === activeConversationId
+          ? {
+              ...conversation,
+              messages: [...conversation.messages, { role: 'assistant', content: t('aiAssistantErrorReply') }],
+              updatedAt: Date.now(),
+            }
+          : conversation
+      )))
+    } finally {
+      setAiAssistantSending(false)
     }
   }
 
@@ -1227,6 +1590,17 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   }, [remoteFeaturesReady])
 
   useEffect(() => {
+    if (!aiAssistantOpen) return
+
+    requestAnimationFrame(() => {
+      aiMessagesViewportRef.current?.scrollTo({
+        top: aiMessagesViewportRef.current.scrollHeight,
+        behavior: 'smooth',
+      })
+    })
+  }, [aiAssistantMessages, aiAssistantOpen, aiAssistantSending])
+
+  useEffect(() => {
     if (!terminalRef.current) return
 
     if (props.pane.status === 'connecting' && props.pane.connection) {
@@ -1237,11 +1611,13 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     if (props.pane.status === 'idle') {
       resetTerminal()
       resetFileManagerState()
+      resetAiAssistantState()
       resetZmodemRuntime()
     }
 
     if (props.pane.status === 'closed' || props.pane.status === 'error') {
       resetFileManagerState()
+      setAiAssistantOpen(false)
       resetZmodemRuntime()
     }
 
@@ -1254,6 +1630,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     authProbeBufferRef.current = ''
     authenticatedSessionIdRef.current = undefined
     resetFileManagerState()
+    resetAiAssistantState()
     resetTerminalTextDecoder()
     resetZmodemRuntime()
     if (!props.pane.session_id) return
@@ -1373,6 +1750,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
       zmodemSessionRef.current?.abort?.()
       finishZmodemSession()
       resetFileManagerState()
+      resetAiAssistantState()
       resizeObserverRef.current?.disconnect()
       unlistenDataRef.current?.()
       unlistenDisconnectedRef.current?.()
@@ -1482,10 +1860,11 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
           style={{ '--terminal-bg': resolveTerminalTheme().background } as CSSProperties}
         />
 
-        <div className="pointer-events-none absolute inset-0 z-[12] flex justify-end">
+        <div className="pointer-events-none absolute inset-0 z-[12]">
           <aside
             className={cn(
-              'pointer-events-auto relative z-[13] flex h-full w-[clamp(200px,23%,253px)] max-w-[92%] flex-col border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              'absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(200px,23%,253px)] max-w-[92%] flex-col border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              fileManagerOpen ? 'pointer-events-auto' : 'pointer-events-none',
               fileManagerOpen ? 'translate-x-0' : 'translate-x-full',
             )}
             onMouseDown={(event) => event.stopPropagation()}
@@ -1595,6 +1974,198 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
               </ContextMenuContent>
             </ContextMenu>
           </aside>
+
+          <aside
+            className={cn(
+              'absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(260px,28%,360px)] max-w-[94%] flex-col border-l border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] text-[var(--text-primary)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              aiAssistantOpen ? 'pointer-events-auto' : 'pointer-events-none',
+              aiAssistantOpen ? 'translate-x-0' : 'translate-x-full',
+            )}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="border-b border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] px-4 py-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <strong className="block truncate text-[26px] font-semibold leading-none text-[var(--text-strong)]">{t('aiAssistant')}</strong>
+                  <span className="mt-2 block truncate text-xs text-[var(--text-muted)]">{buildAiTargetLabel(props.pane.connection)}</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant="ghost"
+                    size="iconSm"
+                    className="h-8 w-8 rounded-full text-[var(--text-muted)] hover:bg-[var(--surface-chip)] hover:text-[var(--accent)]"
+                    onClick={toggleAiHistory}
+                    aria-label={t('aiAssistantHistory')}
+                  >
+                    <History className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="iconSm"
+                    className="h-8 w-8 rounded-full text-[var(--text-muted)] hover:bg-[var(--surface-chip)] hover:text-[var(--accent)]"
+                    onClick={startNewAiConversation}
+                    aria-label={t('aiAssistantNewChat')}
+                  >
+                    <MessageSquarePlus className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="iconSm"
+                    className="h-8 w-8 rounded-full text-[var(--text-muted)] hover:bg-[var(--surface-chip)] hover:text-[var(--text-strong)]"
+                    onClick={() => setAiAssistantOpen(false)}
+                    aria-label={t('close')}
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            {aiHistoryOpen ? (
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <strong className="block text-sm text-[var(--text-strong)]">{t('aiAssistantHistory')}</strong>
+                    <span className="text-xs text-[var(--text-muted)]">{t('aiAssistantHistoryHint')}</span>
+                  </div>
+                  <span className="rounded-full border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-2 py-0.5 text-[11px] text-[var(--text-muted)]">
+                    {t('aiAssistantConversationCount', { count: aiConversationHistory.length })}
+                  </span>
+                </div>
+
+                {aiConversationHistory.length === 0 ? (
+                  <div className="rounded-2xl border border-dashed border-[var(--border-subtle)] bg-[var(--surface-panel)]/40 px-3.5 py-3 text-sm text-[var(--text-muted)]">
+                    {t('aiAssistantHistoryEmpty')}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {aiConversationHistory.map((conversation) => {
+                      const lastMessage = conversation.messages[conversation.messages.length - 1]
+                      const active = conversation.id === activeAiConversation.id
+
+                      return (
+                        <button
+                          key={conversation.id}
+                          type="button"
+                          className={cn(
+                            'block w-full rounded-2xl border px-3.5 py-3 text-left transition',
+                            active
+                              ? 'border-[var(--border-strong)] bg-[var(--accent-soft)] text-[var(--text-strong)] shadow-[0_10px_24px_var(--accent-soft)]'
+                              : 'border-[var(--border-subtle)] bg-[var(--surface-panel)]/50 text-[var(--text-primary)] hover:bg-[var(--surface-chip)]',
+                          )}
+                          onClick={() => openAiConversation(conversation.id)}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <strong className="block truncate text-sm">
+                                {conversation.title || t('aiAssistantUntitledConversation')}
+                              </strong>
+                              <span className="mt-1 block truncate text-xs text-[var(--text-muted)]">
+                                {lastMessage ? summarizeAiConversationPreview(lastMessage.content) : t('aiAssistantEmptyConversation')}
+                              </span>
+                            </div>
+                            <div className="shrink-0 text-right">
+                              <span className="block text-[11px] text-[var(--text-muted)]">{formatAiConversationTime(conversation.updatedAt)}</span>
+                              {active && (
+                                <span className="mt-1 inline-flex rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] text-white">
+                                  {t('aiAssistantCurrentConversation')}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                <div ref={aiMessagesViewportRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+                  <div className="flex items-start gap-3">
+                    <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[radial-gradient(circle_at_30%_30%,var(--surface-panel-strong),var(--accent-soft)_38%,var(--accent)_100%)] shadow-[0_0_0_1px_var(--border-strong)]">
+                      <Bot className="h-4 w-4 text-[var(--text-strong)]" />
+                    </div>
+                    <div className="min-w-0">
+                      <strong className="block text-sm text-[var(--text-strong)]">{t('aiAssistant')}</strong>
+                      <div className="mt-2 rounded-2xl rounded-tl-md border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-3 text-sm leading-6 text-[var(--text-primary)] shadow-[0_6px_18px_rgba(15,23,42,0.08)]">
+                        {t('aiAssistantGreeting', { target: buildAiTargetLabel(props.pane.connection) })}
+                      </div>
+                    </div>
+                  </div>
+
+                  {(!props.aiAssistantSettings.api_key.trim() || !props.aiAssistantSettings.model.trim()) && (
+                    <div className="mt-4 rounded-2xl border border-[var(--border-strong)] bg-[var(--accent-soft)] px-3.5 py-3 text-sm text-[var(--text-primary)]">
+                      <p>{t('aiAssistantSetupHint')}</p>
+                      <Button className="mt-3 h-8 px-3 text-xs" variant="secondary" onClick={props.onOpenSettings}>
+                        {t('aiAssistantOpenSettings')}
+                      </Button>
+                    </div>
+                  )}
+
+                  {aiAssistantMessages.length === 0 && (
+                    <div className="mt-4 rounded-2xl border border-dashed border-[var(--border-subtle)] bg-[var(--surface-panel)]/40 px-3.5 py-3 text-sm text-[var(--text-muted)]">
+                      {t('aiAssistantEmptyHint')}
+                    </div>
+                  )}
+
+                  <div className="mt-4 space-y-4">
+                    {aiAssistantMessages.map((message, index) => (
+                      <div key={`${activeAiConversation.id}-${message.role}-${index}-${message.content.slice(0, 24)}`} className={cn('flex', message.role === 'user' ? 'justify-end' : 'justify-start')}>
+                        <div
+                          className={cn(
+                            'max-w-[92%] whitespace-pre-wrap rounded-2xl border px-3.5 py-3 text-sm leading-6',
+                            message.role === 'user'
+                              ? 'rounded-br-md border-[var(--accent)] bg-[var(--accent)] text-white shadow-[0_8px_22px_var(--accent-soft)]'
+                              : 'rounded-tl-md border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] text-[var(--text-primary)]',
+                          )}
+                        >
+                          {message.content}
+                        </div>
+                      </div>
+                    ))}
+
+                    {aiAssistantSending && (
+                      <div className="flex justify-start">
+                        <div className="rounded-2xl rounded-tl-md border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-3 text-sm text-[var(--text-muted)]">
+                          {t('aiAssistantThinking')}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="border-t border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel),var(--surface-card-end))] px-4 py-4">
+                  <div className="rounded-[16px] border border-[var(--border-strong)] bg-[var(--surface-shell)] p-2 shadow-[0_0_0_1px_var(--accent-soft)]">
+                    <div className="relative">
+                      <Textarea
+                        value={aiAssistantDraft}
+                        rows={4}
+                        disabled={aiAssistantSending}
+                        placeholder={t('aiAssistantInputPlaceholder')}
+                        className="min-h-[116px] resize-none border-0 bg-transparent pr-12 text-sm text-[var(--text-primary)] shadow-none placeholder:text-[var(--text-muted)] focus-visible:ring-0"
+                        onChange={(event) => setAiAssistantDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' && !event.shiftKey) {
+                            event.preventDefault()
+                            void submitAiAssistantPrompt()
+                          }
+                        }}
+                      />
+                      <button
+                        type="button"
+                        className="absolute bottom-2 right-2 grid h-9 w-9 place-items-center rounded-xl bg-[var(--accent)] text-white shadow-[0_8px_18px_var(--accent-soft)] transition hover:scale-[1.02] hover:brightness-[1.03] disabled:cursor-not-allowed disabled:opacity-55"
+                        disabled={aiAssistantSending || !aiAssistantDraft.trim()}
+                        onClick={() => void submitAiAssistantPrompt()}
+                      >
+                        <SendHorizontal className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </aside>
         </div>
 
         <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[11] flex justify-start px-3 pb-2 pt-3">
@@ -1610,11 +2181,23 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
                 <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
                   event.stopPropagation()
                   void openFileManager()
-                }}>
+                }} aria-label={t('fileManager')}>
                   <FolderOpen className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{t('fileManager')}</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="iconSm" className={actionButtonClass} onClick={(event) => {
+                  event.stopPropagation()
+                  openAiAssistant()
+                }} aria-label={t('aiAssistant')}>
+                  <Sparkles className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('aiAssistant')}</TooltipContent>
             </Tooltip>
           </div>
         </div>
@@ -1775,6 +2358,30 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={Boolean(pendingAiCommandApproval)} onOpenChange={(open) => {
+        if (!open) resolvePendingAiCommandApproval(false)
+      }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('aiAssistantApproveExecutionTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('aiAssistantApproveExecutionDescription')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-2 font-mono text-xs leading-5 text-[var(--text-primary)] whitespace-pre-wrap break-all">
+            {pendingAiCommandApproval?.text || ''}
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => resolvePendingAiCommandApproval(false)}>
+              {t('aiAssistantApproveExecutionCancel')}
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={() => resolvePendingAiCommandApproval(true)}>
+              {t('aiAssistantApproveExecutionConfirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={Boolean(deleteEntry)} onOpenChange={(open) => {
         if (!open) setDeleteEntry(null)

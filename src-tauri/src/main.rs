@@ -159,6 +159,51 @@ struct AppUpdateDownloadProgress {
     percent: f32,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+enum AiProvider {
+    #[serde(rename = "openai-compatible", alias = "open-ai-compatible")]
+    OpenAiCompatible,
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+enum AiAssistantTerminalPermission {
+    ReplyOnly,
+    TypeOnly,
+    Execute,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AiAssistantSettingsRequest {
+    provider: AiProvider,
+    base_url: String,
+    api_key: String,
+    model: String,
+    system_prompt: String,
+    terminal_permission: AiAssistantTerminalPermission,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AiAssistantMessageInput {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AiAssistantContext {
+    connection_name: Option<String>,
+    host: Option<String>,
+    username: Option<String>,
+    host_platform: Option<String>,
+    linux_distro: Option<String>,
+    current_directory: Option<String>,
+    visible_terminal_output: Option<String>,
+    recent_terminal_output: Option<String>,
+    pending_terminal_input: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct SshFileDownloadProgress {
     session_id: Option<String>,
@@ -853,6 +898,18 @@ fn set_app_locale(
 }
 
 #[tauri::command]
+async fn ai_chat(
+    settings: AiAssistantSettingsRequest,
+    messages: Vec<AiAssistantMessageInput>,
+    context: Option<AiAssistantContext>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_ai_chat(settings, messages, context))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(format_boxed_error)
+}
+
+#[tauri::command]
 async fn check_app_update(allow_prerelease: bool) -> Result<AppUpdateInfo, String> {
     tauri::async_runtime::spawn_blocking(move || run_check_app_update(allow_prerelease))
         .await
@@ -1200,6 +1257,346 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 
 fn format_boxed_error(error: Box<dyn std::error::Error + Send + Sync>) -> String {
     format_error_chain(error.as_ref())
+}
+
+fn normalize_openai_compatible_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "https://api.openai.com/v1/chat/completions".to_string();
+    }
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+    if trimmed.ends_with("/chat") {
+        return format!("{trimmed}/completions");
+    }
+    format!("{trimmed}/chat/completions")
+}
+
+fn normalize_anthropic_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "https://api.anthropic.com/v1/messages".to_string();
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let path = url.path().trim_end_matches('/').to_string();
+        if path.is_empty() || path == "/" {
+            let mut normalized = url;
+            normalized.set_path("/v1/messages");
+            return normalized.to_string();
+        }
+        if path.ends_with("/anthropic") {
+            let mut normalized = url;
+            normalized.set_path(&format!("{path}/v1/messages"));
+            return normalized.to_string();
+        }
+        if path == "/v1" {
+            let mut normalized = url;
+            normalized.set_path("/v1/messages");
+            return normalized.to_string();
+        }
+    }
+    if trimmed.ends_with("/messages") {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}/messages")
+}
+
+fn extract_api_error_message(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if let Some(message) = value.get("message").and_then(|value| value.as_str()) {
+        return Some(message.to_string());
+    }
+    value
+        .get("error")
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .or_else(|| error.as_str())
+        })
+        .map(str::to_string)
+}
+
+fn extract_openai_message_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+    {
+        return Some(text.to_string());
+    }
+
+    let parts = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_array())?;
+
+    let combined = parts
+        .iter()
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(|text| text.as_str())
+                .or_else(|| part.get("content").and_then(|text| text.as_str()))
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    (!combined.trim().is_empty()).then_some(combined)
+}
+
+fn extract_anthropic_message_text(value: &serde_json::Value) -> Option<String> {
+    let parts = value.get("content")?.as_array()?;
+    let combined = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(|kind| kind.as_str()) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+
+    (!combined.trim().is_empty()).then_some(combined)
+}
+
+fn sanitize_ai_messages(messages: Vec<AiAssistantMessageInput>) -> Vec<AiAssistantMessageInput> {
+    messages
+        .into_iter()
+        .filter_map(|message| {
+            let role = message.role.trim().to_lowercase();
+            let content = message.content.trim().to_string();
+            if content.is_empty() || (role != "user" && role != "assistant") {
+                return None;
+            }
+            Some(AiAssistantMessageInput { role, content })
+        })
+        .collect()
+}
+
+fn build_ai_system_prompt(
+    custom_prompt: &str,
+    context: Option<&AiAssistantContext>,
+    terminal_permission: AiAssistantTerminalPermission,
+) -> String {
+    let base_prompt = if custom_prompt.trim().is_empty() {
+        "You are the TerSterm AI assistant. Help with Linux and Windows server operations, SSH troubleshooting, deployment, logs, file management, permissions, networking, and shell usage. Keep answers concise, practical, and accurate."
+            .to_string()
+    } else {
+        custom_prompt.trim().to_string()
+    };
+
+    let mut lines = vec![base_prompt];
+
+    match terminal_permission {
+        AiAssistantTerminalPermission::ReplyOnly => {
+            lines.push(String::new());
+            lines.push("Terminal permission: reply only.".to_string());
+            lines.push("Do not emit <tersterm-command> tags or any runnable terminal actions. If the user asks for commands, provide them as plain text for manual review.".to_string());
+        }
+        AiAssistantTerminalPermission::TypeOnly => {
+            lines.push(String::new());
+            lines.push("Terminal action format:".to_string());
+            lines.push("When and only when the user explicitly asks you to type something into the current terminal, append one or more terminal action tags using this exact format:".to_string());
+            lines.push(r#"<tersterm-command execute="false" delay_ms="35">"#.to_string());
+            lines.push("command text here".to_string());
+            lines.push("</tersterm-command>".to_string());
+            lines.push("Rules: keep explanations outside the tag; prefer safe read-only commands unless the user clearly requests a mutating action; always use execute=\"false\" so the user can review the typed command before running it.".to_string());
+        }
+        AiAssistantTerminalPermission::Execute => {
+            lines.push(String::new());
+            lines.push("Terminal action format:".to_string());
+            lines.push("When and only when the user explicitly asks you to type or run something in the current terminal, append one or more terminal action tags using this exact format:".to_string());
+            lines.push(r#"<tersterm-command execute="true" delay_ms="35">"#.to_string());
+            lines.push("command text here".to_string());
+            lines.push("</tersterm-command>".to_string());
+            lines.push("Rules: keep explanations outside the tag; prefer safe read-only commands unless the user clearly requests a mutating action; execute=\"true\" means TerSterm will progressively type the command into the current terminal and press Enter; execute=\"false\" means type without pressing Enter.".to_string());
+        }
+    }
+
+    let Some(context) = context else {
+        return lines.join("\n");
+    };
+
+    lines.push(String::new());
+    lines.push("Current session context:".to_string());
+
+    if let Some(value) = context.connection_name.as_deref().filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- Connection: {value}"));
+    }
+    if let Some(value) = context.host.as_deref().filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("- Host: {value}"));
+    }
+    if let Some(value) = context.username.as_deref().filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("- Username: {value}"));
+    }
+    if let Some(value) = context
+        .host_platform
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- Platform: {value}"));
+    }
+    if let Some(value) = context
+        .linux_distro
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- Distro: {value}"));
+    }
+    if let Some(value) = context
+        .current_directory
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- Current directory: {value}"));
+    }
+    if let Some(value) = context
+        .visible_terminal_output
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push("- Current visible terminal content:".to_string());
+        lines.push(value.to_string());
+    }
+    if let Some(value) = context
+        .recent_terminal_output
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push("- Recent terminal output:".to_string());
+        lines.push(value.to_string());
+    }
+    if let Some(value) = context
+        .pending_terminal_input
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(format!("- Current pending terminal input: {value}"));
+    }
+
+    lines.join("\n")
+}
+
+fn run_openai_compatible_ai_chat(
+    client: &reqwest::blocking::Client,
+    settings: &AiAssistantSettingsRequest,
+    messages: &[AiAssistantMessageInput],
+    context: Option<&AiAssistantContext>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = normalize_openai_compatible_endpoint(&settings.base_url);
+    let mut request_messages = vec![serde_json::json!({
+        "role": "system",
+        "content": build_ai_system_prompt(
+            &settings.system_prompt,
+            context,
+            settings.terminal_permission,
+        ),
+    })];
+    request_messages.extend(messages.iter().map(|message| {
+        serde_json::json!({
+            "role": message.role,
+            "content": message.content,
+        })
+    }));
+
+    let response = client
+        .post(endpoint)
+        .bearer_auth(settings.api_key.trim())
+        .json(&serde_json::json!({
+            "model": settings.model.trim(),
+            "messages": request_messages,
+            "temperature": 0.3
+        }))
+        .send()?;
+
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        let message = extract_api_error_message(&body).unwrap_or(body);
+        return Err(format!("AI request failed ({status}): {message}").into());
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(&body)?;
+    extract_openai_message_text(&value)
+        .ok_or_else(|| "AI service returned an empty response".into())
+}
+
+fn run_anthropic_ai_chat(
+    client: &reqwest::blocking::Client,
+    settings: &AiAssistantSettingsRequest,
+    messages: &[AiAssistantMessageInput],
+    context: Option<&AiAssistantContext>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = normalize_anthropic_endpoint(&settings.base_url);
+    let request_messages = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let response = client
+        .post(endpoint)
+        .header("x-api-key", settings.api_key.trim())
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model": settings.model.trim(),
+            "system": build_ai_system_prompt(
+                &settings.system_prompt,
+                context,
+                settings.terminal_permission,
+            ),
+            "messages": request_messages,
+            "max_tokens": 1024,
+            "temperature": 0.3
+        }))
+        .send()?;
+
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        let message = extract_api_error_message(&body).unwrap_or(body);
+        return Err(format!("AI request failed ({status}): {message}").into());
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(&body)?;
+    extract_anthropic_message_text(&value)
+        .ok_or_else(|| "AI service returned an empty response".into())
+}
+
+fn run_ai_chat(
+    settings: AiAssistantSettingsRequest,
+    messages: Vec<AiAssistantMessageInput>,
+    context: Option<AiAssistantContext>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if settings.api_key.trim().is_empty() {
+        return Err("API key is required".into());
+    }
+    if settings.model.trim().is_empty() {
+        return Err("Model is required".into());
+    }
+
+    let messages = sanitize_ai_messages(messages);
+    if messages.is_empty() || messages.iter().all(|message| message.role != "user") {
+        return Err("At least one user message is required".into());
+    }
+
+    let client = github_client(Some(Duration::from_secs(90)))?;
+
+    match settings.provider {
+        AiProvider::OpenAiCompatible => {
+            run_openai_compatible_ai_chat(&client, &settings, &messages, context.as_ref())
+        }
+        AiProvider::Anthropic => {
+            run_anthropic_ai_chat(&client, &settings, &messages, context.as_ref())
+        }
+    }
 }
 
 fn emit_app_update_download_progress(
@@ -4397,6 +4794,7 @@ fn main() {
             ssh_get_system_usage,
             check_app_update,
             download_app_update,
+            ai_chat,
             set_window_close_behavior,
             set_app_locale
         ])
@@ -4511,7 +4909,8 @@ mod tests {
     #[cfg(windows)]
     use super::{build_windows_update_installer_wait_script, collect_descendants_from_entries};
     use super::{
-        compare_release_versions, format_error_chain, merge_window_state,
+        compare_release_versions, extract_api_error_message, format_error_chain,
+        merge_window_state, normalize_anthropic_endpoint,
         output_looks_authenticated, parse_github_releases_feed, parse_openssh_file_list,
         parse_system_usage_output, release_asset_download_url, remote_file_upload_shell_fragment,
         run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
@@ -4567,6 +4966,48 @@ mod tests {
         assert!(script.contains("$installerExtension = 'msi'"));
         assert!(script.contains("Start-Process -FilePath 'msiexec.exe'"));
         assert!(script.contains("-ArgumentList @('/i', $installerPath)"));
+    }
+
+    #[test]
+    fn normalize_anthropic_endpoint_defaults_to_v1_messages_for_origin_only() {
+        assert_eq!(
+            normalize_anthropic_endpoint("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_endpoint_appends_messages_to_v1() {
+        assert_eq!(
+            normalize_anthropic_endpoint("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_endpoint_keeps_existing_messages_path() {
+        assert_eq!(
+            normalize_anthropic_endpoint("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_endpoint_appends_v1_messages_to_xfyun_anthropic_base() {
+        assert_eq!(
+            normalize_anthropic_endpoint(
+                "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic"
+            ),
+            "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn extract_api_error_message_reads_top_level_message() {
+        assert_eq!(
+            extract_api_error_message(r#"{"message":"not found"}"#).as_deref(),
+            Some("not found")
+        );
     }
 
     #[test]
