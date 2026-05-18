@@ -204,3 +204,91 @@
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+@media (max-height: 900px) {
+  .app-frame {
+    gap: 2px;
+    padding-right: 8px;
+    padding-bottom: 8px;
+    padding-left: 8px;
+  }
+
+  .app-titlebar {
+    height: 32px;
+  }
+
+  .connection-sidebar {
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .workspace-shell,
+  .pane-grid {
+    gap: 8px;
+  }
+
+  .workspace-toolbar {
+    min-height: 38px;
+    gap: 8px;
+    padding-right: 10px;
+    padding-left: 10px;
+  }
+
+  .terminal-pane {
+    border-radius: 10px;
+  }
+
+  .terminal-host .xterm {
+    padding: 6px 8px 8px;
+  }
+
+  .ai-drawer-header,
+  .ai-drawer-body,
+  .ai-drawer-input {
+    padding: 12px;
+  }
+
+  .ai-drawer-title {
+    font-size: 22px;
+  }
+
+  .ai-drawer-input textarea {
+    min-height: 88px;
+  }
+
+  .empty-session-card {
+    padding: 24px 20px;
+  }
+}
+
+@media (max-height: 760px) {
+  .app-frame {
+    padding-right: 6px;
+    padding-bottom: 6px;
+    padding-left: 6px;
+  }
+
+  .app-titlebar {
+    height: 30px;
+  }
+
+  .connection-sidebar {
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .workspace-shell,
+  .pane-grid {
+    gap: 6px;
+  }
+
+  .workspace-toolbar {
+    min-height: 36px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+
+  .ai-drawer-input textarea {
+    min-height: 72px;
+  }
+}

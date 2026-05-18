@@ -60,8 +60,13 @@ const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str =
 const NO_MATCHING_RELEASE_ERROR: &str = "No matching release found";
 const APP_SETTINGS_FILE_NAME: &str = "app-settings.json";
 const WINDOW_STATE_FILE_NAME: &str = "window-state.json";
-const DEFAULT_WINDOW_WIDTH: f64 = 1665.0;
-const DEFAULT_WINDOW_HEIGHT: f64 = 1039.0;
+const LARGE_DEFAULT_WINDOW_WIDTH: f64 = 1665.0;
+const LARGE_DEFAULT_WINDOW_HEIGHT: f64 = 1039.0;
+const COMPACT_DEFAULT_WINDOW_WIDTH: f64 = 1440.0;
+const COMPACT_DEFAULT_WINDOW_HEIGHT: f64 = 900.0;
+const MIN_WINDOW_WIDTH: f64 = 960.0;
+const MIN_WINDOW_HEIGHT: f64 = 600.0;
+const WINDOW_WORK_AREA_MARGIN: f64 = 48.0;
 const OPENSSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const OPENSSH_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -440,18 +445,18 @@ struct PersistedWindowState {
 impl Default for PersistedWindowState {
     fn default() -> Self {
         Self {
-            width: DEFAULT_WINDOW_WIDTH,
-            height: DEFAULT_WINDOW_HEIGHT,
+            width: LARGE_DEFAULT_WINDOW_WIDTH,
+            height: LARGE_DEFAULT_WINDOW_HEIGHT,
             maximized: false,
         }
     }
 }
 
 impl PersistedWindowState {
-    fn sanitized(self) -> Self {
+    fn sanitized(self, fallback: PersistedWindowState) -> Self {
         Self {
-            width: sanitize_window_dimension(self.width, DEFAULT_WINDOW_WIDTH),
-            height: sanitize_window_dimension(self.height, DEFAULT_WINDOW_HEIGHT),
+            width: sanitize_window_dimension(self.width, fallback.width),
+            height: sanitize_window_dimension(self.height, fallback.height),
             maximized: self.maximized,
         }
     }
@@ -537,7 +542,109 @@ fn merge_window_state(
         next.height = sanitize_window_dimension(height, current.height);
     }
     next.maximized = maximized;
-    next.sanitized()
+    next.sanitized(current)
+}
+
+fn logical_monitor_sizes(window: &tauri::WebviewWindow) -> Option<(u32, u32, f64, f64)> {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let monitor = monitor?;
+
+    let scale_factor = monitor.scale_factor();
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+
+    let screen_size = monitor.size();
+    let work_area = monitor.work_area();
+    let work_width = f64::from(work_area.size.width) / scale_factor;
+    let work_height = f64::from(work_area.size.height) / scale_factor;
+    Some((screen_size.width, screen_size.height, work_width, work_height))
+}
+
+fn clamp_window_state_to_display(
+    state: PersistedWindowState,
+    window: &tauri::WebviewWindow,
+) -> PersistedWindowState {
+    let Some((_, _, work_width, work_height)) = logical_monitor_sizes(window) else {
+        return state;
+    };
+
+    if work_width <= MIN_WINDOW_WIDTH || work_height <= MIN_WINDOW_HEIGHT {
+        return state;
+    }
+
+    clamp_window_state_to_work_area(state, work_width, work_height)
+}
+
+fn clamp_window_state_to_work_area(
+    state: PersistedWindowState,
+    work_width: f64,
+    work_height: f64,
+) -> PersistedWindowState {
+    if work_width <= MIN_WINDOW_WIDTH || work_height <= MIN_WINDOW_HEIGHT {
+        return state;
+    }
+
+    let available_width = (work_width - WINDOW_WORK_AREA_MARGIN).max(MIN_WINDOW_WIDTH);
+    let available_height = (work_height - WINDOW_WORK_AREA_MARGIN).max(MIN_WINDOW_HEIGHT);
+
+    PersistedWindowState {
+        width: state.width.min(available_width),
+        height: state.height.min(available_height),
+        maximized: state.maximized,
+    }
+}
+
+fn responsive_default_window_state_for_display(
+    screen_width: u32,
+    screen_height: u32,
+    work_width: f64,
+    work_height: f64,
+) -> PersistedWindowState {
+    let has_large_physical_screen = screen_width >= 2_400 && screen_height >= 1_300;
+    let preferred_width = if has_large_physical_screen {
+        LARGE_DEFAULT_WINDOW_WIDTH
+    } else {
+        COMPACT_DEFAULT_WINDOW_WIDTH
+    };
+    let preferred_height = if has_large_physical_screen {
+        LARGE_DEFAULT_WINDOW_HEIGHT
+    } else {
+        COMPACT_DEFAULT_WINDOW_HEIGHT
+    };
+
+    clamp_window_state_to_work_area(
+        PersistedWindowState {
+            width: preferred_width,
+            height: preferred_height,
+            maximized: false,
+        },
+        work_width,
+        work_height,
+    )
+}
+
+fn responsive_default_window_state(window: &tauri::WebviewWindow) -> PersistedWindowState {
+    let fallback = PersistedWindowState::default();
+    let Some((screen_width, screen_height, work_width, work_height)) = logical_monitor_sizes(window)
+    else {
+        return fallback;
+    };
+
+    if work_width <= MIN_WINDOW_WIDTH || work_height <= MIN_WINDOW_HEIGHT {
+        return fallback;
+    }
+
+    responsive_default_window_state_for_display(
+        screen_width,
+        screen_height,
+        work_width,
+        work_height,
+    )
 }
 
 fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
@@ -579,11 +686,14 @@ fn write_persisted_app_settings(app: &AppHandle, settings: PersistedAppSettings)
     fs::write(path, contents).ok();
 }
 
-fn read_persisted_window_state(app: &AppHandle) -> Option<PersistedWindowState> {
+fn read_persisted_window_state(
+    app: &AppHandle,
+    fallback: PersistedWindowState,
+) -> Option<PersistedWindowState> {
     let path = window_state_path(app)?;
     let contents = fs::read_to_string(path).ok()?;
     let state = serde_json::from_str::<PersistedWindowState>(&contents).ok()?;
-    Some(state.sanitized())
+    Some(state.sanitized(fallback))
 }
 
 fn write_persisted_window_state(app: &AppHandle, state: PersistedWindowState) {
@@ -593,7 +703,8 @@ fn write_persisted_window_state(app: &AppHandle, state: PersistedWindowState) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let Ok(contents) = serde_json::to_vec(&state.sanitized()) else {
+    let Ok(contents) = serde_json::to_vec(&state.sanitized(PersistedWindowState::default()))
+    else {
         return;
     };
 
@@ -649,7 +760,11 @@ fn persist_main_window_state(window: &tauri::WebviewWindow) {
 
 fn initialize_main_window_state(window: &tauri::WebviewWindow) {
     let app = window.app_handle();
-    let state = read_persisted_window_state(&app).unwrap_or_default();
+    let default_state = responsive_default_window_state(window);
+    let state = clamp_window_state_to_display(
+        read_persisted_window_state(&app, default_state).unwrap_or(default_state),
+        window,
+    );
 
     if let Ok(mut store) = app.state::<PersistedMainWindowState>().0.lock() {
         *store = state;
@@ -4913,9 +5028,9 @@ mod tests {
         merge_window_state, normalize_anthropic_endpoint,
         output_looks_authenticated, parse_github_releases_feed, parse_openssh_file_list,
         parse_system_usage_output, release_asset_download_url, remote_file_upload_shell_fragment,
-        run_openssh_exec_command, run_remote_file_list, run_remote_system_usage,
-        select_feed_release, should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
-        PersistedWindowState,
+        responsive_default_window_state_for_display, run_openssh_exec_command,
+        run_remote_file_list, run_remote_system_usage, select_feed_release,
+        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses, PersistedWindowState,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
 
@@ -5062,6 +5177,24 @@ mod tests {
         assert_eq!(next.width, 1366.0);
         assert_eq!(next.height, 860.0);
         assert!(next.maximized);
+    }
+
+    #[test]
+    fn defaults_to_large_window_on_2k_displays() {
+        let state = responsive_default_window_state_for_display(2560, 1440, 2560.0, 1392.0);
+
+        assert_eq!(state.width, 1665.0);
+        assert_eq!(state.height, 1039.0);
+        assert!(!state.maximized);
+    }
+
+    #[test]
+    fn defaults_to_compact_window_on_1080p_displays() {
+        let state = responsive_default_window_state_for_display(1920, 1080, 1920.0, 1032.0);
+
+        assert_eq!(state.width, 1440.0);
+        assert_eq!(state.height, 900.0);
+        assert!(!state.maximized);
     }
 
     #[test]

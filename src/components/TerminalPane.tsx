@@ -1943,7 +1943,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
   return (
     <section
       className={cn(
-        'relative flex h-full min-h-0 flex-col overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] shadow-[0_12px_28px_rgba(20,38,52,0.07)] transition',
+        'terminal-pane relative flex h-full min-h-0 flex-col overflow-hidden rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] shadow-[0_12px_28px_rgba(20,38,52,0.07)] transition',
         props.active && 'border-[var(--border-strong)] shadow-[0_16px_34px_rgba(20,38,52,0.11)]',
         dragActive && 'ring-2 ring-[var(--ring)]',
       )}
@@ -1999,7 +1999,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
         <div className="pointer-events-none absolute inset-0 z-[12]">
           <aside
             className={cn(
-              'absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(200px,23%,253px)] max-w-[92%] flex-col border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              'file-drawer absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(200px,23%,253px)] max-w-[92%] flex-col border-l border-[var(--border-subtle)] bg-[var(--surface-panel)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
               fileManagerOpen ? 'pointer-events-auto' : 'pointer-events-none',
               fileManagerOpen ? 'translate-x-0' : 'translate-x-full',
             )}
@@ -2113,16 +2113,16 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
           <aside
             className={cn(
-              'absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(260px,28%,360px)] max-w-[94%] flex-col border-l border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] text-[var(--text-primary)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
+              'ai-drawer absolute inset-y-0 right-0 z-[13] flex h-full w-[clamp(260px,28%,360px)] max-w-[94%] flex-col border-l border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-card-start),var(--surface-card-end))] text-[var(--text-primary)] shadow-[-16px_0_32px_rgba(15,23,42,0.18)] transition-transform duration-220 ease-out',
               aiAssistantOpen ? 'pointer-events-auto' : 'pointer-events-none',
               aiAssistantOpen ? 'translate-x-0' : 'translate-x-full',
             )}
             onMouseDown={(event) => event.stopPropagation()}
           >
-            <div className="border-b border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] px-4 py-4">
+            <div className="ai-drawer-header border-b border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] px-4 py-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <strong className="block truncate text-[26px] font-semibold leading-none text-[var(--text-strong)]">{t('aiAssistant')}</strong>
+                  <strong className="ai-drawer-title block truncate text-[26px] font-semibold leading-none text-[var(--text-strong)]">{t('aiAssistant')}</strong>
                   <span className="mt-2 block truncate text-xs text-[var(--text-muted)]">{buildAiTargetLabel(props.pane.connection)}</span>
                 </div>
                 <div className="flex items-center gap-1">
@@ -2158,7 +2158,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             </div>
 
             {aiHistoryOpen ? (
-              <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+              <div className="ai-drawer-body min-h-0 flex-1 overflow-y-auto px-4 py-4">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
                     <strong className="block text-sm text-[var(--text-strong)]">{t('aiAssistantHistory')}</strong>
@@ -2217,7 +2217,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
               </div>
             ) : (
               <>
-                <div ref={aiMessagesViewportRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+                <div ref={aiMessagesViewportRef} className="ai-drawer-body min-h-0 flex-1 overflow-y-auto px-4 py-4">
                   <div className="flex items-start gap-3">
                     <div className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[radial-gradient(circle_at_30%_30%,var(--surface-panel-strong),var(--accent-soft)_38%,var(--accent)_100%)] shadow-[0_0_0_1px_var(--border-strong)]">
                       <Bot className="h-4 w-4 text-[var(--text-strong)]" />
@@ -2271,7 +2271,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
                   </div>
                 </div>
 
-                <div className="border-t border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel),var(--surface-card-end))] px-4 py-4">
+                <div className="ai-drawer-input border-t border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel),var(--surface-card-end))] px-4 py-4">
                   <div className="rounded-[16px] border border-[var(--border-strong)] bg-[var(--surface-shell)] p-2 shadow-[0_0_0_1px_var(--accent-soft)]">
                     <div className="relative">
                       <Textarea
@@ -2348,7 +2348,7 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
       {props.pane.status === 'idle' && (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-[linear-gradient(180deg,rgba(227,233,236,0.72),rgba(222,229,233,0.58))] p-5 backdrop-blur-[1px]">
-          <div className="flex w-full max-w-sm flex-col items-center rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-6 py-8 text-center shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
+          <div className="empty-session-card flex w-full max-w-sm flex-col items-center rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-6 py-8 text-center shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
             <div className="mb-3 grid h-12 w-12 place-items-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent)] shadow-[inset_0_1px_0_var(--surface-highlight)]">
               <SquareTerminal className="h-6 w-6" />
             </div>

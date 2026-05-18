@@ -2325,8 +2325,8 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-1 overflow-hidden bg-transparent px-2.5 pb-2.5 pt-0">
-      <header className="flex h-9 items-center gap-3 bg-transparent px-1">
+    <div className="app-frame flex h-full min-h-0 flex-col gap-1 overflow-hidden bg-transparent px-2.5 pb-2.5 pt-0">
+      <header className="app-titlebar flex h-9 items-center gap-3 bg-transparent px-1">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -2393,7 +2393,7 @@ export default function App() {
 
       <main className={cn('grid min-h-0 flex-1 gap-0 overflow-hidden bg-transparent', resizingSidebar && 'select-none')} style={appShellStyle}>
       {!sidebarCollapsed && (
-        <aside className="flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
+        <aside className="connection-sidebar flex min-h-0 min-w-0 flex-col gap-2.5 rounded-[12px] border border-[var(--border-subtle)] bg-[linear-gradient(180deg,var(--surface-panel-strong),var(--surface-panel))] p-3.5 shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
           <div className="grid grid-cols-[minmax(0,1fr)_40px] gap-2 max-[640px]:grid-cols-1">
             <Button onClick={() => openConnectionModal()}>
               <Plus className="h-4 w-4" />
@@ -2505,8 +2505,8 @@ export default function App() {
         </div>
       )}
 
-      <section className="flex min-h-0 min-w-0 flex-col gap-2.5 overflow-hidden rounded-[12px] border border-[rgba(255,255,255,0.18)] bg-[var(--surface-shell)] p-0.5">
-        <header className="flex min-h-[42px] flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-1 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
+      <section className="workspace-shell flex min-h-0 min-w-0 flex-col gap-2.5 overflow-hidden rounded-[12px] border border-[rgba(255,255,255,0.18)] bg-[var(--surface-shell)] p-0.5">
+        <header className="workspace-toolbar flex min-h-[42px] flex-wrap items-center justify-between gap-3 rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-3.5 py-1 shadow-[0_12px_28px_rgba(20,38,52,0.07)]">
           <div className="min-w-0 flex-1 max-md:w-full">
             <div aria-label={t('sessionList')} className="relative flex min-w-0 items-end gap-1 overflow-x-auto pr-0.5 pb-0 pt-0.5">
               {panes.map((pane) => (
@@ -2652,7 +2652,7 @@ export default function App() {
         </header>
 
         <div className={cn(
-          'grid min-h-0 flex-1 gap-2.5 overflow-hidden rounded-[10px]',
+          'pane-grid grid min-h-0 flex-1 gap-2.5 overflow-hidden rounded-[10px]',
           visiblePanes.length === 1 && 'grid-cols-1',
           visiblePanes.length === 2 && 'grid-cols-1 xl:grid-cols-2',
           visiblePanes.length === 3 && 'grid-cols-1 xl:grid-cols-[1.25fr_.75fr] xl:grid-rows-2',
