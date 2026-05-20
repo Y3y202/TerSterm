@@ -30,7 +30,7 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["tersterm"]
+        "schemes": ["tersterm", "ssh"]
       }
     }
   }

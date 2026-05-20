@@ -1748,6 +1748,12 @@ export default function App() {
       const value = url.searchParams.get(name)?.trim()
       if (value) return value
     }
+    const normalizedNames = new Set(names.map((name) => name.toLowerCase()))
+    for (const [key, rawValue] of url.searchParams.entries()) {
+      if (!normalizedNames.has(key.toLowerCase())) continue
+      const value = rawValue.trim()
+      if (value) return value
+    }
     return ''
   }
 
@@ -1757,7 +1763,13 @@ export default function App() {
     return !['0', 'false', 'no', 'off'].includes(value)
   }
 
-  const isTerstermDeepLink = (url: URL) => url.protocol.toLowerCase() === 'tersterm:'
+  const isQuickSessionDeepLink = (url: URL) => ['tersterm:', 'ssh:'].includes(url.protocol.toLowerCase())
+
+  const hostFromUrlPath = (url: URL) => {
+    const path = decodeURIComponent(url.pathname).replace(/^\/+/, '').trim()
+    if (!path || path.includes('/')) return ''
+    return path
+  }
 
   const groupIdFromDeepLink = (value: string) => {
     const groupName = value.trim()
@@ -1789,26 +1801,52 @@ export default function App() {
       return undefined
     }
 
-    if (!isTerstermDeepLink(url)) return undefined
+    if (!isQuickSessionDeepLink(url)) return undefined
 
-    const command = url.hostname.toLowerCase()
-    const shorthandHost = command && command !== 'connect' ? url.hostname : ''
-    const host = readUrlValue(url, ['host', 'hostname', 'ip']) || shorthandHost
-    const username = readUrlValue(url, ['username', 'user', 'login']) || decodeURIComponent(url.username)
+    const isTerstermUrl = url.protocol.toLowerCase() === 'tersterm:'
+    const command = isTerstermUrl ? url.hostname.toLowerCase() : ''
+    const shorthandHost = isTerstermUrl && command && command !== 'connect' ? url.hostname : ''
+    const host =
+      readUrlValue(url, ['host', 'hostname', 'ip', 'ipaddr', 'address', 'server', 'target']) ||
+      shorthandHost ||
+      (!isTerstermUrl ? url.hostname : '') ||
+      hostFromUrlPath(url)
+    const username =
+      readUrlValue(url, [
+        'username',
+        'user',
+        'login',
+        'account',
+        'accountname',
+        'acct',
+        'userid',
+        'user_name',
+        'login_user',
+        'login_name',
+      ]) ||
+      decodeURIComponent(url.username)
 
     if (!host || !username) {
       toast.warning(t('quickSessionLinkNeedsHostAndUsername'))
       return undefined
     }
 
-    const port = parsePort(readUrlValue(url, ['port']) || url.port, true) ?? 22
-    const name = readUrlValue(url, ['name', 'title']) || `${username}@${host}`
-    const groupValue = readUrlValue(url, ['group', 'group_id', 'folder'])
+    const port = parsePort(readUrlValue(url, ['port', 'ssh_port', 'sshport']) || url.port, true) ?? 22
+    const name = readUrlValue(url, ['name', 'title', 'alias']) || `${username}@${host}`
+    const groupValue = readUrlValue(url, ['group', 'group_id', 'groupid', 'folder'])
     const group_id = groupValue ? groupIdFromDeepLink(groupValue) : getPreferredGroupId(groupsRef.current)
-    const password = readUrlValue(url, ['password', 'pass']) || decodeURIComponent(url.password)
-    const private_key_path = readUrlValue(url, ['private_key_path', 'key_path', 'identity'])
-    const private_key = readUrlValue(url, ['private_key', 'key'])
-    const private_key_passphrase = readUrlValue(url, ['private_key_passphrase', 'passphrase'])
+    const password = readUrlValue(url, ['password', 'pass', 'passwd', 'pwd']) || decodeURIComponent(url.password)
+    const private_key_path = readUrlValue(url, [
+      'private_key_path',
+      'privatekeypath',
+      'key_path',
+      'keypath',
+      'identity',
+      'identity_file',
+      'identityfile',
+    ])
+    const private_key = readUrlValue(url, ['private_key', 'privatekey', 'key'])
+    const private_key_passphrase = readUrlValue(url, ['private_key_passphrase', 'privatekeypassphrase', 'passphrase'])
 
     return {
       profile: {

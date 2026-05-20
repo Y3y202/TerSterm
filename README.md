@@ -138,7 +138,7 @@ pnpm check:process-cleanup
 
 ## 深链快速会话
 
-应用注册了 `tersterm://` 协议，可通过深链创建或直接打开会话。
+应用注册了 `tersterm://` 和标准 `ssh://` 协议，可通过深链创建或直接打开会话。`ssh://` 用于兼容 4A / 堡垒机 Web 管理平台按通用 SSH 客户端方式拉起桌面终端。
 
 示例：
 
@@ -147,19 +147,22 @@ tersterm://connect?host=192.168.1.10&username=root
 tersterm://connect?host=192.168.1.10&username=root&port=22&name=Prod
 tersterm://connect?host=192.168.1.10&username=root&group=生产环境&save=true&connect=true
 tersterm://192.168.1.10?username=root
+ssh://root@192.168.1.10:22
+ssh://root:password@192.168.1.10:22
+ssh://192.168.1.10?username=root&port=22
 ```
 
-支持的常用参数：
+参数名大小写不敏感，支持的常用参数：
 
-- `host` / `hostname` / `ip`
-- `username` / `user` / `login`
-- `port`
-- `name` / `title`
-- `group` / `group_id` / `folder`
-- `password` / `pass`
-- `private_key_path` / `key_path` / `identity`
-- `private_key` / `key`
-- `private_key_passphrase` / `passphrase`
+- `host` / `hostname` / `ip` / `ipaddr` / `address` / `server` / `target`
+- `username` / `user` / `login` / `account` / `accountname` / `acct` / `userid` / `user_name` / `login_user` / `login_name`
+- `port` / `ssh_port` / `sshport`
+- `name` / `title` / `alias`
+- `group` / `group_id` / `groupid` / `folder`
+- `password` / `pass` / `passwd` / `pwd`
+- `private_key_path` / `privatekeypath` / `key_path` / `keypath` / `identity` / `identity_file` / `identityfile`
+- `private_key` / `privatekey` / `key`
+- `private_key_passphrase` / `privatekeypassphrase` / `passphrase`
 - `save=true|false`
 - `connect=true|false`
 
