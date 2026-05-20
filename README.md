@@ -7,9 +7,13 @@ TerSterm 是一个基于 Tauri 2、Rust、Vue 3、Ant Design Vue 和 xterm.js �
 ## 界面预览
 
 <p align="center">
-  <img src="img/1.png" alt="TerSterm 界面预览 1" width="32%" />
-  <img src="img/2.png" alt="TerSterm 界面预览 2" width="32%" />
-  <img src="img/3.png" alt="TerSterm 界面预览 3" width="32%" />
+  <img src="img/1.png" alt="TerSterm 界面预览 1" width="80%" />
+</p>
+<p align="center">
+  <img src="img/2.png" alt="TerSterm 界面预览 2" width="80%" />
+</p>
+<p align="center">
+  <img src="img/3.png" alt="TerSterm 界面预览 3" width="80%" />
 </p>
 
 ## 当前功能
