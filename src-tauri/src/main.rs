@@ -2703,6 +2703,11 @@ fn build_ssh_command(
     command.arg("-o");
     command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
+    command.arg(format!(
+        "UserKnownHostsFile={}",
+        ensure_terssh_known_hosts().to_string_lossy()
+    ));
+    command.arg("-o");
     command.arg("NumberOfPasswordPrompts=1");
 
     if let Some(private_key) = private_key {
@@ -2743,6 +2748,11 @@ fn build_scp_command(
     command.arg("ConnectTimeout=15");
     command.arg("-o");
     command.arg("StrictHostKeyChecking=accept-new");
+    command.arg("-o");
+    command.arg(format!(
+        "UserKnownHostsFile={}",
+        ensure_terssh_known_hosts().to_string_lossy()
+    ));
     command.arg("-o");
     command.arg("NumberOfPasswordPrompts=1");
 
@@ -2853,6 +2863,20 @@ fn expand_local_directory_path(raw_path: &str) -> PathBuf {
     }
 
     PathBuf::from(trimmed)
+}
+
+fn terssh_dir() -> PathBuf {
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        PathBuf::from(home).join(".terssh")
+    } else {
+        env::temp_dir().join("terssh")
+    }
+}
+
+fn ensure_terssh_known_hosts() -> PathBuf {
+    let dir = terssh_dir();
+    fs::create_dir_all(&dir).ok();
+    dir.join("known_hosts")
 }
 
 fn resolve_local_download_directory(
@@ -3658,6 +3682,11 @@ fn run_openssh_scp_download_noninteractive(
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
         .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            ensure_terssh_known_hosts().to_string_lossy()
+        ))
+        .arg("-o")
         .arg("NumberOfPasswordPrompts=0");
 
     if let Some(private_key) = private_key.as_ref() {
@@ -4432,6 +4461,11 @@ fn run_openssh_exec_command_noninteractive_with_stdin_and_timeout(
         .arg("ConnectTimeout=15")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            ensure_terssh_known_hosts().to_string_lossy()
+        ))
         .arg("-o")
         .arg("NumberOfPasswordPrompts=0");
 
