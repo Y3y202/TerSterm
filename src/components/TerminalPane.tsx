@@ -1736,6 +1736,10 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     })
   }, [aiAssistantMessages, aiAssistantOpen, aiAssistantSending])
 
+  const isHostKeyError = props.pane.status === 'error' && props.pane.error &&
+    (props.pane.error.includes('Host key verification failed') ||
+     props.pane.error.includes('REMOTE HOST IDENTIFICATION HAS CHANGED'))
+
   useEffect(() => {
     if (!terminalRef.current) return
 
@@ -1759,6 +1763,11 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
 
     if (props.pane.status === 'error' && props.pane.error) {
       terminalRef.current.writeln(`\r\n${props.pane.error}`)
+
+      if (props.pane.error.includes('Host key verification failed') ||
+          props.pane.error.includes('REMOTE HOST IDENTIFICATION HAS CHANGED')) {
+        terminalRef.current.writeln(`\r\n\x1b[33m[i]\x1b[0m ${i18n.t('hostKeyChangedHint')}`)
+      }
     }
   }, [props.pane.status, props.pane.connection, props.pane.error])
 
@@ -2362,6 +2371,18 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
               <Link2 className="h-4 w-4" />
               {t('connectHost')}
             </Button>
+          </div>
+        </div>
+      )}
+
+      {props.pane.status === 'error' && isHostKeyError && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-[linear-gradient(180deg,rgba(227,233,236,0.72),rgba(222,229,233,0.58))] p-5 backdrop-blur-[1px]">
+          <div className="empty-session-card flex w-full max-w-sm flex-col items-center rounded-[12px] border border-[var(--border-subtle)] bg-[var(--surface-panel-strong)] px-6 py-8 text-center shadow-[0_14px_32px_rgba(20,38,52,0.07)]">
+            <div className="mb-3 grid h-12 w-12 place-items-center rounded-lg bg-amber-50 text-amber-500 shadow-[inset_0_1px_0_var(--surface-highlight)]">
+              <RefreshCw className="h-6 w-6 animate-spin" />
+            </div>
+            <strong className="text-base text-[var(--text-strong)]">{t('hostKeyChangedTitle')}</strong>
+            <p className="mt-2 max-w-[260px] text-sm leading-6 text-[var(--text-muted)]">{t('hostKeyChangedHint')}</p>
           </div>
         </div>
       )}

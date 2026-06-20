@@ -579,6 +579,7 @@ export default function App() {
   }))
   const [groupForm, setGroupForm] = useState({ id: '', name: '' })
   const [groupPendingDelete, setGroupPendingDelete] = useState<ConnectionGroup | null>(null)
+  const [connectionPendingDelete, setConnectionPendingDelete] = useState<ConnectionProfile | null>(null)
   const terminalRefs = useRef<Record<string, TerminalPaneHandle | null>>({})
   const pendingConnectPaneIdRef = useRef<string>()
   const unlistenDeepLinkRef = useRef<DeepLinkUnlisten>()
@@ -2097,6 +2098,10 @@ export default function App() {
     setGroupPendingDelete(group)
   }
 
+  const confirmDeleteConnection = (connection: ConnectionProfile) => {
+    setConnectionPendingDelete(connection)
+  }
+
   const deleteConnection = async (connection: ConnectionProfile) => {
     setConnections((current) => current.filter((item) => item.id !== connection.id))
     if (selectedConnectionIdRef.current === connection.id) {
@@ -2541,7 +2546,7 @@ export default function App() {
                             </ContextMenuTrigger>
                             <ContextMenuContent>
                               <ContextMenuItem onSelect={() => openConnectionModal(connection)}>{t('edit')}</ContextMenuItem>
-                              <ContextMenuItem className="text-[#d45b5b] focus:text-[#d45b5b]" onSelect={() => void deleteConnection(connection)}>
+                              <ContextMenuItem className="text-[#d45b5b] focus:text-[#d45b5b]" onSelect={() => confirmDeleteConnection(connection)}>
                                 {t('delete')}
                               </ContextMenuItem>
                             </ContextMenuContent>
@@ -3456,6 +3461,26 @@ export default function App() {
               if (groupPendingDelete) {
                 deleteGroup(groupPendingDelete)
                 setGroupPendingDelete(null)
+              }
+            }}>{t('delete')}</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={Boolean(connectionPendingDelete)} onOpenChange={(open) => {
+        if (!open) setConnectionPendingDelete(null)
+      }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('delete')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('deleteConnectionConfirm', { name: connectionPendingDelete?.name })}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => {
+              if (connectionPendingDelete) {
+                void deleteConnection(connectionPendingDelete)
+                setConnectionPendingDelete(null)
               }
             }}>{t('delete')}</AlertDialogAction>
           </AlertDialogFooter>

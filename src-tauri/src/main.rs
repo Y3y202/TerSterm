@@ -563,7 +563,12 @@ fn logical_monitor_sizes(window: &tauri::WebviewWindow) -> Option<(u32, u32, f64
     let work_area = monitor.work_area();
     let work_width = f64::from(work_area.size.width) / scale_factor;
     let work_height = f64::from(work_area.size.height) / scale_factor;
-    Some((screen_size.width, screen_size.height, work_width, work_height))
+    Some((
+        screen_size.width,
+        screen_size.height,
+        work_width,
+        work_height,
+    ))
 }
 
 fn clamp_window_state_to_display(
@@ -631,7 +636,8 @@ fn responsive_default_window_state_for_display(
 
 fn responsive_default_window_state(window: &tauri::WebviewWindow) -> PersistedWindowState {
     let fallback = PersistedWindowState::default();
-    let Some((screen_width, screen_height, work_width, work_height)) = logical_monitor_sizes(window)
+    let Some((screen_width, screen_height, work_width, work_height)) =
+        logical_monitor_sizes(window)
     else {
         return fallback;
     };
@@ -704,8 +710,7 @@ fn write_persisted_window_state(app: &AppHandle, state: PersistedWindowState) {
     let Some(parent) = path.parent() else {
         return;
     };
-    let Ok(contents) = serde_json::to_vec(&state.sanitized(PersistedWindowState::default()))
-    else {
+    let Ok(contents) = serde_json::to_vec(&state.sanitized(PersistedWindowState::default())) else {
         return;
     };
 
@@ -779,7 +784,9 @@ fn initialize_main_window_state(window: &tauri::WebviewWindow) {
 }
 
 fn initialize_persisted_app_settings(app: &AppHandle) {
-    let settings = read_persisted_app_settings(app).unwrap_or_default().sanitized();
+    let settings = read_persisted_app_settings(app)
+        .unwrap_or_default()
+        .sanitized();
     let close_behavior = settings.window_close_behavior();
     let locale = settings.locale();
 
@@ -1236,6 +1243,70 @@ async fn ssh_download_file(
 }
 
 #[tauri::command]
+fn ssh_remove_known_host(host: String, port: Option<u16>) -> Result<(), String> {
+    let known_hosts_path = ensure_terssh_known_hosts();
+    if !known_hosts_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&known_hosts_path)
+        .map_err(|error| format!("Failed to read known_hosts: {}", error))?;
+
+    // OpenSSH 的存储格式：
+    // - 默认端口 22：直接用主机名，例如 `38.76.185.33 ssh-ed25519 ...`
+    // - 非默认端口：用 `[host]:port`，例如 `[38.76.185.33]:2222 ssh-ed25519 ...`
+    // 一行可能含多个逗号分隔的主机，例如 `host1,host2 ssh-ed25519 ...`
+    //
+    // 重连前清理时无法确定旧条目当初用哪个端口建立（可能是裸主机名，也可能带端口），
+    // 因此同时匹配裸主机名和 `[host]:port` 两种格式，确保该主机的所有旧 key 都被清除。
+    let port = port.unwrap_or(22);
+    let bracketed = format!("[{}]:{}", host, port);
+
+    let matches_host = |entry: &str| -> bool {
+        // entry 可能是 `host`、`[host]:port` 或 `host,host2`
+        entry.split(',').any(|token| {
+            let token = token.trim();
+            // 裸主机名匹配（兼容默认端口及历史遗留条目）
+            if token == host || token == bracketed {
+                return true;
+            }
+            // 任意端口的 `[host]:any` 也视为同一主机
+            token.strip_prefix(&format!("[{}]:", host)).is_some()
+        })
+    };
+
+    let mut new_lines = Vec::new();
+    let mut removed = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            new_lines.push(line);
+            continue;
+        }
+
+        let host_field = trimmed.split_whitespace().next().unwrap_or("");
+        if matches_host(host_field) {
+            removed = true;
+            continue;
+        }
+        new_lines.push(line);
+    }
+
+    if removed {
+        let mut new_content = new_lines.join("\n");
+        // 保留尾部换行，避免下次追加写入时与新条目粘连。
+        if !new_content.is_empty() {
+            new_content.push('\n');
+        }
+        fs::write(&known_hosts_path, new_content)
+            .map_err(|error| format!("Failed to write known_hosts: {}", error))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn ssh_get_file_permissions(
     app: AppHandle,
     mut config: ConnectionConfig,
@@ -1547,14 +1618,25 @@ fn build_ai_system_prompt(
     lines.push(String::new());
     lines.push("Current session context:".to_string());
 
-    if let Some(value) = context.connection_name.as_deref().filter(|value| !value.trim().is_empty())
+    if let Some(value) = context
+        .connection_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
     {
         lines.push(format!("- Connection: {value}"));
     }
-    if let Some(value) = context.host.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = context
+        .host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         lines.push(format!("- Host: {value}"));
     }
-    if let Some(value) = context.username.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(value) = context
+        .username
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         lines.push(format!("- Username: {value}"));
     }
     if let Some(value) = context
@@ -2976,7 +3058,9 @@ fn file_list_shell_fragment(remote_path: &str) -> String {
     )
 }
 
-fn validate_remote_file_component(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn validate_remote_file_component(
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Name is required".into());
@@ -3380,9 +3464,12 @@ fn run_remote_get_file_permissions(
     parse_file_permissions_output(&output)
 }
 
-fn validate_permission_mode(mode: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+fn validate_permission_mode(
+    mode: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let trimmed = mode.trim();
-    let valid = matches!(trimmed.len(), 3 | 4) && trimmed.chars().all(|char| ('0'..='7').contains(&char));
+    let valid =
+        matches!(trimmed.len(), 3 | 4) && trimmed.chars().all(|char| ('0'..='7').contains(&char));
     if !valid {
         return Err("Mode must be a 3 or 4 digit octal value".into());
     }
@@ -4106,12 +4193,12 @@ fn parse_system_usage_output(
 }
 
 fn run_ssh_ping(config: &ConnectionConfig) -> u64 {
-    let addr = format!("{}:{}", config.host, config.port);
     let start = Instant::now();
-    let _ = TcpStream::connect_timeout(
-        &addr.parse().expect("invalid SSH address"),
-        std::time::Duration::from_secs(3),
-    );
+    if let Ok(mut addresses) = (config.host.as_str(), config.port).to_socket_addrs() {
+        if let Some(address) = addresses.next() {
+            let _ = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3));
+        }
+    }
     start.elapsed().as_millis() as u64
 }
 
@@ -4579,6 +4666,25 @@ fn run_openssh_exec_command_noninteractive_with_stdin_and_timeout(
     Err(message.to_string().into())
 }
 
+fn ssh_session_error_message(exit_code: u32, output: &str) -> String {
+    let output_tail = output.trim();
+    format!(
+        "SSH process exited with code {}{}",
+        exit_code,
+        if output_tail.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", output_tail)
+        }
+    )
+}
+
+fn is_host_key_verification_error(output: &str) -> bool {
+    output.contains("Host key verification failed")
+        || output.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
+        || (output.contains("Host key for") && output.contains("has changed"))
+}
+
 fn run_ssh_session(
     app: AppHandle,
     session_id: String,
@@ -4592,240 +4698,291 @@ fn run_ssh_session(
     );
 
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: 32,
-        cols: 120,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let mut host_key_retry_used = false;
 
-    let private_key = prepare_private_key(&config)?;
-    let command = build_ssh_command(&config, private_key.as_ref(), None);
-    let master = pair.master;
-    let slave = pair.slave;
-    let mut child = slave.spawn_command(command)?;
-    drop(slave);
+    'connect_attempt: loop {
+        let pair = pty_system.openpty(PtySize {
+            rows: 32,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
 
-    let mut reader = master.try_clone_reader()?;
-    let mut writer = Some(master.take_writer()?);
-    let mut master = Some(master);
-    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
-    let private_key_passphrase = config
-        .private_key_passphrase
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let password = config
-        .password
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let should_capture_private_key_passphrase =
-        connection_uses_private_key(&config) && private_key_passphrase.is_none();
-    let private_key_passphrase_prompted = Arc::new(AtomicBool::new(false));
-    let should_capture_password = password.is_none();
-    let password_prompted = Arc::new(AtomicBool::new(false));
-    let authenticated = Arc::new(AtomicBool::new(false));
-    let writer_tx = app
-        .state::<SshSessions>()
-        .0
-        .lock()
-        .ok()
-        .and_then(|store| store.get(&session_id).map(|entry| entry.sender.clone()));
+        let private_key = prepare_private_key(&config)?;
+        let command = build_ssh_command(&config, private_key.as_ref(), None);
+        let master = pair.master;
+        let slave = pair.slave;
+        let mut child = slave.spawn_command(command)?;
+        drop(slave);
 
-    thread::spawn({
-        let app = app.clone();
-        let session_id = session_id.clone();
-        let private_key_passphrase_prompted = private_key_passphrase_prompted.clone();
-        let password_prompted = password_prompted.clone();
-        let authenticated = authenticated.clone();
-        move || {
-            let mut buffer = [0_u8; 8192];
-            let mut password_sent = false;
-            let mut passphrase_sent = false;
-            let mut auth_prompt_buffer = String::new();
+        let mut reader = master.try_clone_reader()?;
+        let mut writer = Some(master.take_writer()?);
+        let mut master = Some(master);
+        let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+        let private_key_passphrase = config
+            .private_key_passphrase
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let password = config
+            .password
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        let should_capture_private_key_passphrase =
+            connection_uses_private_key(&config) && private_key_passphrase.is_none();
+        let private_key_passphrase_prompted = Arc::new(AtomicBool::new(false));
+        let should_capture_password = password.is_none();
+        let password_prompted = Arc::new(AtomicBool::new(false));
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let writer_tx = app
+            .state::<SshSessions>()
+            .0
+            .lock()
+            .ok()
+            .and_then(|store| store.get(&session_id).map(|entry| entry.sender.clone()));
 
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(size) => {
-                        let data = String::from_utf8_lossy(&buffer[..size]).to_string();
-                        auth_prompt_buffer.push_str(&data);
-                        if auth_prompt_buffer.len() > 4096 {
-                            auth_prompt_buffer = auth_prompt_buffer
-                                .chars()
-                                .rev()
-                                .take(4096)
-                                .collect::<String>()
-                                .chars()
-                                .rev()
-                                .collect();
-                        }
-                        if !authenticated.load(Ordering::Relaxed)
-                            && output_looks_authenticated(&auth_prompt_buffer)
-                        {
-                            authenticated.store(true, Ordering::Relaxed);
-                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
-                            password_prompted.store(false, Ordering::Relaxed);
-                        }
+        let shared_output = Arc::new(Mutex::new(String::new()));
 
-                        let prompt = auth_prompt_buffer.to_lowercase();
-                        if !passphrase_sent
-                            && prompt.contains("passphrase")
-                            && private_key_passphrase.is_some()
-                        {
-                            passphrase_sent = true;
-                            if let (Some(sender), Some(passphrase)) =
-                                (&writer_tx, &private_key_passphrase)
+        thread::spawn({
+            let app = app.clone();
+            let session_id = session_id.clone();
+            let private_key_passphrase_prompted = private_key_passphrase_prompted.clone();
+            let password_prompted = password_prompted.clone();
+            let authenticated = authenticated.clone();
+            let shared_output = shared_output.clone();
+            move || {
+                let mut buffer = [0_u8; 8192];
+                let mut password_sent = false;
+                let mut passphrase_sent = false;
+                let mut auth_prompt_buffer = String::new();
+
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(size) => {
+                            let data = String::from_utf8_lossy(&buffer[..size]).to_string();
+                            auth_prompt_buffer.push_str(&data);
+                            if auth_prompt_buffer.len() > 4096 {
+                                auth_prompt_buffer = auth_prompt_buffer
+                                    .chars()
+                                    .rev()
+                                    .take(4096)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect();
+                            }
+                            if let Ok(mut output) = shared_output.lock() {
+                                output.push_str(&data);
+                                if output.len() > 4096 {
+                                    let trimmed = output
+                                        .chars()
+                                        .rev()
+                                        .take(4096)
+                                        .collect::<String>()
+                                        .chars()
+                                        .rev()
+                                        .collect::<String>();
+                                    output.clear();
+                                    output.push_str(&trimmed);
+                                }
+                            }
+                            if !authenticated.load(Ordering::Relaxed)
+                                && output_looks_authenticated(&auth_prompt_buffer)
                             {
-                                sender
-                                    .send(SshCommand::Write(format!("{passphrase}\n")))
-                                    .ok();
+                                authenticated.store(true, Ordering::Relaxed);
+                                private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                                password_prompted.store(false, Ordering::Relaxed);
                             }
-                        }
-                        if !authenticated.load(Ordering::Relaxed)
-                            && should_capture_private_key_passphrase
-                            && prompt.contains("passphrase")
-                        {
-                            private_key_passphrase_prompted.store(true, Ordering::Relaxed);
-                        }
 
-                        if !password_sent && prompt.contains("password:") && password.is_some() {
-                            password_sent = true;
-                            if let (Some(sender), Some(password)) = (&writer_tx, &password) {
-                                sender.send(SshCommand::Write(format!("{password}\n"))).ok();
+                            let prompt = auth_prompt_buffer.to_lowercase();
+                            if !passphrase_sent
+                                && prompt.contains("passphrase")
+                                && private_key_passphrase.is_some()
+                            {
+                                passphrase_sent = true;
+                                if let (Some(sender), Some(passphrase)) =
+                                    (&writer_tx, &private_key_passphrase)
+                                {
+                                    sender
+                                        .send(SshCommand::Write(format!("{passphrase}\n")))
+                                        .ok();
+                                }
                             }
-                        }
-                        if !authenticated.load(Ordering::Relaxed)
-                            && should_capture_password
-                            && prompt.contains("password:")
-                        {
-                            password_prompted.store(true, Ordering::Relaxed);
-                        }
-
-                        emit_ssh_output(&app, &session_id, &buffer[..size]);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            reader_done_tx.send(()).ok();
-        }
-    });
-
-    let mut captured_private_key_passphrase = String::new();
-    let mut captured_password = String::new();
-
-    loop {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(SshCommand::Write(data)) => {
-                if !authenticated.load(Ordering::Relaxed)
-                    && should_capture_private_key_passphrase
-                    && private_key_passphrase_prompted.load(Ordering::Relaxed)
-                {
-                    for ch in data.chars() {
-                        if ch == '\u{3}' {
-                            captured_private_key_passphrase.clear();
-                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
-                            break;
-                        }
-
-                        if ch == '\u{7f}' || ch == '\u{8}' {
-                            captured_private_key_passphrase.pop();
-                            continue;
-                        }
-
-                        if ch == '\r' || ch == '\n' {
-                            if !captured_private_key_passphrase.is_empty() {
-                                remember_session_private_key_passphrase(
-                                    &app.state::<SshSessionSecrets>(),
-                                    &session_id,
-                                    captured_private_key_passphrase.clone(),
-                                );
+                            if !authenticated.load(Ordering::Relaxed)
+                                && should_capture_private_key_passphrase
+                                && prompt.contains("passphrase")
+                            {
+                                private_key_passphrase_prompted.store(true, Ordering::Relaxed);
                             }
-                            captured_private_key_passphrase.clear();
-                            private_key_passphrase_prompted.store(false, Ordering::Relaxed);
-                            break;
-                        }
 
-                        if !ch.is_control() {
-                            captured_private_key_passphrase.push(ch);
+                            if !password_sent && prompt.contains("password:") && password.is_some()
+                            {
+                                password_sent = true;
+                                if let (Some(sender), Some(password)) = (&writer_tx, &password) {
+                                    sender.send(SshCommand::Write(format!("{password}\n"))).ok();
+                                }
+                            }
+                            if !authenticated.load(Ordering::Relaxed)
+                                && should_capture_password
+                                && prompt.contains("password:")
+                            {
+                                password_prompted.store(true, Ordering::Relaxed);
+                            }
+
+                            emit_ssh_output(&app, &session_id, &buffer[..size]);
                         }
+                        Err(_) => break,
                     }
                 }
 
-                if !authenticated.load(Ordering::Relaxed)
-                    && should_capture_password
-                    && password_prompted.load(Ordering::Relaxed)
-                {
-                    for ch in data.chars() {
-                        if ch == '\u{3}' {
-                            captured_password.clear();
-                            password_prompted.store(false, Ordering::Relaxed);
-                            break;
-                        }
+                reader_done_tx.send(()).ok();
+            }
+        });
 
-                        if ch == '\u{7f}' || ch == '\u{8}' {
-                            captured_password.pop();
-                            continue;
-                        }
+        let mut captured_private_key_passphrase = String::new();
+        let mut captured_password = String::new();
 
-                        if ch == '\r' || ch == '\n' {
-                            if !captured_password.is_empty() {
-                                remember_session_password(
-                                    &app.state::<SshSessionSecrets>(),
-                                    &session_id,
-                                    captured_password.clone(),
-                                );
+        loop {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(SshCommand::Write(data)) => {
+                    if !authenticated.load(Ordering::Relaxed)
+                        && should_capture_private_key_passphrase
+                        && private_key_passphrase_prompted.load(Ordering::Relaxed)
+                    {
+                        for ch in data.chars() {
+                            if ch == '\u{3}' {
+                                captured_private_key_passphrase.clear();
+                                private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                                break;
                             }
-                            captured_password.clear();
-                            password_prompted.store(false, Ordering::Relaxed);
-                            break;
-                        }
 
-                        if !ch.is_control() {
-                            captured_password.push(ch);
+                            if ch == '\u{7f}' || ch == '\u{8}' {
+                                captured_private_key_passphrase.pop();
+                                continue;
+                            }
+
+                            if ch == '\r' || ch == '\n' {
+                                if !captured_private_key_passphrase.is_empty() {
+                                    remember_session_private_key_passphrase(
+                                        &app.state::<SshSessionSecrets>(),
+                                        &session_id,
+                                        captured_private_key_passphrase.clone(),
+                                    );
+                                }
+                                captured_private_key_passphrase.clear();
+                                private_key_passphrase_prompted.store(false, Ordering::Relaxed);
+                                break;
+                            }
+
+                            if !ch.is_control() {
+                                captured_private_key_passphrase.push(ch);
+                            }
                         }
                     }
+
+                    if !authenticated.load(Ordering::Relaxed)
+                        && should_capture_password
+                        && password_prompted.load(Ordering::Relaxed)
+                    {
+                        for ch in data.chars() {
+                            if ch == '\u{3}' {
+                                captured_password.clear();
+                                password_prompted.store(false, Ordering::Relaxed);
+                                break;
+                            }
+
+                            if ch == '\u{7f}' || ch == '\u{8}' {
+                                captured_password.pop();
+                                continue;
+                            }
+
+                            if ch == '\r' || ch == '\n' {
+                                if !captured_password.is_empty() {
+                                    remember_session_password(
+                                        &app.state::<SshSessionSecrets>(),
+                                        &session_id,
+                                        captured_password.clone(),
+                                    );
+                                }
+                                captured_password.clear();
+                                password_prompted.store(false, Ordering::Relaxed);
+                                break;
+                            }
+
+                            if !ch.is_control() {
+                                captured_password.push(ch);
+                            }
+                        }
+                    }
+
+                    if let Some(writer) = writer.as_mut() {
+                        writer.write_all(data.as_bytes())?;
+                        writer.flush()?;
+                    }
+                }
+                Ok(SshCommand::WriteBinary(data)) => {
+                    if let Some(writer) = writer.as_mut() {
+                        writer.write_all(&data)?;
+                        writer.flush()?;
+                    }
+                }
+                Ok(SshCommand::Resize { cols, rows }) => {
+                    if let Some(master) = master.as_ref() {
+                        master.resize(PtySize {
+                            rows: rows as u16,
+                            cols: cols as u16,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })?;
+                    }
+                }
+                Ok(SshCommand::Disconnect) => {
+                    shutdown_pty_process(
+                        &mut *child,
+                        &mut master,
+                        &mut writer,
+                        Some(&reader_done_rx),
+                    );
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    shutdown_pty_process(
+                        &mut *child,
+                        &mut master,
+                        &mut writer,
+                        Some(&reader_done_rx),
+                    );
+                    return Ok(());
+                }
+            }
+
+            if reader_done_rx.try_recv().is_ok() {
+                let status = child.wait()?;
+                if status.success() {
+                    return Ok(());
                 }
 
-                if let Some(writer) = writer.as_mut() {
-                    writer.write_all(data.as_bytes())?;
-                    writer.flush()?;
-                }
-            }
-            Ok(SshCommand::WriteBinary(data)) => {
-                if let Some(writer) = writer.as_mut() {
-                    writer.write_all(&data)?;
-                    writer.flush()?;
-                }
-            }
-            Ok(SshCommand::Resize { cols, rows }) => {
-                if let Some(master) = master.as_ref() {
-                    master.resize(PtySize {
-                        rows: rows as u16,
-                        cols: cols as u16,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })?;
-                }
-            }
-            Ok(SshCommand::Disconnect) => {
-                shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
-                return Ok(());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                shutdown_pty_process(&mut *child, &mut master, &mut writer, Some(&reader_done_rx));
-                return Ok(());
-            }
-        }
+                let exit_code = status.exit_code();
+                let output_tail = shared_output
+                    .lock()
+                    .map(|output| output.trim().to_string())
+                    .unwrap_or_default();
 
-        if reader_done_rx.try_recv().is_ok() {
-            let status = child.wait()?;
-            if status.success() {
-                return Ok(());
-            }
+                if !host_key_retry_used && is_host_key_verification_error(&output_tail) {
+                    host_key_retry_used = true;
+                    ssh_remove_known_host(config.host.clone(), Some(config.port))
+                        .map_err(|error| format!("Failed to update known_hosts: {}", error))?;
+                    emit_ssh_output(
+                    &app,
+                    &session_id,
+                    b"\r\n[i] Host key changed. Removed old known_hosts entry, reconnecting...\r\n",
+                );
+                    continue 'connect_attempt;
+                }
 
-            return Err(format!("SSH process exited with code {}", status.exit_code()).into());
+                return Err(ssh_session_error_message(exit_code, &output_tail).into());
+            }
         }
     }
 }
@@ -4961,6 +5118,7 @@ fn main() {
             ssh_download_file,
             ssh_get_file_permissions,
             ssh_set_file_permissions,
+            ssh_remove_known_host,
             save_local_file,
             pick_local_directory,
             ssh_get_system_usage,
@@ -5083,12 +5241,13 @@ mod tests {
     use super::{build_windows_update_installer_wait_script, collect_descendants_from_entries};
     use super::{
         compare_release_versions, extract_api_error_message, format_error_chain,
-        merge_window_state, normalize_anthropic_endpoint,
-        output_looks_authenticated, parse_github_releases_feed, parse_openssh_file_list,
-        parse_system_usage_output, release_asset_download_url, remote_file_upload_shell_fragment,
+        merge_window_state, normalize_anthropic_endpoint, output_looks_authenticated,
+        parse_github_releases_feed, parse_openssh_file_list, parse_system_usage_output,
+        release_asset_download_url, remote_file_upload_shell_fragment,
         responsive_default_window_state_for_display, run_openssh_exec_command,
         run_remote_file_list, run_remote_system_usage, select_feed_release,
-        should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses, PersistedWindowState,
+        run_ssh_ping, should_fallback_to_openssh, ConnectionConfig, OpenSshProcesses,
+        PersistedWindowState,
     };
     use std::{cmp::Ordering as CmpOrdering, env, io};
 
@@ -5253,6 +5412,22 @@ mod tests {
         assert_eq!(state.width, 1440.0);
         assert_eq!(state.height, 900.0);
         assert!(!state.maximized);
+    }
+
+    #[test]
+    fn ssh_ping_handles_dns_hostnames_without_panicking() {
+        let config = ConnectionConfig {
+            name: "Localhost".to_string(),
+            host: "localhost".to_string(),
+            port: 9,
+            username: "tester".to_string(),
+            password: None,
+            private_key_path: None,
+            private_key: None,
+            private_key_passphrase: None,
+        };
+
+        let _ = run_ssh_ping(&config);
     }
 
     #[test]

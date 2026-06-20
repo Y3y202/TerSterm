@@ -255,6 +255,12 @@ export async function sshDeletePath(
   }
 }
 
+export async function sshRemoveKnownHost(host: string, port?: number) {
+  if (isTauriRuntime()) {
+    return invoke<void>('ssh_remove_known_host', { host, port })
+  }
+}
+
 export async function sshDownloadFile(
   config: ConnectionProfile,
   remote_path: string,
