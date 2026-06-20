@@ -1908,12 +1908,13 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
     return `${Math.max(0, used).toFixed(1)}/${Math.max(0, total).toFixed(1)}G`
   }
 
-  const actionButtonClass = 'h-7 w-7 rounded-md border border-white/10 text-slate-300 opacity-90 transition hover:bg-white/10 hover:text-white hover:opacity-100 disabled:border-white/5 disabled:text-slate-500 disabled:opacity-60'
-  const resourceBadgeClass = 'rounded-full border border-white/10 bg-white/[0.06] px-2 py-0.5 text-[rgba(232,240,246,0.88)] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]'
+  const actionButtonClass = 'h-7 w-7 rounded-md border border-[var(--border-subtle)] text-[var(--text-muted)] transition hover:bg-[var(--surface-chip)] hover:text-[var(--text-strong)] disabled:opacity-40'
+  const resourceBadgeClass = 'rounded-full border border-[var(--border-subtle)] bg-[var(--surface-chip)] px-2 py-0.5 text-[var(--text-muted)]'
   const resourceStatusContent = props.pane.system_usage ? (
     <>
       <span className={resourceBadgeClass}>CPU {formatPercent(props.pane.system_usage.cpu_percent)}</span>
       <span className={resourceBadgeClass}>{t('resourceMemory')} {formatGbPair(props.pane.system_usage.memory_used_gb, props.pane.system_usage.memory_total_gb)}</span>
+      <span className={resourceBadgeClass}>{t('resourceLatency')} {props.pane.system_usage.latency_ms}ms</span>
       <span className={resourceBadgeClass}>{t('resourceStorage')} {formatGbPair(props.pane.system_usage.storage_used_gb, props.pane.system_usage.storage_total_gb)}</span>
     </>
   ) : props.pane.system_usage_loading ? (
@@ -2303,39 +2304,39 @@ export const TerminalPane = forwardRef<TerminalPaneHandle, TerminalPaneProps>(fu
             )}
           </aside>
         </div>
+      </div>
 
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[11] flex justify-start px-3 pb-2 pt-3">
-          <div className="pointer-events-auto flex items-center gap-2">
-            {isConnected && (
-              <div className="flex min-w-0 flex-wrap items-center justify-start gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-slate-400 max-sm:hidden">
-                {resourceStatusContent}
-              </div>
-            )}
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
-                  event.stopPropagation()
-                  void openFileManager()
-                }} aria-label={t('fileManager')}>
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('fileManager')}</TooltipContent>
-            </Tooltip>
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="iconSm" className={actionButtonClass} onClick={(event) => {
-                  event.stopPropagation()
-                  openAiAssistant()
-                }} aria-label={t('aiAssistant')}>
-                  <Sparkles className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t('aiAssistant')}</TooltipContent>
-            </Tooltip>
+      <div className="flex shrink-0 items-center gap-2 border-t border-[var(--border-subtle)] bg-[var(--surface-panel)] px-3 py-1.5">
+        {isConnected && (
+          <div className="flex min-w-0 flex-wrap items-center justify-start gap-1.5 font-mono text-[10px] uppercase tracking-[0.04em] text-slate-400 max-sm:hidden">
+            {resourceStatusContent}
           </div>
+        )}
+
+        <div className="ml-auto flex items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="iconSm" className={actionButtonClass} disabled={!isConnected} onClick={(event) => {
+                event.stopPropagation()
+                void openFileManager()
+              }} aria-label={t('fileManager')}>
+                <FolderOpen className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t('fileManager')}</TooltipContent>
+          </Tooltip>
+
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="ghost" size="iconSm" className={actionButtonClass} onClick={(event) => {
+                event.stopPropagation()
+                openAiAssistant()
+              }} aria-label={t('aiAssistant')}>
+                <Sparkles className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t('aiAssistant')}</TooltipContent>
+          </Tooltip>
         </div>
       </div>
 

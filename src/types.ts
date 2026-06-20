@@ -63,6 +63,7 @@ export interface SystemUsage {
   memory_total_gb: number
   storage_used_gb: number
   storage_total_gb: number
+  latency_ms: number
   host_platform?: HostPlatform
   linux_distro?: string
 }

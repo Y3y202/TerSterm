@@ -68,6 +68,7 @@ import {
   sshConnect,
   sshDisconnect,
   sshGetSystemUsage,
+  sshPing,
   sshTestConnection,
   sshWrite,
 } from './bridge'
@@ -195,7 +196,7 @@ const DEFAULT_THEME_MODE: ThemeMode = 'light'
 const DEFAULT_ANALYSIS_THEME_ID: AnalysisThemeId = 'rose'
 const DEFAULT_AI_PROVIDER: AiProvider = 'openai-compatible'
 const DEFAULT_AI_TERMINAL_PERMISSION: AiAssistantPermission = 'type-only'
-const DEFAULT_AI_SYSTEM_PROMPT = 'You are the TerSterm AI assistant. Help with Linux and Windows server operations, SSH troubleshooting, deployment, logs, file management, permissions, networking, and shell usage. Keep answers concise, practical, and accurate.'
+const DEFAULT_AI_SYSTEM_PROMPT = '你是 TerSterm AI 助手。协助处理 Linux 和 Windows 服务器运维、SSH 故障排查、部署、日志分析、文件管理、权限配置、网络问题及 Shell 使用。回答应简洁、实用且准确。'
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms))
 
 const isAppThemeId = (value: string | null): value is AppThemeId =>
@@ -584,6 +585,7 @@ export default function App() {
   const unlistenSshDataRef = useRef<DeepLinkUnlisten>()
   const unlistenAppUpdateProgressRef = useRef<DeepLinkUnlisten>()
   const systemUsageTimerRef = useRef<number>()
+  const latencyTimerRef = useRef<number>()
   const systemUsageRequestIdsRef = useRef(new Map<string, number>())
   const systemUsagePendingPaneIdsRef = useRef(new Map<string, number>())
   const pendingPaneCredentialsRef = useRef(new Map<string, PendingPaneCredential>())
@@ -1119,6 +1121,22 @@ export default function App() {
     panesRef.current.forEach((pane) => {
       if (pane.status === 'connected' && pane.session_id && shouldRefreshPaneSystemUsage(pane)) {
         void refreshPaneSystemUsage(pane)
+      }
+    })
+  }
+
+  const pingAllLatency = () => {
+    panesRef.current.forEach((pane) => {
+      if (pane.status === 'connected' && pane.session_id && pane.connection && shouldRefreshPaneSystemUsage(pane)) {
+        void sshPing(pane.connection).then((latency_ms) => {
+          const currentPane = getPaneById(pane.id)
+          if (currentPane?.system_usage && currentPane.session_id === pane.session_id) {
+            updatePaneById(pane.id, (current) => ({
+              ...current,
+              system_usage: current.system_usage ? { ...current.system_usage, latency_ms } : current.system_usage,
+            }))
+          }
+        })
       }
     })
   }
@@ -2281,6 +2299,7 @@ export default function App() {
 
     refreshAllSystemUsage()
     systemUsageTimerRef.current = window.setInterval(refreshAllSystemUsage, 15_000)
+    latencyTimerRef.current = window.setInterval(pingAllLatency, 3_000)
 
     void onSshData(({ session_id, data }) => {
       appendTerminalOutput(session_id, data)
@@ -2330,6 +2349,9 @@ export default function App() {
       disposed = true
       if (systemUsageTimerRef.current) {
         window.clearInterval(systemUsageTimerRef.current)
+      }
+      if (latencyTimerRef.current) {
+        window.clearInterval(latencyTimerRef.current)
       }
       systemUsageRequestIdsRef.current.clear()
       systemUsagePendingPaneIdsRef.current.clear()

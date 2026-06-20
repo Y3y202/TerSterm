@@ -131,6 +131,7 @@ struct SystemUsage {
     memory_total_gb: f32,
     storage_used_gb: f32,
     storage_total_gb: f32,
+    latency_ms: u64,
     host_platform: Option<String>,
     linux_distro: Option<String>,
 }
@@ -1308,6 +1309,15 @@ async fn ssh_get_system_usage(
 }
 
 #[tauri::command]
+async fn ssh_ping(config: ConnectionConfig) -> Result<u64, String> {
+    validate_connection_config(&config)?;
+
+    tauri::async_runtime::spawn_blocking(move || Ok::<u64, String>(run_ssh_ping(&config)))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn save_local_file(
     app: AppHandle,
     filename: String,
@@ -1496,7 +1506,7 @@ fn build_ai_system_prompt(
     terminal_permission: AiAssistantTerminalPermission,
 ) -> String {
     let base_prompt = if custom_prompt.trim().is_empty() {
-        "You are the TerSterm AI assistant. Help with Linux and Windows server operations, SSH troubleshooting, deployment, logs, file management, permissions, networking, and shell usage. Keep answers concise, practical, and accurate."
+        "你是 TerSterm AI 助手。协助处理 Linux 和 Windows 服务器运维、SSH 故障排查、部署、日志分析、文件管理、权限配置、网络问题及 Shell 使用。回答应简洁、实用且准确。"
             .to_string()
     } else {
         custom_prompt.trim().to_string()
@@ -4089,9 +4099,20 @@ fn parse_system_usage_output(
         memory_total_gb,
         storage_used_gb,
         storage_total_gb,
+        latency_ms: 0,
         host_platform: Some("linux".to_string()),
         linux_distro,
     })
+}
+
+fn run_ssh_ping(config: &ConnectionConfig) -> u64 {
+    let addr = format!("{}:{}", config.host, config.port);
+    let start = Instant::now();
+    let _ = TcpStream::connect_timeout(
+        &addr.parse().expect("invalid SSH address"),
+        std::time::Duration::from_secs(3),
+    );
+    start.elapsed().as_millis() as u64
 }
 
 fn run_remote_system_usage(
@@ -4101,14 +4122,16 @@ fn run_remote_system_usage(
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
     let command = format!("sh -lc {}", shell_quote(system_usage_shell_fragment()));
 
-    match run_ssh2_exec_command(&config, &command) {
+    let result = match run_ssh2_exec_command(&config, &command) {
         Ok(output) => parse_system_usage_output(&output),
         Err(error) if should_fallback_to_openssh(&config, &*error) => {
             let output = run_openssh_exec_command(processes, session_id, &config, &command)?;
             parse_system_usage_output(&output)
         }
         Err(error) => Err(error),
-    }
+    };
+
+    result
 }
 
 fn system_usage_shell_fragment() -> &'static str {
@@ -4941,6 +4964,7 @@ fn main() {
             save_local_file,
             pick_local_directory,
             ssh_get_system_usage,
+            ssh_ping,
             check_app_update,
             download_app_update,
             ai_chat,

@@ -152,9 +152,18 @@ export async function sshGetSystemUsage(
     memory_total_gb: 16,
     storage_used_gb: 84,
     storage_total_gb: 256,
+    latency_ms: 42,
     host_platform: 'linux',
     linux_distro: 'ubuntu',
   }
+}
+
+export async function sshPing(config: ConnectionProfile): Promise<number> {
+  if (isTauriRuntime()) {
+    return invoke<number>('ssh_ping', { config })
+  }
+
+  return 28
 }
 
 export async function sshListFiles(
