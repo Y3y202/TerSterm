@@ -1,6 +1,6 @@
 [package]
 name = "tersterm"
-version = "0.1.17"
+version = "0.1.18"
 description = "TerSterm SSH manager"
 authors = ["TerSterm"]
 edition = "2021"
