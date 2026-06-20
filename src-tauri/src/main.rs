@@ -2779,6 +2779,7 @@ fn build_ssh_command(
     config: &ConnectionConfig,
     private_key: Option<&PreparedPrivateKey>,
     remote_command: Option<&str>,
+    host_key_retry: bool,
 ) -> CommandBuilder {
     let mut command = CommandBuilder::new("ssh");
     command.arg(if remote_command.is_some() {
@@ -2793,7 +2794,11 @@ fn build_ssh_command(
     command.arg("-o");
     command.arg("ConnectTimeout=15");
     command.arg("-o");
-    command.arg("StrictHostKeyChecking=accept-new");
+    command.arg(if host_key_retry {
+        "StrictHostKeyChecking=no"
+    } else {
+        "StrictHostKeyChecking=accept-new"
+    });
     command.arg("-o");
     command.arg(format!(
         "UserKnownHostsFile={}",
@@ -4319,7 +4324,7 @@ fn run_openssh_exec_command_with_stdin_and_timeout(
     })?;
 
     let private_key = prepare_private_key(config)?;
-    let command = build_ssh_command(config, private_key.as_ref(), Some(remote_command));
+    let command = build_ssh_command(config, private_key.as_ref(), Some(remote_command), false);
     if process_guard.is_cancelled() {
         return Err("OpenSSH command cancelled".into());
     }
@@ -4709,7 +4714,7 @@ fn run_ssh_session(
         })?;
 
         let private_key = prepare_private_key(&config)?;
-        let command = build_ssh_command(&config, private_key.as_ref(), None);
+        let command = build_ssh_command(&config, private_key.as_ref(), None, host_key_retry_used);
         let master = pair.master;
         let slave = pair.slave;
         let mut child = slave.spawn_command(command)?;
