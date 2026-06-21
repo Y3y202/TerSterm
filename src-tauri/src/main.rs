@@ -4215,17 +4215,12 @@ fn run_remote_system_usage(
     let fragment = system_usage_shell_fragment();
     let command = format!("sh -lc {}", shell_quote(&fragment));
 
-    eprintln!("[system_usage] command: {}", command);
-
     match run_ssh2_exec_command(&config, &command) {
         Ok(output) => {
-            eprintln!("[system_usage] ssh2 OK, output: {:?}", output);
             parse_system_usage_output(&output)
         }
         Err(error) => {
-            eprintln!("[system_usage] ssh2 error: {}", error);
             if should_fallback_to_openssh(&config, &*error) {
-                eprintln!("[system_usage] falling back to openssh (askpass)");
                 match run_openssh_exec_command_with_askpass(
                     processes,
                     session_id,
@@ -4234,11 +4229,9 @@ fn run_remote_system_usage(
                     OPENSSH_COMMAND_TIMEOUT,
                 ) {
                     Ok(output) => {
-                        eprintln!("[system_usage] askpass OK, output: {:?}", output);
                         parse_system_usage_output(&output)
                     }
                     Err(e) => {
-                        eprintln!("[system_usage] askpass error: {}", e);
                         Err(e)
                     }
                 }
@@ -4254,7 +4247,7 @@ fn system_usage_shell_fragment() -> &'static str {
     // CPU: shell sleeps 1s and reads /proc/stat twice; awk computes the delta.
     // MEM: single awk pass on /proc/meminfo computes GB.
     // DISK: df -P / (fallback: df -P); awk finds root-mount line; always outputs DISK.
-    r##"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; cpu1=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); sleep 1; cpu2=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); awk -v c1="$cpu1" -v c2="$cpu2" 'BEGIN { split(c1, a, " "); split(c2, b, " "); dtotal=b[2]-a[2]; didle=b[1]-a[1]; if (dtotal>0) cpu_pct=(dtotal-didle)*100/dtotal; else cpu_pct=0; printf "CPU %.1f\n", cpu_pct }'; awk '/^MemTotal:/ { mem_total=$2+0 } /^MemAvailable:/ { mem_avail=$2+0 } /^MemFree:/ { mem_free=$2+0 } /^Buffers:/ { buf=$2+0 } /^Cached:/ { cache=$2+0 } /^Cached:|^KReclaimable:|^SReclaimable:/ { reclaim+=$2+0 } END { if (mem_total>0) { if (mem_avail>0) { used=(mem_total-mem_avail)/1048576 } else { used=(mem_total-mem_free-buf-cache-reclaim)/1048576; if (used<0) used=(mem_total-mem_free)/1048576 }; if (used<0) used=0; total=mem_total/1048576; printf "MEM %.2f %.2f\n", used, total } }' /proc/meminfo; dfout=$(df -P / 2>/dev/null); if [ -z "$dfout" ]; then dfout=$(df -P 2>/dev/null); fi; if [ -n "$dfout" ]; then printf "%s" "$dfout" | awk '$NF == "/" { printf "DISK %.2f %.2f\n", $3/1073741824+0, $2/1073741824+0; f=1; exit } END { if (!f) printf "DISK 0.00 0.00\n" }'; else printf "DISK 0.00 0.00\n"; fi"##
+    r##"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; cpu1=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); sleep 1; cpu2=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); awk -v c1="$cpu1" -v c2="$cpu2" 'BEGIN { split(c1, a, " "); split(c2, b, " "); dtotal=b[2]-a[2]; didle=b[1]-a[1]; if (dtotal>0) cpu_pct=(dtotal-didle)*100/dtotal; else cpu_pct=0; printf "CPU %.1f\n", cpu_pct }'; awk '/^MemTotal:/ { mem_total=$2+0 } /^MemAvailable:/ { mem_avail=$2+0 } /^MemFree:/ { mem_free=$2+0 } /^Buffers:/ { buf=$2+0 } /^Cached:/ { cache=$2+0 } /^Cached:|^KReclaimable:|^SReclaimable:/ { reclaim+=$2+0 } END { if (mem_total>0) { if (mem_avail>0) { used=(mem_total-mem_avail)/1048576 } else { used=(mem_total-mem_free-buf-cache-reclaim)/1048576; if (used<0) used=(mem_total-mem_free)/1048576 }; if (used<0) used=0; total=mem_total/1048576; printf "MEM %.2f %.2f\n", used, total } }' /proc/meminfo; dfout=$(df -k -P / 2>/dev/null); if [ -z "$dfout" ]; then dfout=$(df -k -P 2>/dev/null); fi; if [ -n "$dfout" ]; then printf "%s" "$dfout" | awk 'NR>1 && /^[[:space:]]/ { prev=prev" "$0; next } NR>1 { if(prev!="") { print prev; prev="" }; print } END { if(prev!="") print prev }' | awk '$NF == "/" { used=$(NF-3)+0; total=$(NF-4)+0; printf "DISK %.2f %.2f\n", used/1048576, total/1048576; f=1; exit } END { if(!f) printf "DISK 0.00 0.00\n" }'; else printf "DISK 0.00 0.00\n"; fi"##
 }
 
 fn run_ssh2_exec_command(
@@ -5793,6 +5786,37 @@ mod tests {
         assert_eq!(usage.storage_total_gb, 256.0);
         assert_eq!(usage.host_platform.as_deref(), Some("linux"));
         assert_eq!(usage.linux_distro.as_deref(), Some("ubuntu"));
+    }
+
+    #[test]
+    fn parses_system_usage_disk_from_realistic_df_output() {
+        // Simulates output from: df -k -P / on a 50GB Ubuntu LVM root
+        // 52428800 1K-blocks = 50.00 GiB, 44040192 1K-blocks used = 41.96 GiB
+        let output = concat!(
+            "OS ubuntu\n",
+            "CPU 5.0\n",
+            "MEM 3.25 16.00\n",
+            "DISK 41.96 50.00\n"
+        );
+
+        let usage = parse_system_usage_output(output).expect("system usage should parse");
+        assert!((usage.storage_used_gb - 41.96).abs() < 0.01);
+        assert!((usage.storage_total_gb - 50.00).abs() < 0.01);
+    }
+
+    #[test]
+    fn parses_system_usage_disk_fallback_zero() {
+        // When df fails entirely, the shell fragment outputs DISK 0.00 0.00
+        let output = concat!(
+            "OS linux\n",
+            "CPU 0.0\n",
+            "MEM 0.00 0.00\n",
+            "DISK 0.00 0.00\n"
+        );
+
+        let usage = parse_system_usage_output(output).expect("system usage should parse");
+        assert_eq!(usage.storage_used_gb, 0.0);
+        assert_eq!(usage.storage_total_gb, 0.0);
     }
 
     #[test]
