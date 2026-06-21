@@ -4250,12 +4250,11 @@ fn run_remote_system_usage(
 }
 
 fn system_usage_shell_fragment() -> &'static str {
-    // 使用 awk 处理所有算术运算，避免 shell 整数溢出、read 失败导致变量为空、
-    // 远端 shell 不支持 POSIX 算术扩展等问题。
-    // CPU 通过 shell sleep 1 两次采样 /proc/stat 差值计算。
-    // 输出格式与 parse_system_usage_output 保持一致：OS / CPU / MEM / DISK。
-    // DISK 取 df 第二行（Linux 远端是 / 所在的设备），无需强制路径前缀。
-    r#"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; cpu1=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); sleep 1; cpu2=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); awk -v c1="$cpu1" -v c2="$cpu2" 'BEGIN { split(c1, a, " "); split(c2, b, " "); dtotal=b[2]-a[2]; didle=b[1]-a[1]; if (dtotal>0) cpu_pct=(dtotal-didle)*100/dtotal; else cpu_pct=0; printf "CPU %.1f\n", cpu_pct }'; awk '/^MemTotal:/ { mem_total=$2+0 } /^MemAvailable:/ { mem_avail=$2+0 } END { if (mem_total>0) { mem_used=(mem_total-mem_avail)/1048576; mem_total_gb=mem_total/1048576; printf "MEM %.2f %.2f\n", mem_used, mem_total_gb } }' /proc/meminfo; df -P / 2>/dev/null | awk 'NR==2 { used=$3/1073741824; total=$2/1073741824; printf "DISK %.2f %.2f\n", used+0, total+0 }'"#
+    // Use awk for all arithmetic to avoid shell integer overflow and compatibility issues.
+    // CPU: shell sleeps 1s and reads /proc/stat twice; awk computes the delta.
+    // MEM: single awk pass on /proc/meminfo computes GB.
+    // DISK: read root mount device from /proc/mounts, then df -P on it; fallback to df -P /.
+    r##"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; cpu1=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); sleep 1; cpu2=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); awk -v c1="$cpu1" -v c2="$cpu2" 'BEGIN { split(c1, a, " "); split(c2, b, " "); dtotal=b[2]-a[2]; didle=b[1]-a[1]; if (dtotal>0) cpu_pct=(dtotal-didle)*100/dtotal; else cpu_pct=0; printf "CPU %.1f\n", cpu_pct }'; awk '/^MemTotal:/ { mem_total=$2+0 } /^MemAvailable:/ { mem_avail=$2+0 } /^MemFree:/ { mem_free=$2+0 } /^Buffers:/ { buf=$2+0 } /^Cached:/ { cache=$2+0 } /^Cached:|^KReclaimable:|^SReclaimable:/ { reclaim+=$2+0 } END { if (mem_total>0) { if (mem_avail>0) { used=(mem_total-mem_avail)/1048576 } else { used=(mem_total-mem_free-buf-cache-reclaim)/1048576; if (used<0) used=(mem_total-mem_free)/1048576 }; if (used<0) used=0; total=mem_total/1048576; printf "MEM %.2f %.2f\n", used, total } }' /proc/meminfo; root_dev=$(awk 'BEGIN { dev="" } { for (i=1; i<=NF; i++) { if ($i == "/") { if (NR>1) { print prev_dev; exit } } prev_dev=$1 } }' /proc/mounts 2>/dev/null); if [ -n "$root_dev" ]; then df -P "$root_dev" 2>/dev/null | awk 'NR==2 { used=$3/1073741824; total=$2/1073741824; printf "DISK %.2f %.2f\n", used+0, total+0; exit }'; else df -P / 2>/dev/null | awk 'NR==2 { used=$3/1073741824; total=$2/1073741824; printf "DISK %.2f %.2f\n", used+0, total+0; exit }'; fi"##
 }
 
 fn run_ssh2_exec_command(
