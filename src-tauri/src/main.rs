@@ -3084,7 +3084,7 @@ fn run_remote_shell_fragment(
     config: ConnectionConfig,
     fragment: String,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let command = format!("sh -lc {}", shell_quote(&fragment));
+    let command = format!("sh -c {}", shell_quote(&fragment));
 
     match run_ssh2_exec_command(&config, &command) {
         Ok(output) => Ok(output),
@@ -3280,7 +3280,7 @@ fn run_remote_file_list_openssh(
     remote_path: &str,
 ) -> Result<RemoteFileList, Box<dyn std::error::Error + Send + Sync>> {
     let fragment = file_list_shell_fragment(remote_path);
-    let command = format!("sh -lc {}", shell_quote(&fragment));
+    let command = format!("sh -c {}", shell_quote(&fragment));
     let output = run_openssh_exec_command(processes, session_id, config, &command)?;
     parse_openssh_file_list(&output)
 }
@@ -3585,7 +3585,7 @@ fn run_remote_file_upload_openssh(
     let target = remote_join(&normalize_remote_path(&remote_path), &safe_name);
     let remote_target = sftp_path(&target);
     let fragment = remote_file_upload_shell_fragment(&remote_target);
-    let command = format!("sh -lc {}", shell_quote(&fragment));
+    let command = format!("sh -c {}", shell_quote(&fragment));
     run_openssh_exec_command_with_stdin_and_timeout(
         processes,
         session_id,
@@ -4212,22 +4212,50 @@ fn run_remote_system_usage(
     session_id: Option<&str>,
     config: ConnectionConfig,
 ) -> Result<SystemUsage, Box<dyn std::error::Error + Send + Sync>> {
-    let command = format!("sh -lc {}", shell_quote(system_usage_shell_fragment()));
+    let fragment = system_usage_shell_fragment();
+    let command = format!("sh -lc {}", shell_quote(&fragment));
 
-    let result = match run_ssh2_exec_command(&config, &command) {
-        Ok(output) => parse_system_usage_output(&output),
-        Err(error) if should_fallback_to_openssh(&config, &*error) => {
-            let output = run_openssh_exec_command(processes, session_id, &config, &command)?;
+    eprintln!("[system_usage] command: {}", command);
+
+    match run_ssh2_exec_command(&config, &command) {
+        Ok(output) => {
+            eprintln!("[system_usage] ssh2 OK, output: {:?}", output);
             parse_system_usage_output(&output)
         }
-        Err(error) => Err(error),
-    };
-
-    result
+        Err(error) => {
+            eprintln!("[system_usage] ssh2 error: {}", error);
+            if should_fallback_to_openssh(&config, &*error) {
+                eprintln!("[system_usage] falling back to openssh (askpass)");
+                match run_openssh_exec_command_with_askpass(
+                    processes,
+                    session_id,
+                    &config,
+                    &command,
+                    OPENSSH_COMMAND_TIMEOUT,
+                ) {
+                    Ok(output) => {
+                        eprintln!("[system_usage] askpass OK, output: {:?}", output);
+                        parse_system_usage_output(&output)
+                    }
+                    Err(e) => {
+                        eprintln!("[system_usage] askpass error: {}", e);
+                        Err(e)
+                    }
+                }
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn system_usage_shell_fragment() -> &'static str {
-    r#"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total1=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle1=$((idle+iowait)); sleep 1; read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat; total2=$((user+nice+system+idle+iowait+irq+softirq+steal)); idle2=$((idle+iowait)); total=$((total2-total1)); idle_delta=$((idle2-idle1)); awk -v total="$total" -v idle="$idle_delta" "BEGIN { if (total > 0) printf \"CPU %.1f\n\", (total-idle)*100/total; else print \"CPU 0.0\" }"; awk "/MemTotal:/ { total=\$2 } /MemAvailable:/ { available=\$2 } END { printf \"MEM %.2f %.2f\n\", (total-available)/1048576, total/1048576 }" /proc/meminfo; df -B1 / | awk "NR==2 { printf \"DISK %.2f %.2f\n\", \$3/1073741824, \$2/1073741824 }""#
+    // 使用 awk 处理所有算术运算，避免 shell 整数溢出、read 失败导致变量为空、
+    // 远端 shell 不支持 POSIX 算术扩展等问题。
+    // CPU 通过 shell sleep 1 两次采样 /proc/stat 差值计算。
+    // 输出格式与 parse_system_usage_output 保持一致：OS / CPU / MEM / DISK。
+    // DISK 取 df 第二行（Linux 远端是 / 所在的设备），无需强制路径前缀。
+    r#"printf "\n"; if [ -r /etc/os-release ]; then . /etc/os-release; printf "OS %s\n" "${ID:-linux}"; else printf "OS linux\n"; fi; cpu1=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); sleep 1; cpu2=$(awk '/^cpu[0-9]? / { idle=$5+0; tot=0; for (i=2;i<=NF;i++) tot+=$i+0; print idle" "tot; exit }' /proc/stat 2>/dev/null); awk -v c1="$cpu1" -v c2="$cpu2" 'BEGIN { split(c1, a, " "); split(c2, b, " "); dtotal=b[2]-a[2]; didle=b[1]-a[1]; if (dtotal>0) cpu_pct=(dtotal-didle)*100/dtotal; else cpu_pct=0; printf "CPU %.1f\n", cpu_pct }'; awk '/^MemTotal:/ { mem_total=$2+0 } /^MemAvailable:/ { mem_avail=$2+0 } END { if (mem_total>0) { mem_used=(mem_total-mem_avail)/1048576; mem_total_gb=mem_total/1048576; printf "MEM %.2f %.2f\n", mem_used, mem_total_gb } }' /proc/meminfo; df -P / 2>/dev/null | awk 'NR==2 { used=$3/1073741824; total=$2/1073741824; printf "DISK %.2f %.2f\n", used+0, total+0 }'"#
 }
 
 fn run_ssh2_exec_command(
@@ -4660,6 +4688,194 @@ fn run_openssh_exec_command_noninteractive_with_stdin_and_timeout(
 
     if status.success() {
         stdin_result?;
+        return Ok(combined);
+    }
+
+    let message = combined.trim();
+    if message.is_empty() {
+        return Err(format!("OpenSSH command failed with code {:?}", status.code()).into());
+    }
+
+    Err(message.to_string().into())
+}
+
+/// Write the password to a temporary askpass script and return its path.
+/// The script writes the password to stdout when invoked by ssh.
+fn write_askpass_script(
+    password: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = std::env::temp_dir().join(format!("tersterm-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir)?;
+    let script_path = dir.join("askpass.sh");
+
+    // Escape the password for embedding in the script. Use single quotes and
+    // replace any embedded single quote with `'\''`.
+    let escaped = password.replace('\'', "'\\''");
+    let script_body = format!("#!/bin/sh\nprintf '%s\\n' '{escaped}'\n");
+
+    let mut file = fs::File::create(&script_path)?;
+    file.write_all(script_body.as_bytes())?;
+    file.sync_all()?;
+
+    // On Windows, .sh is not directly executable; the `ssh` client should
+    // still be able to invoke it via the configured shell. But on some
+    // OpenSSH for Windows builds, only .exe or .bat is honored. To stay
+    // portable, we also create a .bat shim that prints the password.
+    #[cfg(windows)]
+    {
+        let bat_path = dir.join("askpass.bat");
+        // Use cmd's echo to avoid issues with special characters.
+        // Set the password in an env var to safely pass it through.
+        let bat_body = format!(
+            "@echo off\r\nsetlocal\r\nset PASS={}\r\necho %PASS%\r\nendlocal\r\n",
+            password
+                .replace('%', "%%")
+                .replace('^', "^^")
+                .replace('&', "^&")
+                .replace('<', "^<")
+                .replace('>', "^>")
+                .replace('|', "^|")
+        );
+        let mut bat_file = fs::File::create(&bat_path)?;
+        bat_file.write_all(bat_body.as_bytes())?;
+        bat_file.sync_all()?;
+        return Ok(bat_path);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script_path, perms)?;
+        return Ok(script_path);
+    }
+}
+
+fn run_openssh_exec_command_with_askpass(
+    processes: &OpenSshProcesses,
+    session_id: Option<&str>,
+    config: &ConnectionConfig,
+    remote_command: &str,
+    timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let process_guard = register_openssh_process(processes, session_id);
+    if process_guard.is_cancelled() {
+        return Err("OpenSSH command cancelled".into());
+    }
+
+    let password = config
+        .password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("Password is required for askpass authentication")?;
+
+    let askpass_path = write_askpass_script(password)?;
+
+    let private_key = prepare_private_key_for_noninteractive_openssh(config)?;
+    let mut command = std::process::Command::new("ssh");
+    configure_subprocess(&mut command);
+    command
+        .env("SSH_ASKPASS", &askpass_path)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        // ssh requires a TTY for askpass; DISPLAY is checked on Unix.
+        // On Windows, SSH_ASKPASS_REQUIRE=force is sufficient.
+        .env("DISPLAY", ":0")
+        .arg("-T")
+        .arg("-p")
+        .arg(config.port.to_string())
+        .arg("-o")
+        .arg("ServerAliveInterval=30")
+        .arg("-o")
+        .arg("ConnectTimeout=15")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            ensure_terssh_known_hosts().to_string_lossy()
+        ))
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=1");
+
+    if let Some(private_key) = private_key.as_ref() {
+        command.arg("-i").arg(&private_key.path);
+    }
+
+    command
+        .arg(format!("{}@{}", config.username, config.host))
+        .arg(remote_command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let result = run_openssh_command_and_collect(
+        &mut command,
+        &process_guard,
+        timeout,
+        &askpass_path,
+    );
+
+    // Clean up the temporary askpass script.
+    if let Some(parent) = askpass_path.parent() {
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    result
+}
+
+fn run_openssh_command_and_collect(
+    command: &mut std::process::Command,
+    process_guard: &OpenSshProcessGuard,
+    timeout: Duration,
+    _askpass_path: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut child = command.spawn()?;
+    let mut stdout = child.stdout.take().ok_or("Unable to read OpenSSH stdout")?;
+    let mut stderr = child.stderr.take().ok_or("Unable to read OpenSSH stderr")?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).ok();
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        stderr.read_to_string(&mut output).ok();
+        output
+    });
+    let started_at = Instant::now();
+    let status;
+
+    loop {
+        if process_guard.is_cancelled() {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command cancelled".into());
+        }
+
+        if let Some(exit_status) = child.try_wait()? {
+            status = exit_status;
+            break;
+        }
+
+        if started_at.elapsed() > timeout {
+            child.kill().ok();
+            child.wait().ok();
+            stdout_reader.join().ok();
+            stderr_reader.join().ok();
+            return Err("OpenSSH command timed out".into());
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    let combined = format!("{stdout}{stderr}");
+
+    if status.success() {
         return Ok(combined);
     }
 
